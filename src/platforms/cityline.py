@@ -8,6 +8,8 @@ import random
 import time
 
 import util
+from nodriver_common import evaluate_refresh_if_enabled
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     check_and_handle_pause,
     handle_cloudflare_challenge,
@@ -55,17 +57,20 @@ def is_cityline_login_page(url):
 
 
 async def nodriver_cityline_auto_retry_access(tab, url, config_dict):
+
+    if not util.is_auto_refresh_enabled():
+        return False
     debug = util.create_debug_logger(config_dict)
     try:
         js = "goEvent();"
-        await tab.evaluate(js)
+        await evaluate_refresh_if_enabled(tab, js)
     except Exception as exc:
         debug.log(f"[CITYLINE] goEvent() failed: {exc}")
         pass
 
     auto_reload_page_interval = config_dict["advanced"]["auto_reload_page_interval"]
     if auto_reload_page_interval > 0:
-        await asyncio.sleep(auto_reload_page_interval)
+        await sleep_before_auto_refresh(auto_reload_page_interval)
 
 async def nodriver_cityline_login(tab, cityline_account, config_dict):
     """
@@ -162,7 +167,7 @@ async def nodriver_cityline_date_auto_select(tab, config_dict):
     auto_select_mode = config_dict["date_auto_select"]["mode"]
     date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
     date_auto_fallback = config_dict.get("date_auto_fallback", False)  # Read from top level
-    auto_reload_coming_soon_page = config_dict["tixcraft"].get("auto_reload_coming_soon_page", False)
+    auto_reload_coming_soon_page = (config_dict["tixcraft"].get("auto_reload_coming_soon_page", False)) and util.is_auto_refresh_enabled()
 
     ret = False
 
@@ -224,8 +229,8 @@ async def nodriver_cityline_date_auto_select(tab, config_dict):
                 # Auto reload if no dates available
                 debug.log("[DATE FALLBACK] Auto-reloading page...")
                 try:
-                    await asyncio.sleep(config_dict["advanced"]["auto_reload_page_interval"])
-                    await tab.reload()
+                    await sleep_before_auto_refresh(config_dict["advanced"]["auto_reload_page_interval"])
+                    await reload_page_if_enabled(tab)
                 except:
                     pass
             else:
@@ -1031,7 +1036,7 @@ async def nodriver_cityline_main(tab, url, config_dict):
                 debug.log(f"[CITYLINE] Redirecting to target page: {target_url}")
                 try:
                     _state["last_homepage_redirect_time"] = current_time
-                    await tab.get(target_url)
+                    await navigate_page_if_enabled(tab, target_url)
                     await asyncio.sleep(random.uniform(1.5, 2.5))
                     # Update URL after redirect
                     url = await tab.evaluate('window.location.href')

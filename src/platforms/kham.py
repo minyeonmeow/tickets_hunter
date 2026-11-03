@@ -19,6 +19,8 @@ import webbrowser
 from zendriver import cdp
 
 import util
+from nodriver_common import evaluate_refresh_if_enabled
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     asyncio_sleep_with_pause_check,
     check_and_handle_pause,
@@ -284,7 +286,7 @@ async def nodriver_kham_go_buy_redirect(tab, domain_name):
             ''')
 
             if next_url:
-                await tab.get(next_url)
+                await navigate_page_if_enabled(tab, next_url)
                 return True
         except:
             pass
@@ -539,7 +541,7 @@ async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
 
     auto_select_mode = config_dict["date_auto_select"]["mode"]
     date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
-    auto_reload_coming_soon_page_enable = config_dict["tixcraft"]["auto_reload_coming_soon_page"]
+    auto_reload_coming_soon_page_enable = (config_dict["tixcraft"]["auto_reload_coming_soon_page"]) and util.is_auto_refresh_enabled()
 
     # Feature 003: Safe access for conditional fallback switch
     date_auto_fallback = config_dict.get('date_auto_fallback', False)
@@ -777,11 +779,11 @@ async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
                 # Wait before reload (use config interval)
                 reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.0)
                 if reload_interval > 0:
-                    await tab.sleep(reload_interval)
+                    await sleep_before_auto_refresh(reload_interval)
                 else:
                     await tab.sleep(1.0)  # Default 1 second delay
 
-                await tab.reload()
+                await reload_page_if_enabled(tab)
                 await tab.sleep(0.5)  # Wait for page to start loading
 
                 debug.log("Page reloaded, waiting for content...")
@@ -1524,14 +1526,14 @@ async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_na
         debug.log("is_need_refresh:", is_need_refresh)
         # Stage 5: area sold out / keyword not matched -> reload and retry.
         try:
-            await tab.reload()
+            await reload_page_if_enabled(tab)
         except Exception as exc:
             debug.log("Area reload exception:", exc)
         # Wait AFTER the reload: a DOM read before the new document parses sees
         # zero area rows and reloads forever. The same wait throttles the refresh
         # rate (#322); the settle floor applies even when the interval is 0.
         reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.0)
-        await tab.sleep(max(reload_interval, CONST_KHAM_RELOAD_SETTLE))
+        await sleep_before_auto_refresh(max(reload_interval, CONST_KHAM_RELOAD_SETTLE))
         # The page is reloading and the current DOM is stale, so skip the
         # captcha/submit attempt this round. Returning is_captcha_sent=False
         # makes the caller skip the add-to-cart submit (avoids the wasted
@@ -1736,7 +1738,7 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
             if config_homepage and not is_config_homepage_also_home and config_homepage.lower() != url.lower():
                 debug.log(f"[KHAM LOGIN] Redirecting to target: {config_homepage}")
                 try:
-                    await tab.get(config_homepage)
+                    await navigate_page_if_enabled(tab, config_homepage)
                     return tab
                 except Exception as e:
                     debug.log(f"[KHAM LOGIN] Redirect failed: {e}")
@@ -3875,6 +3877,9 @@ async def nodriver_kham_handle_seat_unavailable(tab, config_dict):
     1. 首次發現無位時：最多點擊「更新座位」(.btn-update / top.location.reload) 刷新一次。
     2. 刷新一次後仍無位時：返回票區列表（UTK0204）重新找其他位置。
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     global KHAM_SEAT_RELOAD_TRACKER
     debug = util.create_debug_logger(config_dict)
 
@@ -3916,7 +3921,7 @@ async def nodriver_kham_handle_seat_unavailable(tab, config_dict):
         debug.log(f"[KHAM SEAT] 票區 {area_display} 可用空位不足，嘗試點擊「更新座位」刷新一次...")
 
         try:
-            await tab.evaluate('''
+            await evaluate_refresh_if_enabled(tab, '''
                 (() => {
                     const btnUpdate = document.querySelector('.btn-update, div[onclick*="reload"]');
                     if (btnUpdate) {

@@ -17,6 +17,7 @@ import webbrowser
 from zendriver import cdp
 
 import util
+from nodriver_common import back_if_auto_refresh_enabled, navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     asyncio_sleep_with_pause_check,
     check_and_handle_pause,
@@ -602,7 +603,7 @@ async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
     auto_select_mode = config_dict["date_auto_select"]["mode"]
     date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
     date_auto_fallback = config_dict.get('date_auto_fallback', False)  # T017: Safe access for new field
-    auto_reload_coming_soon_page_enable = config_dict["tixcraft"]["auto_reload_coming_soon_page"]
+    auto_reload_coming_soon_page_enable = (config_dict["tixcraft"]["auto_reload_coming_soon_page"]) and util.is_auto_refresh_enabled()
 
     debug.log("[IBON DATE] Starting date selection on ActivityInfo/Details page")
     debug.log("date_keyword:", date_keyword)
@@ -3090,6 +3091,9 @@ async def nodriver_ibon_navigate_on_sold_out(tab, config_dict):
     Returns:
         bool: True if navigation successful, False otherwise
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     debug = util.create_debug_logger(config_dict)
     navigation_success = False
 
@@ -3106,7 +3110,7 @@ async def nodriver_ibon_navigate_on_sold_out(tab, config_dict):
                 # Navigate to Event page (area selection)
                 event_url = '/'.join(parts[:3] + ['Event', parts[4], parts[5]])
                 debug.log(f"[IBON] Sold out - navigating to area selection: {event_url}")
-                await tab.get(event_url)
+                await navigate_page_if_enabled(tab, event_url)
                 navigation_success = True
 
         # Old format: orders.ibon.com.tw/application/UTK02/UTK0202_.aspx?PERFORMANCE_PRICE_AREA_ID=xxx
@@ -3114,20 +3118,20 @@ async def nodriver_ibon_navigate_on_sold_out(tab, config_dict):
         # Using tab.back() is safer to return to the previous area selection page.
         elif '/utk02/utk0202_' in url_lower and 'PERFORMANCE_PRICE_AREA_ID=' in url.upper():
             debug.log("[IBON] Sold out - using tab.back() to return to area selection")
-            await tab.back()
+            await back_if_auto_refresh_enabled(tab)
             navigation_success = True
 
         # Fallback: use tab.back() if URL pattern not recognized
         if not navigation_success:
             debug.log("[IBON] Sold out - using tab.back() as fallback")
-            await tab.back()
+            await back_if_auto_refresh_enabled(tab)
             navigation_success = True
 
     except Exception as e:
         debug.log(f"[IBON] Navigation error: {e}")
         # Fallback to reload if navigation fails
         try:
-            await tab.reload()
+            await reload_page_if_enabled(tab)
         except Exception:
             pass
 
@@ -3933,7 +3937,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
         ibon_base = "https://ticket.ibon.com.tw/"
         debug.log(f"[IBON LOGIN] Navigating to ibon base URL to activate cookie session")
         try:
-            await tab.get(ibon_base)
+            await navigate_page_if_enabled(tab, ibon_base)
             await asyncio.sleep(random.uniform(1.5, 2.0))
             await dismiss_pending_ibon_dialog(tab, config_dict)
         except Exception as e:
@@ -3984,7 +3988,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                 debug.log(f"[IBON] Redirecting to config homepage: {config_homepage}")
                 try:
                     _state["last_homepage_redirect_time"] = current_time
-                    await tab.get(config_homepage)
+                    await navigate_page_if_enabled(tab, config_homepage)
                     await asyncio.sleep(2)
                     debug.log(f"[IBON] Successfully redirected to: {config_homepage}")
                 except Exception as redirect_exc:
@@ -4032,16 +4036,16 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                         auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                         if auto_reload_interval > 0:
-                            await asyncio.sleep(auto_reload_interval)
+                            await sleep_before_auto_refresh(auto_reload_interval)
 
                         try:
-                            await tab.reload()
+                            await reload_page_if_enabled(tab)
                         except:
                             pass
 
     if 'ibon.com.tw/error.html?' in url.lower():
         try:
-            await tab.back()
+            await back_if_auto_refresh_enabled(tab)
         except Exception as exc:
             pass
 
@@ -4165,7 +4169,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                                     "area_id": livemap_selected['area_id'],
                                     "area_name": livemap_selected['area_name'],
                                 }
-                                await tab.get(skip_url)
+                                await navigate_page_if_enabled(tab, skip_url)
                                 return False
                             else:
                                 livemap_debug.log("[IBON LIVEMAP] No matching area after filtering, falling back to DOM flow")
@@ -4219,10 +4223,10 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                     auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                     if auto_reload_interval > 0:
-                        await asyncio.sleep(auto_reload_interval)
+                        await sleep_before_auto_refresh(auto_reload_interval)
 
                     try:
-                        await tab.reload()
+                        await reload_page_if_enabled(tab)
                     except Exception as exc:
                         pass
 
@@ -4264,7 +4268,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                         if auto_reload_interval > 0:
                             debug.log(f"[AUTO RELOAD] Waiting {auto_reload_interval} seconds before next check...")
-                            await asyncio.sleep(auto_reload_interval)
+                            await sleep_before_auto_refresh(auto_reload_interval)
 
                         return False  # Return to main loop to continue monitoring
 
@@ -4332,7 +4336,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                             auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                             if auto_reload_interval > 0:
                                 debug.log(f"[AUTO RELOAD] Waiting {auto_reload_interval} seconds before next check...")
-                                await asyncio.sleep(auto_reload_interval)
+                                await sleep_before_auto_refresh(auto_reload_interval)
 
                             return False  # Return to main loop to continue monitoring
 
@@ -4381,7 +4385,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                         if auto_reload_interval > 0:
                             debug.log(f"[AUTO RELOAD] Waiting {auto_reload_interval} seconds before next check...")
-                            await asyncio.sleep(auto_reload_interval)
+                            await sleep_before_auto_refresh(auto_reload_interval)
 
                         return False  # Return to main loop to continue monitoring
 
@@ -4447,7 +4451,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                             auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                             if auto_reload_interval > 0:
                                 debug.log(f"[AUTO RELOAD] Waiting {auto_reload_interval} seconds before next check...")
-                                await asyncio.sleep(auto_reload_interval)
+                                await sleep_before_auto_refresh(auto_reload_interval)
 
                             return False  # Return to main loop to continue monitoring
 
@@ -4529,10 +4533,10 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                     # Use auto_reload_page_interval setting
                     auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                     if auto_reload_interval > 0:
-                        await asyncio.sleep(auto_reload_interval)
+                        await sleep_before_auto_refresh(auto_reload_interval)
 
                     try:
-                        await tab.reload()
+                        await reload_page_if_enabled(tab)
                         debug.log("[NEW EVENT] Page reloaded successfully")
                     except Exception as reload_exc:
                         debug.log(f"[NEW EVENT] Page reload failed: {reload_exc}")
@@ -4637,8 +4641,8 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                 if is_sold_out:
                     debug.log("[NEW EVENTBUY] Sold out detected, going back and refreshing")
                     try:
-                        await tab.back()
-                        await tab.reload()
+                        await back_if_auto_refresh_enabled(tab)
+                        await reload_page_if_enabled(tab)
                     except Exception as exc:
                         debug.log(f"[NEW EVENTBUY] Back/reload failed: {exc}")
 
@@ -4694,10 +4698,10 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         # Use auto_reload_page_interval setting
                         auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                         if auto_reload_interval > 0:
-                            await asyncio.sleep(auto_reload_interval)
+                            await sleep_before_auto_refresh(auto_reload_interval)
 
                         try:
-                            await tab.reload()
+                            await reload_page_if_enabled(tab)
                             debug.log("[IBON AREA] Page reloaded successfully")
                         except Exception as reload_exc:
                             debug.log(f"[IBON AREA] Page reload failed: {reload_exc}")
@@ -4788,8 +4792,8 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                             #is_button_clicked = press_button(tab, By.CSS_SELECTOR, 'a.btn.btn-primary')
                             # plan-B, easy and better than plan-A
                             try:
-                                await tab.back()
-                                await tab.reload()
+                                await back_if_auto_refresh_enabled(tab)
+                                await reload_page_if_enabled(tab)
                             except Exception as exc:
                                 pass
 

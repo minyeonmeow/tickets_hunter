@@ -10,6 +10,7 @@ from urllib.parse import quote, unquote
 from zendriver import cdp
 
 import util
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled
 from nodriver_common import check_and_handle_pause, play_sound_while_ordering
 from nodriver_common import CONST_FROM_TOP_TO_BOTTOM
 
@@ -387,7 +388,7 @@ async def nodriver_fansigo_click_show(tab, show_dict, config_dict):
 
     debug.log(f"[FANSIGO] Navigating to show: {href}")
 
-    await tab.get(href)
+    await navigate_page_if_enabled(tab, href)
 
 def fansigo_match_by_keyword(items: list, keyword_string: str, text_key: str = "text") -> dict:
     """Match item by keyword string
@@ -831,7 +832,7 @@ async def nodriver_fansigo_main(tab, url, config_dict):
             _state["is_cookie_injected"] = True
             if injected:
                 debug.log("[FANSIGO] Cookie injected on login page, reloading")
-                await tab.reload()
+                await reload_page_if_enabled(tab)
             else:
                 debug.log("[FANSIGO] No credentials configured, please login manually")
         return tab
@@ -841,7 +842,7 @@ async def nodriver_fansigo_main(tab, url, config_dict):
         _state["is_cookie_injected"] = await nodriver_fansigo_inject_cookie(tab, config_dict)
         if _state["is_cookie_injected"]:
             debug.log("[FANSIGO] Cookie injected on non-login page, reloading")
-            await tab.reload()
+            await reload_page_if_enabled(tab)
 
     # Handle checkout page - stop automation
     if page_type == "checkout" or page_type == "order_result":

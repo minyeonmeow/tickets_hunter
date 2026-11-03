@@ -11,6 +11,8 @@ import traceback
 from zendriver import cdp
 
 import util
+from nodriver_common import click_refresh_if_enabled
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     check_and_handle_pause,
     evaluate_with_pause_check,
@@ -456,10 +458,13 @@ async def nodriver_ticketplus_account_auto_fill(tab, config_dict):
 
 async def _ticketplus_click_refresh_button(tab, debug):
     """Click float-btn refresh button for partial DOM update; return True if clicked."""
+    if not util.is_auto_refresh_enabled():
+        return False
+
     try:
         btn = await tab.query_selector('button.float-btn')
         if btn:
-            await btn.click()
+            await click_refresh_if_enabled(btn)
             await asyncio.sleep(0.3)
             debug.log("[REFRESH] Clicked update button (partial refresh)")
             return True
@@ -476,7 +481,7 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
     date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
     date_auto_fallback = config_dict.get('date_auto_fallback', False)
     pass_date_is_sold_out_enable = config_dict["tixcraft"]["pass_date_is_sold_out"]
-    auto_reload_coming_soon_page_enable = config_dict["tixcraft"]["auto_reload_coming_soon_page"]
+    auto_reload_coming_soon_page_enable = (config_dict["tixcraft"]["auto_reload_coming_soon_page"]) and util.is_auto_refresh_enabled()
 
     debug.log("date_auto_select_mode:", auto_select_mode)
     debug.log("date_keyword:", date_keyword)
@@ -616,7 +621,7 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
                         event_id = current_url.split('/activity/')[-1].split('/')[0].split('?')[0]
                         order_url = 'https://ticketplus.com.tw/order/' + event_id + '/' + session_id
                         debug.log(f"[TicketPlus DATE] Vue data: date={target_session.get('date', '')} sessionId={session_id}")
-                        await tab.get(order_url)
+                        await navigate_page_if_enabled(tab, order_url)
                         is_date_clicked = True
 
         except Exception as exc:
@@ -817,13 +822,13 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
                 reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
                 if reload_interval > 0:
                     debug.log(f"[TicketPlus DATE] Waiting {reload_interval}s before auto-reload...")
-                    await asyncio.sleep(reload_interval)
+                    await sleep_before_auto_refresh(reload_interval)
                 else:
                     await asyncio.sleep(1.0)
 
                 clicked = await _ticketplus_click_refresh_button(tab, debug)
                 if not clicked:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                     debug.log("[TicketPlus DATE] Page reloaded, waiting for content...")
                     await asyncio.sleep(0.5)
             except Exception as exc:
@@ -1775,7 +1780,7 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
                 debug.log("[ORDER FAIL] Popup dismissed after submit, refreshing ticket availability")
                 _state["order_page_visited"] = False
                 try:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                 except Exception as reload_exc:
                     debug.log(f"[ORDER FAIL] Reload failed: {reload_exc}")
                 return
@@ -1791,7 +1796,7 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
                     debug.log("[ORDER FAIL] Popup dismissed during queue monitoring, refreshing ticket availability")
                     _state["order_page_visited"] = False
                     try:
-                        await tab.reload()
+                        await reload_page_if_enabled(tab)
                     except Exception as reload_exc:
                         debug.log(f"[ORDER FAIL] Reload failed: {reload_exc}")
                     return
@@ -1804,12 +1809,12 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
         if auto_reload_interval >= 0:
             if auto_reload_interval > 0:
                 debug.log(f"[AUTO RELOAD] Waiting {auto_reload_interval} seconds before reload...")
-                await asyncio.sleep(auto_reload_interval)
+                await sleep_before_auto_refresh(auto_reload_interval)
             debug.log("[AUTO RELOAD] Refreshing ticket count...")
             try:
                 clicked = await _ticketplus_click_refresh_button(tab, debug)
                 if not clicked:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                     debug.log("[AUTO RELOAD] Full page reload (button not found)")
             except Exception as reload_exc:
                 debug.log(f"[AUTO RELOAD] Reload failed: {reload_exc}")
@@ -2162,7 +2167,7 @@ async def nodriver_ticketplus_main(tab, url, config_dict, ocr, Captcha_Browser):
         is_homepage_target = config_homepage in ['https://ticketplus.com.tw', 'ticketplus.com.tw']
         if not is_homepage_target and url.lower() != config_dict["homepage"].lower():
             try:
-                await tab.get(config_dict["homepage"])
+                await navigate_page_if_enabled(tab, config_dict["homepage"])
             except Exception as e:
                 pass
 
@@ -2220,7 +2225,7 @@ async def nodriver_ticketplus_main(tab, url, config_dict, ocr, Captcha_Browser):
             if is_order_fail_handled is True:
                 debug.log("[ORDER FAIL] Reloading page to refresh ticket availability")
                 try:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                     await asyncio.sleep(0.5)
                 except Exception as reload_exc:
                     debug.log(f"[ORDER FAIL] Reload failed: {reload_exc}")

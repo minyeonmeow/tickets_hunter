@@ -15,6 +15,8 @@ from zendriver import cdp
 from zendriver.core.keys import SpecialKeys
 
 import util
+from nodriver_common import evaluate_refresh_if_enabled
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     nodriver_check_modal_dialog_popup,
     play_sound_while_ordering,
@@ -613,15 +615,15 @@ async def nodriver_hkticketing_date_auto_select(tab, config_dict, fail_list):
 
     # Auto reload if page not ready
     if not is_page_ready:
-        auto_reload_coming_soon_page = config_dict["tixcraft"].get("auto_reload_coming_soon_page", False)
+        auto_reload_coming_soon_page = (config_dict["tixcraft"].get("auto_reload_coming_soon_page", False)) and util.is_auto_refresh_enabled()
         if auto_reload_coming_soon_page:
             debug.log("[HKTICKETING DATE] Page not ready, reloading...")
 
             if config_dict["advanced"]["auto_reload_page_interval"] > 0:
-                await asyncio.sleep(config_dict["advanced"]["auto_reload_page_interval"])
+                await sleep_before_auto_refresh(config_dict["advanced"]["auto_reload_page_interval"])
 
             try:
-                await tab.reload()
+                await reload_page_if_enabled(tab)
             except Exception as exc:
                 pass
 
@@ -1154,10 +1156,13 @@ async def nodriver_hkticketing_type02_check_traffic_overload(tab, config_dict=No
     Returns:
         bool: True if traffic overload was detected (and refresh clicked), False otherwise
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     debug = util.create_debug_logger(config_dict)
 
     try:
-        result = await tab.evaluate('''
+        result = await evaluate_refresh_if_enabled(tab, '''
             (function() {
                 // Look for the refresh button that indicates traffic overload
                 var refreshBtn = document.querySelector('button.mz-no-data-btn');
@@ -2331,6 +2336,9 @@ async def nodriver_hkticketing_url_redirect(tab, url, config_dict):
     Handle URL redirect for queue and error pages
     Reference: chrome_tixcraft.py hkticketing_url_redirect (line 8201-8262)
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     debug = util.create_debug_logger(config_dict)
     is_redirected = False
 
@@ -2349,14 +2357,14 @@ async def nodriver_hkticketing_url_redirect(tab, url, config_dict):
                     break
 
             try:
-                await tab.get(entry_url)
+                await navigate_page_if_enabled(tab, entry_url)
                 is_redirected = True
                 debug.log(f"[HKTICKETING REDIRECT] Redirected to: {entry_url}")
             except Exception as exc:
                 pass
 
             if config_dict["advanced"]["auto_reload_page_interval"] > 0:
-                await asyncio.sleep(config_dict["advanced"]["auto_reload_page_interval"])
+                await sleep_before_auto_refresh(config_dict["advanced"]["auto_reload_page_interval"])
 
             if is_redirected:
                 break
@@ -2379,7 +2387,7 @@ async def nodriver_hkticketing_url_redirect(tab, url, config_dict):
         if is_need_refresh:
             entry_url = "https://hotshow.hkticketing.com/"
             try:
-                await tab.get(entry_url)
+                await navigate_page_if_enabled(tab, entry_url)
                 is_redirected = True
                 debug.log(f"[HKTICKETING REDIRECT] Access denied, redirected to: {entry_url}")
             except Exception as exc:
@@ -2392,6 +2400,9 @@ async def nodriver_hkticketing_content_refresh(tab, url, config_dict):
     Handle content error and refresh page
     Reference: chrome_tixcraft.py hkticketing_content_refresh (line 8264-8343)
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     debug = util.create_debug_logger(config_dict)
     is_redirected = False
 
@@ -2425,14 +2436,14 @@ async def nodriver_hkticketing_content_refresh(tab, url, config_dict):
         if is_need_refresh:
             debug.log("[HKTICKETING CONTENT] Start to automatically refresh page.")
             try:
-                await tab.get(new_url)
+                await navigate_page_if_enabled(tab, new_url)
                 is_redirected = True
                 debug.log(f"[HKTICKETING CONTENT] Redirected to: {new_url}")
             except Exception as exc:
                 pass
 
             if config_dict["advanced"]["auto_reload_page_interval"] > 0:
-                await asyncio.sleep(config_dict["advanced"]["auto_reload_page_interval"])
+                await sleep_before_auto_refresh(config_dict["advanced"]["auto_reload_page_interval"])
 
     return is_redirected
 
@@ -2441,6 +2452,9 @@ async def nodriver_hkticketing_travel_iframe(tab, config_dict):
     Traverse iframes for error detection
     Reference: chrome_tixcraft.py hkticketing_travel_iframe (line 8345-8400)
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     debug = util.create_debug_logger(config_dict)
     is_redirected = False
 
@@ -2473,7 +2487,7 @@ async def nodriver_hkticketing_travel_iframe(tab, config_dict):
                             url = await tab.evaluate('window.location.href')
                             domain_name = url.split('/')[2]
                             new_url = "https://%s/default.aspx" % (domain_name)
-                            await tab.get(new_url)
+                            await navigate_page_if_enabled(tab, new_url)
                             is_redirected = True
                             debug.log(f"[HKTICKETING IFRAME] Error detected in iframe, redirected to: {new_url}")
                             break
@@ -2556,10 +2570,10 @@ async def nodriver_hkticketing_main(tab, url, config_dict):
             await asyncio.sleep(0.5)
             homepage = config_dict.get("homepage", "").strip()
             if homepage and 'hkt.hkticketing.com' in homepage:
-                await tab.get(homepage)
+                await navigate_page_if_enabled(tab, homepage)
                 debug.log(f"[HKTICKETING TYPE02] Redirecting to: {homepage}")
             else:
-                await tab.get("https://hkt.hkticketing.com/hant/#/home")
+                await navigate_page_if_enabled(tab, "https://hkt.hkticketing.com/hant/#/home")
                 debug.log("[HKTICKETING TYPE02] Redirecting to home page")
         return tab
 
@@ -2671,7 +2685,7 @@ async def nodriver_hkticketing_main(tab, url, config_dict):
                         if not is_same_page and not is_homepage_default:
                             if 'default.aspx' in current_url or current_url.endswith('/'):
                                 debug.log(f"[HKTICKETING LOGIN] Redirecting to event page: {homepage}")
-                                await tab.get(homepage)
+                                await navigate_page_if_enabled(tab, homepage)
                                 await asyncio.sleep(1.0)
                 except Exception as redirect_error:
                     debug.log(f"[HKTICKETING LOGIN] Redirect error: {redirect_error}")

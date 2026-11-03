@@ -109,6 +109,25 @@ def get_app_root():
     return app_root
 
 
+CONST_AUTO_REFRESH_DISABLED_FILE = "MAXBOT_AUTO_REFRESH_DISABLED.txt"
+
+
+def is_auto_refresh_enabled():
+    """Global, persistent switch shared by all profiles and running processes."""
+    return not os.path.isfile(os.path.join(get_app_root(), CONST_AUTO_REFRESH_DISABLED_FILE))
+
+
+def set_auto_refresh_enabled(enabled):
+    """Only controls bot refreshes; it never pauses detection or manual F5."""
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    path = pathlib.Path(get_app_root()) / CONST_AUTO_REFRESH_DISABLED_FILE
+    if enabled:
+        path.unlink(missing_ok=True)
+    else:
+        path.touch(exist_ok=True)
+
+
 # ===== Multi-instance support =====
 # Each bot process owns an instance id (derived from its config filename).
 # State files (pause flag, last URL, online answer) resolve through

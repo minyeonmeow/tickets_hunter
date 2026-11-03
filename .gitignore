@@ -2,6 +2,7 @@
 /.vscode
 /.idea
 .venv/
+.build-venv/
 
 # Python cache
 __pycache__/
@@ -17,6 +18,7 @@ __pycache__/
 /src/MAXBOT_INT28_IDLE.txt
 /src/MAXBOT_QUESTION.txt
 /src/heartbeat.txt
+/src/MAXBOT_*.txt
 /src/profiles/
 /src/instances/
 src/webdriver/*/data/settings.json

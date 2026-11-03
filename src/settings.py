@@ -599,6 +599,29 @@ class InstancesHandler(tornado.web.RequestHandler):
         instances = [get_instance_status(name) for name in list_instance_ids()]
         self.write({"instances": instances})
 
+class AutoRefreshHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_header("Cache-Control", "no-store")
+        self.write({"enabled": util.is_auto_refresh_enabled()})
+
+    def post(self):
+        try:
+            body = json.loads(self.request.body)
+            if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+                raise ValueError("enabled must be a boolean")
+        except (ValueError, TypeError):
+            self.set_status(400)
+            self.write({"error": "enabled must be a boolean"})
+            return
+        try:
+            util.set_auto_refresh_enabled(body["enabled"])
+        except OSError:
+            self.set_status(500)
+            self.write({"error": "Unable to save auto-refresh mode"})
+            return
+        self.write({"enabled": util.is_auto_refresh_enabled()})
+
+
 class PauseHandler(tornado.web.RequestHandler):
     def get(self):
         profile_name = self.get_query_argument("profile", "")
@@ -1025,14 +1048,7 @@ class QueryHandler(tornado.web.RequestHandler):
         #print("answer_text_output:", answer_text_output)
         self.write(answer_text_output)
 
-async def main_server():
-    ocr = None
-    try:
-        ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
-    except Exception as exc:
-        print(exc)
-        pass
-
+def create_application(ocr=None):
     app = Application([
         ("/version", VersionHandler),
         ("/shutdown", ShutdownHandler),
@@ -1041,6 +1057,7 @@ async def main_server():
         # status api
         ("/status", StatusHandler),
         ("/instances", InstancesHandler),
+        ("/auto_refresh", AutoRefreshHandler),
         ("/pause", PauseHandler),
         ("/resume", ResumeHandler),
         ("/stop", StopHandler),
@@ -1062,6 +1079,19 @@ async def main_server():
     app.ocr = ocr;
     app.version = CONST_APP_VERSION;
 
+    return app
+
+
+async def main_server():
+    ocr = None
+    try:
+        ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
+    except Exception as exc:
+        print(exc)
+        pass
+
+    app = create_application(ocr)
+
     # Get server_port from config, fallback to default (Issue #156)
     _, config_dict = load_json()
     server_port = config_dict.get("advanced", {}).get("server_port", CONST_SERVER_PORT)
@@ -1076,7 +1106,8 @@ async def main_server():
 
     url = "http://127.0.0.1:" + str(server_port) + "/settings.html"
     print("goto url:", url)
-    webbrowser.open_new(url)
+    if os.environ.get("TICKETS_HUNTER_NO_BROWSER") != "1":
+        webbrowser.open_new(url)
     await asyncio.Event().wait()
 
 def get_server_port():

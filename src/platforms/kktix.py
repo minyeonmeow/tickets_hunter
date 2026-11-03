@@ -18,6 +18,7 @@ import webbrowser
 from zendriver import cdp
 
 import util
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     cdp_click_at,
     check_and_handle_pause,
@@ -557,7 +558,7 @@ async def nodriver_kktix_signin(tab, url, config_dict):
                     elif (current_url.endswith('/') or '/users/' in current_url) and target_url != current_url:
                         # If on homepage or user page, manually redirect to back_to URL
                         debug.log(f"[KKTIX SIGNIN] Currently on homepage/user page, redirecting to: {target_url}")
-                        await tab.get(target_url)
+                        await navigate_page_if_enabled(tab, target_url)
                         await asyncio.sleep(random.uniform(1.2, 2.3))
                         has_redirected = True
                     else:
@@ -606,7 +607,7 @@ async def nodriver_kktix_redirect_to_signin_if_guest(tab, url, config_dict):
         sign_in_url = "https://kktix.com/users/sign_in?back_to=" + urllib.parse.quote(url, safe='')
         debug.log("[KKTIX] Guest session on registration page, redirecting to sign_in")
         try:
-            await tab.get(sign_in_url)
+            await navigate_page_if_enabled(tab, sign_in_url)
         except Exception as exc:
             debug.log(f"[KKTIX] Redirect to sign_in failed: {exc}")
 
@@ -2426,10 +2427,10 @@ async def nodriver_kktix_reg_new_main(tab, config_dict, fail_list, played_sound_
                     debug.log("[KKTIX] no match any price, start to refresh page...")
 
                     if config_dict["advanced"]["auto_reload_page_interval"] > 0:
-                        await asyncio.sleep(config_dict["advanced"]["auto_reload_page_interval"])
+                        await sleep_before_auto_refresh(config_dict["advanced"]["auto_reload_page_interval"])
 
                     try:
-                        await tab.reload()
+                        await reload_page_if_enabled(tab)
                     except Exception as exc:
                         pass
 
@@ -2576,7 +2577,7 @@ async def nodriver_kktix_main(tab, url, config_dict):
                 if current_time - last_redirect_time > redirect_interval:
                     try:
                         _state["last_homepage_redirect_time"] = current_time
-                        await tab.get(homepage)
+                        await navigate_page_if_enabled(tab, homepage)
                     except Exception:
                         pass
 
@@ -2594,7 +2595,7 @@ async def nodriver_kktix_main(tab, url, config_dict):
                 _state["next_button_pressed_time"] = 0
                 debug.log("[KKTIX] Alert triggered reload, refreshing page...")
                 try:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                 except Exception as reload_exc:
                     debug.log(f"[KKTIX] Alert-triggered reload failed: {reload_exc}")
                 # Reload is a recovery path, not a terminal state.
@@ -2612,7 +2613,7 @@ async def nodriver_kktix_main(tab, url, config_dict):
                 _state["next_button_pressed_time"] = 0
                 debug.log("[KKTIX] Failure modal dismissed, refreshing page...")
                 try:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                 except Exception as reload_exc:
                     debug.log(f"[KKTIX] Post-modal reload failed: {reload_exc}")
                 return False

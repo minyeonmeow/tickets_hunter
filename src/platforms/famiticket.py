@@ -7,6 +7,7 @@ import json
 import random
 
 import util
+from nodriver_common import navigate_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     CONST_FROM_TOP_TO_BOTTOM,
     CONST_MAXBOT_ANSWER_ONLINE_FILE,
@@ -232,7 +233,7 @@ async def nodriver_fami_date_auto_select(tab, config_dict, last_activity_url):
     auto_select_mode = config_dict["date_auto_select"].get("mode", CONST_FROM_TOP_TO_BOTTOM)
     date_keyword = config_dict["date_auto_select"].get("date_keyword", "").strip()
     date_auto_fallback = config_dict.get('date_auto_fallback', False)
-    auto_reload_coming_soon_page_enable = config_dict["tixcraft"].get("auto_reload_coming_soon_page", False)
+    auto_reload_coming_soon_page_enable = (config_dict["tixcraft"].get("auto_reload_coming_soon_page", False)) and util.is_auto_refresh_enabled()
     auto_reload_page_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
 
     debug.log(f"[FAMI DATE] date_keyword: {date_keyword}")
@@ -359,10 +360,10 @@ async def nodriver_fami_date_auto_select(tab, config_dict, last_activity_url):
                 debug.log("[FAMI DATE] Date list is empty, triggering auto-reload")
 
                 if auto_reload_page_interval > 0:
-                    await asyncio.sleep(auto_reload_page_interval)
+                    await sleep_before_auto_refresh(auto_reload_page_interval)
 
                 if last_activity_url:
-                    await tab.get(last_activity_url)
+                    await navigate_page_if_enabled(tab, last_activity_url)
                     await asyncio.sleep(0.3)
 
     except Exception as exc:
@@ -708,7 +709,7 @@ async def nodriver_fami_home_auto_select(tab, config_dict, last_activity_url):
                 auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 5)
                 if auto_reload_interval > 0:
                     debug.log(f"[FAMI HOME] No area selected, waiting {auto_reload_interval}s before retry...")
-                    await tab.sleep(auto_reload_interval)
+                    await sleep_before_auto_refresh(auto_reload_interval)
 
             return is_area_selected
         return False
@@ -769,7 +770,7 @@ async def nodriver_famiticket_main(tab, url, config_dict):
             homepage = config_dict.get("homepage", "")
             if homepage and '/Home/Activity/Info/' in homepage:
                 debug.log(f"[FAMITICKET MAIN] Redirecting to activity: {homepage[:60]}...")
-                await tab.get(homepage)
+                await navigate_page_if_enabled(tab, homepage)
                 result = True
             else:
                 debug.log("[FAMITICKET MAIN] On homepage, no redirect needed")

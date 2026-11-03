@@ -276,7 +276,7 @@ async def nodriver_goto_homepage(driver, config_dict):
             # trigger a login redirect even though the cookie is already set.
             if not is_tour_ibon:
                 try:
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                     await asyncio.sleep(random.uniform(1.0, 1.5))
                     await dismiss_pending_ibon_dialog(tab, config_dict)
                     debug.log("[IBON] Page reloaded to apply cookie session")
@@ -329,7 +329,7 @@ async def nodriver_goto_homepage(driver, config_dict):
 
                     # Reload page to apply cookie
                     debug.log("[FUNONE] Reloading page to apply cookie...")
-                    await tab.reload()
+                    await reload_page_if_enabled(tab)
                     await asyncio.sleep(1.5)
                 else:
                     debug.log("[FUNONE] Warning: ticket_session cookie not found after setting")
@@ -595,7 +595,7 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
     if now >= target_dt:
         state["reached"] = True
         try:
-            await tab.reload()
+            await reload_page_if_enabled(tab)
             print("[REFRESH] Target time reached, starting:", target_dt.strftime('%Y/%m/%d %H:%M:%S'))
         except Exception:
             pass
@@ -635,7 +635,7 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
             await asyncio.sleep(remaining)
         state["reached"] = True
         try:
-            await tab.reload()
+            await reload_page_if_enabled(tab)
             print("[REFRESH] Target time reached, starting:", target_dt.strftime('%Y/%m/%d %H:%M:%S'))
         except Exception:
             pass

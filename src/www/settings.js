@@ -6,6 +6,65 @@ const reset_button = document.querySelector('#reset_btn');
 const exit_button = document.querySelector('#exit_btn');
 const pause_button = document.querySelector('#pause_btn');
 const resume_button = document.querySelector('#resume_btn');
+const auto_refresh_button = document.querySelector('#auto_refresh_btn');
+let autoRefreshEnabled = null;
+let autoRefreshBusy = false;
+let autoRefreshRequest = 0;
+
+function renderAutoRefreshMode() {
+    const en = currentLanguage === 'en';
+    const status = document.querySelector('#auto_refresh_status');
+    document.querySelector('label[for="auto_refresh_btn"]').textContent = en ? 'Global auto-refresh' : '全域自動重整';
+    document.querySelector('#auto_refresh_help').textContent = en
+        ? 'Shared by all platforms and instances; applied immediately and remembered. Turn off for manual F5 while detection and ticket selection continue. Website updates and CAPTCHA image changes are unaffected.'
+        : '所有平台與實例共用，切換後即時生效並記住選擇。關閉後可手動 F5，程式仍持續偵測及自動選票；網站自身更新與驗證碼換圖不受影響。';
+    if (typeof autoRefreshEnabled !== 'boolean') return;
+    auto_refresh_button.textContent = autoRefreshEnabled
+        ? (en ? 'Turn off auto-refresh' : '關閉自動重整')
+        : (en ? 'Turn on auto-refresh' : '開啟自動重整');
+    auto_refresh_button.setAttribute('aria-pressed', String(autoRefreshEnabled));
+    auto_refresh_button.classList.toggle('btn-outline-primary', autoRefreshEnabled);
+    auto_refresh_button.classList.toggle('btn-warning', !autoRefreshEnabled);
+    auto_refresh_button.disabled = autoRefreshBusy;
+    status.textContent = autoRefreshEnabled
+        ? (en ? 'Auto-refresh on' : '自動重整已開啟')
+        : (en ? 'Manual refresh; detection continues' : '手動重整模式，持續偵測中');
+}
+
+function autoRefreshModeApi() {
+    if (autoRefreshBusy) return;
+    const request = ++autoRefreshRequest;
+    $.getJSON('/auto_refresh').done(function(data) {
+        if (request !== autoRefreshRequest || autoRefreshBusy || typeof data.enabled !== 'boolean') return;
+        autoRefreshEnabled = data.enabled;
+        renderAutoRefreshMode();
+    }).fail(function() {
+        if (request !== autoRefreshRequest || autoRefreshBusy) return;
+        autoRefreshEnabled = null;
+        auto_refresh_button.disabled = true;
+        auto_refresh_button.textContent = currentLanguage === 'en' ? 'Unavailable' : '尚未連線';
+        document.querySelector('#auto_refresh_status').textContent = currentLanguage === 'en'
+            ? 'Cannot read refresh mode; reconnecting…' : '無法讀取重整模式，正在重新連線…';
+    });
+}
+
+function toggleAutoRefresh() {
+    if (autoRefreshBusy || typeof autoRefreshEnabled !== 'boolean') return;
+    autoRefreshBusy = true;
+    ++autoRefreshRequest;
+    renderAutoRefreshMode();
+    $.ajax({url: '/auto_refresh', method: 'POST', contentType: 'application/json',
+        data: JSON.stringify({enabled: !autoRefreshEnabled})
+    }).done(function(data) {
+        if (typeof data.enabled === 'boolean') autoRefreshEnabled = data.enabled;
+    }).fail(function() {
+        window.alert(currentLanguage === 'en' ? 'Could not change auto-refresh mode.' : '無法變更自動重整模式，請重試。');
+    }).always(function() {
+        autoRefreshBusy = false;
+        renderAutoRefreshMode();
+        autoRefreshModeApi();
+    });
+}
 
 // preference
 const homepage = document.querySelector('#homepage');
@@ -770,6 +829,7 @@ function renderStaticTranslations() {
 }
 
 function applyLanguage(language) {
+    // The global refresh control is independent of the selected profile.
     currentLanguage = normalizeLanguage(language);
     document.documentElement.lang = currentLanguage === 'en' ? 'en' : 'zh-Hant';
     if (language_selector) {
@@ -779,6 +839,7 @@ function applyLanguage(language) {
     // Warning badges are dynamic; re-render them in the new language.
     if (typeof update_multi_open_warnings === 'function') update_multi_open_warnings(last_profile_details);
     updateThemeStatus(document.documentElement.getAttribute('data-bs-theme') || 'light');
+    renderAutoRefreshMode();
 
     if (currentHelpField) {
         const openField = currentHelpField;
@@ -1973,6 +2034,10 @@ reset_button.addEventListener('click', maxbot_reset_api);
 exit_button.addEventListener('click', maxbot_shutdown_api);
 pause_button.addEventListener('click', maxbot_pause_api);
 resume_button.addEventListener('click', maxbot_resume_api);
+auto_refresh_button.addEventListener('click', toggleAutoRefresh);
+autoRefreshModeApi();
+const autoRefreshInterval = setInterval(autoRefreshModeApi, 2000);
+window.addEventListener('beforeunload', () => clearInterval(autoRefreshInterval));
 
 const onchange_tag_list = ["input","select","textarea"];
 onchange_tag_list.forEach((tag) => {

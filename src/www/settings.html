@@ -1099,6 +1099,15 @@
           </div>
         </div>
 
+        <div class="row mb-3" id="auto_refresh_panel">
+          <label class="col-sm-2 col-form-label" for="auto_refresh_btn">全域自動重整</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <button type="button" class="btn btn-outline-primary" id="auto_refresh_btn" disabled aria-pressed="true">讀取中…</button>
+            <span class="small ms-2" id="auto_refresh_status" role="status" aria-live="polite"></span>
+            <div class="form-text" id="auto_refresh_help">所有平台與實例共用，切換後即時生效並記住選擇。關閉後可手動 F5，程式仍持續偵測及自動選票；網站自身更新與驗證碼換圖不受影響。</div>
+          </div>
+        </div>
+
         <!-- Phase 3: live overview of every instance (profiles + CLI runs) -->
         <div class="row mb-3" id="instances_panel">
           <label class="col-sm-2 col-form-label">執行中實例</label>

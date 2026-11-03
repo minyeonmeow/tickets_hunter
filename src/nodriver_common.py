@@ -20,6 +20,57 @@ import util
 import settings
 import chrome_downloader
 
+
+async def reload_page_if_enabled(tab):
+    """Check at execution time, including after a refresh delay already started."""
+    if not util.is_auto_refresh_enabled():
+        return False
+    await tab.reload()
+    return True
+
+
+async def navigate_page_if_enabled(tab, url):
+    """Preserve normal navigation, but suppress re-opening the current URL."""
+    if not util.is_auto_refresh_enabled():
+        current = await nodriver_current_url_safe(tab)
+        if not current or str(current).rstrip('/') == str(url).rstrip('/'):
+            return tab
+    return await tab.get(url)
+
+
+async def sleep_before_auto_refresh(seconds):
+    """Yield quickly when manual-refresh mode is selected during a delay."""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        if not util.is_auto_refresh_enabled():
+            return False
+        duration = min(remaining, 0.1)
+        await asyncio.sleep(duration)
+        remaining -= duration
+    return util.is_auto_refresh_enabled()
+
+
+async def back_if_auto_refresh_enabled(tab):
+    """Recovery/backtracking is a refresh path, not a manual browser action."""
+    if not util.is_auto_refresh_enabled():
+        return False
+    await tab.back()
+    return True
+
+
+async def evaluate_refresh_if_enabled(tab, script):
+    """Guard a known refresh script without altering any browser-native functions."""
+    if not util.is_auto_refresh_enabled():
+        return False
+    return await tab.evaluate(script)
+
+
+async def click_refresh_if_enabled(element):
+    if not util.is_auto_refresh_enabled():
+        return False
+    await element.click()
+    return True
+
 try:
     import ddddocr
 except Exception:

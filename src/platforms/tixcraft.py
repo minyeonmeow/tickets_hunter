@@ -23,6 +23,7 @@ except Exception:
 from zendriver import cdp
 
 import util
+from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     check_and_handle_pause,
     sleep_with_pause_check,
@@ -223,6 +224,9 @@ def _is_page_reload_enabled(config_dict, debug, log_tag):
     is on, so a site that skipped while verbose was off still logs the first
     time verbose is on.
     """
+    if not util.is_auto_refresh_enabled():
+        return False
+
     interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 0)
     try:
         is_enabled = interval > 0
@@ -281,7 +285,7 @@ async def nodriver_tixcraft_redirect(tab, url):
             entry_url = url.replace("/activity/detail/", "/activity/game/").split("#")[0]
             print("redirect to new url:", entry_url)
             try:
-                await tab.get(entry_url)
+                await navigate_page_if_enabled(tab, entry_url)
                 # 等待日期列表出現，確保頁面載入完成
                 try:
                     await tab.wait_for('#gameList > table > tbody > tr', timeout=5)
@@ -689,7 +693,7 @@ async def nodriver_ticketmaster_date_auto_select(tab, config_dict):
     # other platform reads it from there too. Reading "kktix" made this always
     # False, so a Ticketmaster page never auto-reloaded while waiting for the
     # sale to open (issue #378).
-    auto_reload_coming_soon_page_enable = config_dict.get("tixcraft", {}).get("auto_reload_coming_soon_page", False)
+    auto_reload_coming_soon_page_enable = (config_dict.get("tixcraft", {}).get("auto_reload_coming_soon_page", False)) and util.is_auto_refresh_enabled()
 
     sold_out_text_list = ["Sold out", "No tickets available"]
     find_ticket_text_list = ['Find tickets', 'See Tickets']
@@ -914,7 +918,7 @@ async def nodriver_ticketmaster_date_auto_select(tab, config_dict):
             reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 0)
             if reload_interval > 0:
                 await sleep_with_pause_check(tab, reload_interval, config_dict)
-            await tab.reload()
+            await reload_page_if_enabled(tab)
             await tab.sleep(0.3)
         except:
             pass
@@ -1011,8 +1015,8 @@ async def nodriver_ticketmaster_area_auto_select(tab, config_dict, zone_info):
             debug.log("[TICKETMASTER AREA] No areas matched keyword, reloading page...")
             try:
                 if config_dict.get("advanced", {}).get("auto_reload_page_interval", 0) > 0:
-                    await tab.sleep(config_dict["advanced"]["auto_reload_page_interval"])
-                await tab.reload()
+                    await sleep_before_auto_refresh(config_dict["advanced"]["auto_reload_page_interval"])
+                await reload_page_if_enabled(tab)
             except:
                 pass
         elif not area_keyword:
@@ -1689,7 +1693,7 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
     date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
     date_auto_fallback = config_dict.get('date_auto_fallback', False)  # T017: Safe access for new field (default: strict mode)
     pass_date_is_sold_out_enable = config_dict["tixcraft"]["pass_date_is_sold_out"]
-    auto_reload_coming_soon_page_enable = config_dict["tixcraft"]["auto_reload_coming_soon_page"]
+    auto_reload_coming_soon_page_enable = (config_dict["tixcraft"]["auto_reload_coming_soon_page"]) and util.is_auto_refresh_enabled()
 
     sold_out_text_list = ["選購一空","已售完","No tickets available","Sold out","空席なし","完売した"]
     find_ticket_text_list = ['立即訂購','Find tickets', 'Start ordering','お申込みへ進む']
@@ -1918,7 +1922,7 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
 
                 if data_href:
                     debug.log("[DATE SELECT] Navigating via button[data-href]...")
-                    await tab.get(data_href)
+                    await navigate_page_if_enabled(tab, data_href)
                     is_date_clicked = True
                     click_method_used = "button[data-href]"
                     debug.log("[DATE SELECT] Successfully navigated via button[data-href]")
@@ -1978,7 +1982,7 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
 
         debug.log(f"[DATE SELECT] No date selected, reloading page...")
         try:
-            await tab.reload()
+            await reload_page_if_enabled(tab)
         except Exception:
             pass
 
@@ -2131,7 +2135,7 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
 
         debug.log(f"[AREA SELECT] Page reloading...")
         try:
-            await tab.reload()
+            await reload_page_if_enabled(tab)
         except Exception:
             pass
 
@@ -2710,7 +2714,7 @@ async def nodriver_tixcraft_ticket_main(tab, config_dict, ocr, Captcha_Browser, 
             interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
             if interval > 0:
                 await asyncio.sleep(interval)
-            await tab.reload()
+            await reload_page_if_enabled(tab)
         except Exception as reload_exc:
             debug.log(f"[TICKET SELECT] Reload failed: {reload_exc}")
 
@@ -3353,7 +3357,7 @@ async def nodriver_ticketmaster_check_ip_block(tab, config_dict, current_url="")
         if original_url:
             debug.log(f"[EPS BLOCK] Block expired, navigating back to: {original_url}")
             try:
-                await tab.get(original_url)
+                await navigate_page_if_enabled(tab, original_url)
             except Exception:
                 pass
 
@@ -3513,7 +3517,7 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
             if current_time - last_redirect_time > redirect_interval:
                 try:
                     _state["last_homepage_redirect_time"] = current_time
-                    await tab.get(homepage)
+                    await navigate_page_if_enabled(tab, homepage)
                 except Exception:
                     pass
 
@@ -3610,7 +3614,7 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
                                 reload_interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 0)
                                 if reload_interval > 0:
                                     await sleep_with_pause_check(tab, reload_interval, config_dict)
-                                await tab.reload()
+                                await reload_page_if_enabled(tab)
                             except Exception:
                                 pass
 
