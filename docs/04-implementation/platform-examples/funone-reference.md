@@ -43,6 +43,12 @@
 - date_auto_select.enable、area_auto_select.enable 控制場次／票區自動選取。
 - refresh_datetime 設定到點開始；FunOne 活動頁保留原頁面，等目標場次的
   「下一步」可點擊才操作，不強制啟用網站停用的按鈕。未設定時間則立即偵測。
+- 場次日期以月／日標準化比對，可接受斜線、點、連字號及月日格式。
+  沒有符合關鍵字時會說明原因，不會擅自點選其他場次。
+- advanced.funone_entry_retry_interval 控制未跳轉時的下一步重試間隔，預設 0.1 秒，
+  可於進階設定調整至 0.1–30 秒。按鈕停用時等待；已跳轉時不再點擊活動頁。
+  僅自動關閉明確的「尚未開賣」確認提示，其餘登入／資格視窗留給使用者處理。
+  場次已載入時不因等待下一步而重新載入整頁。
 - ticket_number、area_auto_fallback、keyword_exclude 限制可選票券。
 - ocr_captcha.enable=False 時等待人工填寫，不覆蓋未完成輸入。
 - ocr_captcha.force_submit=False 時保留選票結果，等待人工送出。
@@ -66,6 +72,9 @@ test_funone_browser.py 使用真實 Chrome 操作本機 HTML，
 測試票區索引、關鍵字、張數、人工選位、刷新與驗證碼生命週期。
 也測試下一步按鈕位於場次區塊外、停用按鈕、隱藏錯誤與大小寫。
 test_scheduled_start.py 測試到點釋放、倒數暫停及其他平台的刷新行為。
-新增 HAR 從人工按下一步之後開始，未含活動頁 DOM；活動入口以本機頁面驗證，
-尚未以實際開售活動驗證。
+2026-11-04 新增 HAR 含活動頁、場次元件與 GetNowTime 回應，
+可確認下一步位於 .round_info 內，以及網站使用伺服器時間。
+GetNowTime 為 POST /api/ApiFront/GetNowTime，回傳 IsSuccess、Value（台灣時間，精度到秒）；
+本次未新增呼叫、未將其用於校正排程時鐘。排程仍使用本機時間，之後追蹤網站按鈕狀態。
+活動入口及重試以本機 Chrome 驗證，尚未以實際開售活動驗證。
 可透過 FUNONE_TEST_CHROME 指定 Chrome 路徑；不連接票務網站。

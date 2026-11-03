@@ -689,6 +689,7 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                         "play_sound", "disable_adjacent_seat", "hide_some_image",
                         "auto_guess_options", "user_guess_string", "auto_reload_page_interval", "verbose",
                         "tixcraft_soft_block_delay",
+                        "funone_entry_retry_interval",
                         "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
                         "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
                         "discount_code"

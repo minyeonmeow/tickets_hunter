@@ -602,6 +602,13 @@
           </div>
         </div>
         <div class="row mb-3">
+          <label for="funone_entry_retry_interval" class="col-sm-2 col-form-label">FunOne 下一步重試間隔（秒）</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <input class="form-control" id="funone_entry_retry_interval" type="number" min="0.1" max="30" step="0.1" value="0.1" />
+            <small class="form-text text-muted">未跳轉且按鈕可用時重試；等待網站回應、跳轉後或有待人工處理的視窗時不連點。場次關鍵字須符合。</small>
+          </div>
+        </div>
+        <div class="row mb-3">
           <label for="browser_connection_mode" class="col-sm-2 col-form-label">瀏覽器啟動方式</label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <select class="form-select" id="browser_connection_mode">

@@ -97,6 +97,7 @@ const reset_browser_interval = document.querySelector('#reset_browser_interval')
 const server_port = document.querySelector('#server_port');
 const browser_connection_mode = document.querySelector('#browser_connection_mode');
 const browser_port = document.querySelector('#browser_port');
+const funone_entry_retry_interval = document.querySelector('#funone_entry_retry_interval');
 const proxy_server_port = document.querySelector('#proxy_server_port');
 const window_size = document.querySelector('#window_size');
 const disable_adjacent_seat = document.querySelector('#disable_adjacent_seat');
@@ -1292,6 +1293,7 @@ function load_settins_to_form(settings)
         server_port.value = settings.advanced.server_port || 16888;
         browser_connection_mode.value = settings.advanced.browser_connection_mode || 'attach';
         browser_port.value = settings.advanced.browser_port ?? 19327;
+        funone_entry_retry_interval.value = settings.advanced.funone_entry_retry_interval ?? 0.1;
         proxy_server_port.value  = settings.advanced.proxy_server_port;
         window_size.value  = settings.advanced.window_size;
 
@@ -1548,6 +1550,11 @@ function maxbot_shutdown_api()
 
 function save_changes_to_dict(silent_flag)
 {
+    const funoneRetry = Number(funone_entry_retry_interval.value);
+    if (!Number.isFinite(funoneRetry) || funoneRetry < 0.1 || funoneRetry > 30) {
+        message('FunOne 下一步重試間隔請填寫 0.1 到 30 秒。');
+        return false;
+    }
     const browserPortValue = Number(browser_port.value);
     if (!Number.isInteger(browserPortValue) || browserPortValue < 1024 || browserPortValue > 65535) {
         browser_port.classList.add('is-invalid');
@@ -1615,6 +1622,7 @@ function save_changes_to_dict(silent_flag)
             settings.advanced.server_port = parseInt(server_port.value) || 16888;
             settings.advanced.browser_connection_mode = browser_connection_mode.value;
             settings.advanced.browser_port = browserPortValue;
+            settings.advanced.funone_entry_retry_interval = funoneRetry;
             settings.advanced.proxy_server_port = proxy_server_port.value;
             settings.advanced.window_size = window_size.value;
 

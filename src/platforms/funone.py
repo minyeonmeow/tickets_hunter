@@ -285,6 +285,39 @@ CONST_FUNONE_SESSION_SCAN_JS = r"""
 """
 
 
+def _funone_session_text(text):
+    """Compare dates consistently across the site's slash/dot/hyphen formats."""
+    return re.sub(r'(?<!\d)(\d{1,2})[/.月-](\d{1,2})日?(?!\d)',
+                  lambda match: f'{int(match[1])}/{int(match[2])}', str(text).casefold())
+
+
+def _funone_entry_status(config_dict, reason):
+    if _state.get("entry_wait_reason") != reason:
+        util.create_debug_logger(config_dict, enabled=True).log("[FUNONE] " + reason)
+        _state["entry_wait_reason"] = reason
+
+
+async def _funone_entry_dialog(tab):
+    """Dismiss only an explicit not-open-yet response; leave account/verification dialogs."""
+    if await _funone_actions_paused():
+        return 'manual'
+    return await tab.evaluate(r"""(() => {
+        const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden' &&
+            getComputedStyle(e).opacity !== '0';
+        const dialogs = Array.from(document.querySelectorAll(
+            '[role="dialog"], .vfm__content, .modal_container, .modal')).filter(visible);
+        for (const dialog of dialogs) {
+            const text = dialog.innerText || '';
+            if (/尚未開賣|尚未開放購票|未到開賣|還未開賣|not (?:yet )?(?:on sale|open)|sale has not started/i.test(text)) {
+                const button = Array.from(dialog.querySelectorAll('button')).find(e =>
+                    visible(e) && !e.disabled && /^(確定|確認|知道了|關閉|ok|close)$/i.test((e.innerText || '').trim()));
+                if (button) { button.click(); return 'retry'; }
+            }
+        }
+        return dialogs.length ? 'manual' : '';
+    })()""")
+
+
 async def _funone_actions_paused(config_dict=None):
     return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
 
@@ -293,15 +326,33 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
     """Select the intended session and click its enabled Next control."""
     if await _funone_actions_paused(config_dict):
         return False
+    try:
+        retry_interval = max(0.1, min(30, float(config_dict.get("advanced", {}).get(
+            "funone_entry_retry_interval", 0.1))))
+    except (ValueError, TypeError):
+        retry_interval = 0.1
     if (_state.get("session_click_url") == url and
-            time.monotonic() - _state.get("session_click_time", 0) < 5):
+            time.monotonic() - _state.get("session_click_time", 0) < retry_interval):
         return False
     debug = util.create_debug_logger(config_dict)
     try:
+        if '/activity/activity_detail/' not in (await nodriver_current_url_safe(tab) or ''):
+            return False
+        dialog = await _funone_entry_dialog(tab)
+        if dialog:
+            if dialog == 'retry':
+                _state["session_click_time"] = time.monotonic()
+                _state["session_click_url"] = url
+                _funone_entry_status(config_dict, "網站尚未開賣，稍後重試下一步。")
+            else:
+                _funone_entry_status(config_dict, "有待處理的視窗，請先確認登入、資格或提示內容。")
+            return False
         sessions = await tab.evaluate("(() => {" + CONST_FUNONE_SESSION_SCAN_JS + """
             return rows.map(row => ({index:row.index, text:row.text, enabled:!!enabled(row)}));
         })()""")
+        _state["entry_has_sessions"] = bool(isinstance(sessions, list) and sessions)
         if not isinstance(sessions, list) or not sessions:
+            _funone_entry_status(config_dict, "等待場次與下一步按鈕載入。")
             return False
         options = config_dict.get("date_auto_select", {})
         keyword = options.get("date_keyword", "")
@@ -312,19 +363,23 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
                 groups = [part.strip() for part in keyword.split(";") if part.strip()]
             for group in groups:
                 matched = [row for row in sessions if all(
-                    word.casefold() in row["text"].casefold() for word in group.split())]
+                    _funone_session_text(word) in _funone_session_text(row["text"]) for word in group.split())]
                 if matched:
                     chosen = matched
                     break
             if not chosen and not config_dict.get("date_auto_fallback", False):
+                _funone_entry_status(config_dict, "沒有符合場次關鍵字的場次；請檢查日期關鍵字，或清空後由程式選擇。")
                 return False
         # Keep waiting for a matching session instead of choosing an unrelated
         # session just because the intended Next button is still disabled.
         candidates = [row for row in (chosen or sessions) if row.get("enabled")]
         if not candidates:
+            _funone_entry_status(config_dict, "目標場次下一步尚不可點擊，持續等待網站開放。")
             return False
         row = candidates[util.get_target_index_by_mode(len(candidates), options.get("mode", "random"))]
         if await _funone_actions_paused(config_dict):
+            return False
+        if (await nodriver_current_url_safe(tab)) != url:
             return False
         script = ("(() => {" + CONST_FUNONE_SESSION_SCAN_JS +
                   "\nconst index = " + json.dumps(row["index"]) +
@@ -338,7 +393,7 @@ async def nodriver_funone_date_auto_select(tab, url, config_dict):
         if clicked is True:
             _state["session_click_url"] = url
             _state["session_click_time"] = time.monotonic()
-            debug.log("[FUNONE] 已點擊場次下一步，等待網站回應。")
+            _funone_entry_status(config_dict, "已點擊場次下一步；若未跳轉且按鈕可用，將依間隔重試。")
             return True
     except Exception as exc:
         debug.log(f"[FUNONE] 場次下一步處理失敗：{exc}")
@@ -1511,7 +1566,7 @@ def _funone_reset_page_state(url, document_id=None):
         _state["flow_document_id"] = document_id
     for key in ("captcha_reload_from", "captcha_filled_signature", "ocr_exhausted_image",
                 "handoff_notified", "captcha_ready_logged", "next_ocr_time",
-                "session_click_url", "session_click_time", "captcha_error_handled"):
+                "session_click_url", "session_click_time", "captcha_error_handled", "entry_wait_reason", "entry_has_sessions"):
         _state.pop(key, None)
     _state.update(ocr_retry_count=0, next_button_clicked=False, qty_fail_reason="")
     if previous is not None:
@@ -1620,7 +1675,8 @@ async def nodriver_funone_main(tab, url, config_dict):
     if _state.get("submission_pending"):
         if await _funone_submission_pending(tab, url, config_dict):
             return tab
-    await nodriver_funone_close_popup(tab)
+    if "/activity/activity_detail/" not in url or not _state.get("next_button_clicked"):
+        await nodriver_funone_close_popup(tab)
     if not await nodriver_funone_verify_login(tab, config_dict):
         return tab
     if "/activity/activity_detail/" in url:
@@ -1628,7 +1684,7 @@ async def nodriver_funone_main(tab, url, config_dict):
             clicked = await nodriver_funone_date_auto_select(tab, url, config_dict)
             if clicked:
                 _state["next_button_clicked"] = True
-        if not _state.get("next_button_clicked"):
+        if not _state.get("next_button_clicked") and not _state.get("entry_has_sessions"):
             await nodriver_funone_auto_reload(tab, config_dict)
     elif "/purchase_choose_ticket" in url:
         await _funone_handle_ticket_flow(tab, url, config_dict)
