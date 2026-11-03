@@ -15,6 +15,7 @@ import webbrowser
 from datetime import datetime
 
 import tornado
+import tornado.websocket
 from tornado.web import Application
 from tornado.web import StaticFileHandler
 
@@ -578,10 +579,54 @@ class VersionHandler(tornado.web.RequestHandler):
     def get(self):
         self.write({"version":self.application.version})
 
+def stop_all_bots():
+    """Ask default, named and ad-hoc instances to stop without clearing their state."""
+    names = {CONST_DEFAULT_PROFILE}
+    directory = os.path.join(util.get_app_root(), "instances")
+    if os.path.isdir(directory):
+        names.update(name for name in os.listdir(directory)
+                     if is_valid_profile_name(name) and os.path.isdir(os.path.join(directory, name)))
+    for name in names:
+        maxbot_stop(name)
+
+
+def request_settings_shutdown():
+    global GLOBAL_SERVER_SHUTDOWN
+    stop_all_bots()
+    GLOBAL_SERVER_SHUTDOWN = True
+
+
+class SettingsPageConnection(tornado.websocket.WebSocketHandler):
+    """One connection per page; background tabs need no JavaScript heartbeat timer."""
+    def open(self):
+        app = self.application
+        self.page_registered = True
+        if app.ui_shutdown_handle:
+            tornado.ioloop.IOLoop.current().remove_timeout(app.ui_shutdown_handle)
+            app.ui_shutdown_handle = None
+        app.ui_connections.add(self)
+
+    def on_message(self, message):
+        pass
+
+    def on_close(self):
+        if not getattr(self, "page_registered", False):
+            return
+        app = self.application
+        app.ui_connections.discard(self)
+        if not app.ui_connections and app.ui_shutdown_handle is None:
+            app.ui_shutdown_handle = tornado.ioloop.IOLoop.current().call_later(
+                5, self.shutdown_if_empty)
+
+    def shutdown_if_empty(self):
+        self.application.ui_shutdown_handle = None
+        if not self.application.ui_connections:
+            request_settings_shutdown()
+
+
 class ShutdownHandler(tornado.web.RequestHandler):
     def get(self):
-        global GLOBAL_SERVER_SHUTDOWN
-        GLOBAL_SERVER_SHUTDOWN = True
+        request_settings_shutdown()
         self.write({"showdown": GLOBAL_SERVER_SHUTDOWN})
 
 class StatusHandler(tornado.web.RequestHandler):
@@ -1072,6 +1117,7 @@ class QueryHandler(tornado.web.RequestHandler):
 
 def create_application(ocr=None):
     app = Application([
+        ("/settings-page", SettingsPageConnection),
         ("/version", VersionHandler),
         ("/shutdown", ShutdownHandler),
         ("/sendkey", SendkeyHandler),
@@ -1100,6 +1146,8 @@ def create_application(ocr=None):
     ])
     app.ocr = ocr;
     app.version = CONST_APP_VERSION;
+    app.ui_connections = set()
+    app.ui_shutdown_handle = None
 
     return app
 
@@ -1214,14 +1262,18 @@ if __name__ == "__main__":
     global GLOBAL_SERVER_SHUTDOWN
     GLOBAL_SERVER_SHUTDOWN = False
     
+    stop_all_bots()
     threading.Thread(target=settgins_gui_timer, daemon=True).start()
     threading.Thread(target=web_server, daemon=True).start()
     
-    clean_tmp_file()
+    # Keep pause/stop flags intact: clearing them could resume an old bot.
 
     print("To exit web server press Ctrl + C.")
-    while True:
-        time.sleep(0.4)
-        if GLOBAL_SERVER_SHUTDOWN:
-            break
+    try:
+        while not GLOBAL_SERVER_SHUTDOWN:
+            time.sleep(0.4)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_all_bots()
     print("Bye bye, see you next time.")

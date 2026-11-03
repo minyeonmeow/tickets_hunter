@@ -2589,3 +2589,32 @@ document.addEventListener('keydown', function(e) {
 window.addEventListener('beforeunload', () => {
     stopQuestionPolling();
 });
+
+// Closing the final settings page shuts down its local server after a reload grace period.
+let settingsPageSocket = null;
+let settingsPageReconnect = null;
+let settingsPageLeaving = false;
+function connectSettingsPage() {
+    if (settingsPageLeaving) return;
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${location.host}/settings-page`);
+    settingsPageSocket = socket;
+    socket.onclose = () => {
+        if (!settingsPageLeaving && settingsPageSocket === socket) {
+            settingsPageReconnect = setTimeout(connectSettingsPage, 1000);
+        }
+    };
+    socket.onerror = () => socket.close();
+}
+window.addEventListener('pagehide', () => {
+    settingsPageLeaving = true;
+    clearTimeout(settingsPageReconnect);
+    if (settingsPageSocket) settingsPageSocket.close();
+});
+window.addEventListener('pageshow', (event) => {
+    if (event.persisted) {
+        settingsPageLeaving = false;
+        connectSettingsPage();
+    }
+});
+connectSettingsPage();
