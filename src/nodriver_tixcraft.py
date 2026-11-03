@@ -705,6 +705,18 @@ async def reload_config(config_dict, last_mtime, config_filepath):
     return config_dict, last_mtime
 
 async def main(args):
+    session = {}
+    try:
+        await _run_bot(args, session)
+    finally:
+        await nodriver_disconnect_browser(session.get("browser"))
+        if session.get("lock"):
+            session["lock"].close()
+        if session.get("heartbeat"):
+            util.force_remove_file(util.get_instance_state_path(session["heartbeat"]))
+
+
+async def _run_bot(args, session):
     # Derive instance id for multi-instance isolation:
     # --instance > --input filename stem > "default".
     # A config named settings.json always maps to "default" (legacy single-run).
@@ -745,48 +757,64 @@ async def main(args):
     if not config_dict is None:
         sandbox = False
         conf = get_extension_config(config_dict, args)
-        nodriver_overwrite_prefs(conf)
-        # PS: nodrirver run twice always cause error:
-        # Failed to connect to browser
-        # One of the causes could be when you are running as root.
-        # In that case you need to pass no_sandbox=True
-        #driver = await uc.start(conf, sandbox=sandbox, headless=config_dict["advanced"]["headless"])
-        driver = await uc.start(conf)
-        if not driver is None:
-            # Output actual CDP port for MCP connection (when mcp_debug is requested)
-            mcp_debug_requested = (args and hasattr(args, 'mcp_debug') and args.mcp_debug) or \
-                                  config_dict["advanced"].get("mcp_debug_port", 0) > 0
-            if mcp_debug_requested:
-                actual_port = driver.config.port
-                print(f"[MCP DEBUG] Browser started on actual port: {actual_port}")
-                print(f"[MCP DEBUG] Update .mcp.json with: --browserUrl http://127.0.0.1:{actual_port}")
-                # Write port to file for /mcpstart command auto-update
-                # Non-default instances write into instances/<id>/ to avoid clobbering
-                try:
-                    if util.get_instance_id() == "default":
-                        port_file = os.path.join(os.path.dirname(__file__), '..', '.temp', 'mcp_port.txt')
-                        os.makedirs(os.path.dirname(port_file), exist_ok=True)
-                    else:
-                        port_file = util.get_instance_state_path('mcp_port.txt')
-                    with open(port_file, 'w') as f:
-                        f.write(str(actual_port))
-                    print(f"[MCP DEBUG] Port saved to {port_file}")
-                except Exception as e:
-                    print(f"[MCP DEBUG] Warning: Could not save port to file: {e}")
-            initial_tab = driver.main_tab
-            if initial_tab:
-                await nodrver_block_urls(initial_tab, config_dict)
-            tab = await nodriver_goto_homepage(driver, config_dict)
-            if tab is None:
-                print("[ERROR] Homepage navigation failed. Cannot continue.")
-                sys.exit()
-            if not initial_tab:
-                tab = await nodrver_block_urls(tab, config_dict)
-            if not config_dict["advanced"]["headless"]:
-                await nodriver_resize_window(tab, config_dict)
+        external_browser = bool(conf.host and conf.port)
+        external_disconnected = False
+        external_target_id = None
+        if external_browser:
+            try:
+                session["lock"] = util.acquire_browser_port_lock(conf.port)
+                driver, tab = await nodriver_attach_browser(conf, config_dict)
+                session["browser"] = driver
+                external_target_id = tab.target.target_id
+            except ValueError as exc:
+                logger.error(str(exc))
+                return
+            except Exception:
+                logger.error("無法連接購票瀏覽器。請先執行 start-browser.cmd，確認 Port 與設定相同，且已開啟購票網站。")
+                return
         else:
-            print("無法使用nodriver，程式無法繼續工作")
-            sys.exit()
+            nodriver_overwrite_prefs(conf)
+            # PS: nodrirver run twice always cause error:
+            # Failed to connect to browser
+            # One of the causes could be when you are running as root.
+            # In that case you need to pass no_sandbox=True
+            #driver = await uc.start(conf, sandbox=sandbox, headless=config_dict["advanced"]["headless"])
+            driver = await uc.start(conf)
+            if not driver is None:
+                # Output actual CDP port for MCP connection (when mcp_debug is requested)
+                mcp_debug_requested = (args and hasattr(args, 'mcp_debug') and args.mcp_debug) or \
+                                      config_dict["advanced"].get("mcp_debug_port", 0) > 0
+                if mcp_debug_requested:
+                    actual_port = driver.config.port
+                    print(f"[MCP DEBUG] Browser started on actual port: {actual_port}")
+                    print(f"[MCP DEBUG] Update .mcp.json with: --browserUrl http://127.0.0.1:{actual_port}")
+                    # Write port to file for /mcpstart command auto-update
+                    # Non-default instances write into instances/<id>/ to avoid clobbering
+                    try:
+                        if util.get_instance_id() == "default":
+                            port_file = os.path.join(os.path.dirname(__file__), '..', '.temp', 'mcp_port.txt')
+                            os.makedirs(os.path.dirname(port_file), exist_ok=True)
+                        else:
+                            port_file = util.get_instance_state_path('mcp_port.txt')
+                        with open(port_file, 'w') as f:
+                            f.write(str(actual_port))
+                        print(f"[MCP DEBUG] Port saved to {port_file}")
+                    except Exception as e:
+                        print(f"[MCP DEBUG] Warning: Could not save port to file: {e}")
+                initial_tab = driver.main_tab
+                if initial_tab:
+                    await nodrver_block_urls(initial_tab, config_dict)
+                tab = await nodriver_goto_homepage(driver, config_dict)
+                if tab is None:
+                    print("[ERROR] Homepage navigation failed. Cannot continue.")
+                    sys.exit()
+                if not initial_tab:
+                    tab = await nodrver_block_urls(tab, config_dict)
+                if not config_dict["advanced"]["headless"]:
+                    await nodriver_resize_window(tab, config_dict)
+            else:
+                print("無法使用nodriver，程式無法繼續工作")
+                sys.exit()
     else:
         print("Load config error!")
         sys.exit()
@@ -820,6 +848,7 @@ async def main(args):
     # main loop spins every 50ms.
     heartbeat_interval_sec = 5
     heartbeat_filename = "heartbeat.txt"
+    session["heartbeat"] = heartbeat_filename
     last_heartbeat_time = 0.0
     last_empty_url_log = 0.0  # [URL DIAG] Step 0: throttle empty-url diagnostics
     is_quit_bot = False
@@ -865,13 +894,36 @@ async def main(args):
         if not is_quit_bot and await check_and_handle_quit(config_dict):
             is_quit_bot = True
 
+        if external_browser and not is_quit_bot:
+            if await check_and_handle_pause(config_dict):
+                if not external_disconnected:
+                    await nodriver_disconnect_browser(driver)
+                    session["browser"] = None
+                    external_disconnected = True
+                    tab = None
+                    logger.info("搶票已暫停，瀏覽器已斷開並保持開啟。")
+                await asyncio.sleep(0.1)
+                continue
+            if external_disconnected:
+                try:
+                    driver, tab = await nodriver_attach_browser(conf, config_dict, external_target_id)
+                    session["browser"] = driver
+                    external_disconnected = False
+                except Exception:
+                    logger.error("重新連接失敗，已結束搶票；請確認瀏覽器及原購票分頁仍開啟，再按開始。")
+                    util.force_remove_file(util.get_instance_state_path(heartbeat_filename))
+                    return
+
         if not is_quit_bot:
             url, is_quit_bot = await nodriver_current_url(tab, config_dict)
             #print("url:", url)
 
         if is_quit_bot:
             try:
-                await driver.stop()
+                if external_browser:
+                    await nodriver_disconnect_browser(driver)
+                else:
+                    await driver.stop()
                 driver = None
             except Exception as e:
                 pass
@@ -1153,13 +1205,13 @@ def cli():
         type=str)
 
     parser.add_argument("--mcp_debug",
-        help="Enable MCP debug mode with fixed CDP port (default: 9222)",
+        help="Show the CDP port of a program-launched Chrome",
         nargs='?',
-        const=9222,
+        const=19327,
         type=int)
 
     parser.add_argument("--mcp_connect",
-        help="Connect to existing Chrome on specified port (e.g., --mcp_connect 9222)",
+        help="Connect to existing Chrome on specified port (e.g., --mcp_connect 19327)",
         type=int,
         metavar="PORT")
 

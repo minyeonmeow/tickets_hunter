@@ -2097,6 +2097,45 @@ def kktix_get_event_code(url):
     #print('event_code:',event_code)
     return event_code
 
+def is_browser_debug_port(port):
+    """Probe local Chrome without inheriting HTTP proxies or logging browser data."""
+    if type(port) is not int or not 1024 <= port <= 65535:
+        return False
+    try:
+        with requests.Session() as client:
+            client.trust_env = False
+            response = client.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+            response.raise_for_status()
+            info = response.json()
+            return ("Chrome/" in info.get("Browser", "") and bool(re.match(
+                rf"^ws://(?:127\.0\.0\.1|localhost):{port}/", info.get("webSocketDebuggerUrl", ""))))
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return False
+
+
+def acquire_browser_port_lock(port):
+    """One bot owns a port, including while paused; OS releases the lock on exit."""
+    root = os.path.join(os.environ.get("LOCALAPPDATA") or get_app_root(), "TicketsHunter", "browser-locks")
+    os.makedirs(root, exist_ok=True)
+    handle = open(os.path.join(root, f"{port}.lock"), "a+b")
+    try:
+        handle.seek(0, 2)
+        if not handle.tell():
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        handle.close()
+        raise ValueError(f"Port {port} 已由另一個搶票實例使用，請先結束該實例或改用不同 Port。") from None
+
+
 def launch_maxbot(script_name="nodriver_tixcraft", filename="", homepage="", kktix_account = "", kktix_password="", window_size="", headless="", instance=""):
     cmd_argument = []
     if len(filename) > 0:

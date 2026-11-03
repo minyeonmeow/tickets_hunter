@@ -602,6 +602,23 @@
           </div>
         </div>
         <div class="row mb-3">
+          <label for="browser_connection_mode" class="col-sm-2 col-form-label">瀏覽器啟動方式</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <select class="form-select" id="browser_connection_mode">
+              <option value="attach">連接已開啟的專用 Chrome（保存登入）</option>
+              <option value="launch">由程式開啟新的 Chrome</option>
+            </select>
+            <small class="form-text text-muted">先執行 start-browser.cmd 並登入、開好購票頁面，再按開始。連接模式暫停或結束時會斷開，保留瀏覽器；繼續時重新連接原分頁。</small>
+          </div>
+        </div>
+        <div class="row mb-3">
+          <label for="browser_port" class="col-sm-2 col-form-label">Chrome 連接 Port</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <input class="form-control" id="browser_port" type="number" min="1024" max="65535" value="19327" />
+            <small class="form-text text-muted">預設 19327。自訂時執行 start-browser.cmd 19328，並在此填相同數字。變更後需結束再開始。每個執行中的搶票實例請使用不同 Port。</small>
+          </div>
+        </div>
+        <div class="row mb-3">
           <label for="server_port" class="col-sm-2 col-form-label">設定介面 Port<span class="help-icon" data-help="server_port" title="設定介面 Port 說明" tabindex="0" role="button" aria-label="設定介面 Port 說明"></span>
           </label>
           <div class="col-sm-10 col-lg-8 col-xl-6">

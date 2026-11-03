@@ -247,6 +247,8 @@ def get_default_config():
 
     # Server port for settings web interface (Issue #156)
     config_dict["advanced"]["server_port"] = CONST_SERVER_PORT
+    config_dict["advanced"]["browser_connection_mode"] = "attach"
+    config_dict["advanced"]["browser_port"] = 19327
     # remote_url will be dynamically generated based on server_port
     config_dict["advanced"]["remote_url"] = ""
 
@@ -333,6 +335,8 @@ def migrate_config(config_dict):
 
     # Migrate server_port: ensure old config has this field (Issue #156)
     if "advanced" in config_dict:
+        config_dict["advanced"].setdefault("browser_connection_mode", "attach")
+        config_dict["advanced"].setdefault("browser_port", 19327)
         if "server_port" not in config_dict["advanced"]:
             config_dict["advanced"]["server_port"] = CONST_SERVER_PORT
 
@@ -653,7 +657,7 @@ class StopHandler(tornado.web.RequestHandler):
         self.write({"stop": True})
 
 class RunHandler(tornado.web.RequestHandler):
-    def get(self):
+    async def get(self):
         profile_name = self.get_query_argument("profile", "")
         if profile_name and not is_valid_profile_name(profile_name):
             self.set_status(400)
@@ -667,6 +671,14 @@ class RunHandler(tornado.web.RequestHandler):
             self.write({"run": False, "error": "invalid instance name"})
             return
         display_name = instance_override or profile_name or CONST_DEFAULT_PROFILE
+        _, config = load_json(profile_name)
+        advanced = config.get("advanced", {})
+        if advanced.get("browser_connection_mode", "attach") == "attach":
+            port = advanced.get("browser_port", 19327)
+            if not await asyncio.to_thread(util.is_browser_debug_port, port):
+                self.set_status(409)
+                self.write({"run": False, "error": f"無法連接 Chrome Port {port}。請先執行 start-browser.cmd，並確認腳本與介面使用相同 Port。"})
+                return
         print('run button pressed. profile:', display_name)
         launch_maxbot(profile_name, instance_override)
         self.write({"run": True, "profile": display_name})
@@ -723,6 +735,15 @@ class SaveJsonHandler(tornado.web.RequestHandler):
             is_pass_check = False
             error_message = "invalid profile name"
             error_code = 1003
+
+        if is_pass_check:
+            advanced = _body.get("advanced", {})
+            browser_port = advanced.get("browser_port", 19327)
+            if (advanced.get("browser_connection_mode", "attach") not in ("attach", "launch")
+                    or type(browser_port) is not int or not 1024 <= browser_port <= 65535):
+                is_pass_check = False
+                error_message = "Browser port must be an integer from 1024 to 65535."
+                error_code = 1004
 
         if is_pass_check:
             config_filepath = get_profile_filepath(profile_name)

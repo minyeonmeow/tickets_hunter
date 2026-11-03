@@ -14,7 +14,9 @@ import os
 import traceback
 
 from zendriver import cdp
+from zendriver import Browser
 from zendriver.core.config import Config
+from zendriver.core.util import get_registered_instances
 
 import util
 import settings
@@ -1362,11 +1364,15 @@ def get_extension_config(config_dict, args=None):
     mcp_connect_port = None
     if args and hasattr(args, 'mcp_connect') and args.mcp_connect:
         mcp_connect_port = args.mcp_connect
+    elif config_dict.get("advanced", {}).get("browser_connection_mode", "attach") == "attach":
+        mcp_connect_port = config_dict.get("advanced", {}).get("browser_port", 19327)
 
     if mcp_connect_port:
+        if type(mcp_connect_port) is not int or not 1024 <= mcp_connect_port <= 65535:
+            raise ValueError("瀏覽器 Port 必須介於 1024 到 65535。")
         # Connect to existing Chrome (NoDriver will NOT start a new browser)
-        print(f"[MCP CONNECT] Connecting to existing Chrome on port {mcp_connect_port}")
-        print(f"[MCP CONNECT] Make sure Chrome is running with: --remote-debugging-port={mcp_connect_port}")
+        util.create_debug_logger(config_dict).log(
+            f"[BROWSER] Connecting to existing Chrome on 127.0.0.1:{mcp_connect_port}")
         conf = Config(
             host="127.0.0.1",
             port=mcp_connect_port,
@@ -1400,6 +1406,70 @@ def get_extension_config(config_dict, args=None):
     # Normal mode: auto-detect (host=None, port=None) to let NoDriver start the browser
     conf = Config(browser_args=browser_args, sandbox=sandbox, headless=config_dict["advanced"]["headless"], browser_executable_path=chrome_path)
     return conf
+
+async def nodriver_disconnect_browser(browser):
+    """Close CDP sockets only; never send Browser.close to a user-owned Chrome."""
+    if browser is None:
+        return
+    probe = _url_probe_state.get("task")
+    if probe and not probe.done():
+        probe.cancel()
+    _url_probe_state.update(tab=None, task=None)
+    connections = list(browser.targets)
+    if browser.connection:
+        connections.append(browser.connection)
+    for connection in connections:
+        listener = getattr(connection, "listener", None)
+        task = getattr(listener, "task", None)
+        try:
+            await asyncio.wait_for(connection.aclose(), timeout=3)
+        except Exception:
+            pass
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    get_registered_instances().discard(browser)
+
+
+async def nodriver_select_existing_tab(browser, homepage, preferred_id=None):
+    """Keep the selected tab on resume; otherwise require an unambiguous website tab."""
+    from urllib.parse import urlsplit
+    tabs = list(browser.tabs)
+    if preferred_id:
+        for tab in tabs:
+            if tab.target.target_id == preferred_id:
+                return tab
+        raise ValueError("原本的購票分頁已關閉；請結束後重新開始。")
+    host = urlsplit(homepage).hostname
+    matches = [tab for tab in tabs if host and urlsplit(tab.target.url).hostname == host]
+    if len(matches) == 1:
+        return matches[0]
+    focused = []
+    for tab in matches:
+        try:
+            if await asyncio.wait_for(tab.evaluate('document.hasFocus()'), timeout=1):
+                focused.append(tab)
+        except Exception:
+            pass
+    if len(focused) == 1:
+        return focused[0]
+    if not matches:
+        raise ValueError("找不到購票分頁；請先在專用 Chrome 開啟與購票網址相同網站的頁面。")
+    raise ValueError("有多個相同網站的分頁；請只保留要操作的購票分頁後重新開始。")
+
+
+async def nodriver_attach_browser(conf, config_dict, preferred_id=None):
+    # Browser.create/uc.start registers shutdown callbacks intended for owned browsers.
+    # Direct construction avoids those callbacks for externally launched Chrome.
+    browser = Browser(conf)
+    try:
+        await asyncio.wait_for(browser.start(), timeout=15)
+        tab = await nodriver_select_existing_tab(browser, config_dict.get("homepage", ""), preferred_id)
+        return browser, tab
+    except BaseException:
+        await nodriver_disconnect_browser(browser)
+        raise
+
 
 def nodriver_overwrite_prefs(conf):
     #print(conf.user_data_dir)

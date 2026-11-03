@@ -95,6 +95,8 @@ const tixcraft_soft_block_delay = document.querySelector('#tixcraft_soft_block_d
 const tixcraft_allow_less_tickets = document.querySelector('#tixcraft_allow_less_tickets');
 const reset_browser_interval = document.querySelector('#reset_browser_interval');
 const server_port = document.querySelector('#server_port');
+const browser_connection_mode = document.querySelector('#browser_connection_mode');
+const browser_port = document.querySelector('#browser_port');
 const proxy_server_port = document.querySelector('#proxy_server_port');
 const window_size = document.querySelector('#window_size');
 const disable_adjacent_seat = document.querySelector('#disable_adjacent_seat');
@@ -589,6 +591,8 @@ function renderAdvancedTabTranslations() {
     setRowLabelForField('tixcraft_allow_less_tickets', fieldLabel('Buy fewer TixCraft tickets if needed', 'tixcraft_allow_less_tickets'));
     setRowLabelForField('reset_browser_interval', fieldLabel('Browser restart interval (sec)', 'reset_browser_interval'));
     setRowLabelForField('server_port', fieldLabel('Settings UI port', 'server_port'));
+    setRowLabelForField('browser_connection_mode', 'Browser launch mode');
+    setRowLabelForField('browser_port', 'Chrome connection port');
     setRowLabelForField('proxy_server_port', fieldLabel('Proxy IP:PORT', 'proxy_server_port'));
     setRowLabelForField('window_size', fieldLabel('Browser window size', 'window_size'));
     setRowLabelForField('disable_adjacent_seat', fieldLabel('Allow non-adjacent seats', 'disable_adjacent_seat'));
@@ -1286,6 +1290,8 @@ function load_settins_to_form(settings)
         tixcraft_allow_less_tickets.checked = settings.tixcraft?.allow_less_tickets || false;
         reset_browser_interval.value = settings.advanced.reset_browser_interval;
         server_port.value = settings.advanced.server_port || 16888;
+        browser_connection_mode.value = settings.advanced.browser_connection_mode || 'attach';
+        browser_port.value = settings.advanced.browser_port ?? 19327;
         proxy_server_port.value  = settings.advanced.proxy_server_port;
         window_size.value  = settings.advanced.window_size;
 
@@ -1513,7 +1519,7 @@ function maxbot_run_api(instance_override)
         console.log("[MaxBot] Launch API response:", data);
     })
     .fail(function(xhr, status, error) {
-        run_message(uiText('launch_failed', status));
+        run_message(xhr.responseJSON?.error || uiText('launch_failed', status));
         console.error("[MaxBot] Launch API error:", status, error);
         console.error("[MaxBot] Response content:", xhr.responseText);
     })
@@ -1542,6 +1548,13 @@ function maxbot_shutdown_api()
 
 function save_changes_to_dict(silent_flag)
 {
+    const browserPortValue = Number(browser_port.value);
+    if (!Number.isInteger(browserPortValue) || browserPortValue < 1024 || browserPortValue > 65535) {
+        browser_port.classList.add('is-invalid');
+        message('Chrome Port 請填寫 1024 到 65535 的整數。');
+        return false;
+    }
+    browser_port.classList.remove('is-invalid');
     const ticket_number_value = parseInt(ticket_number.value);
     const tixcraft_soft_block_delay_value = (tixcraft_soft_block_delay?.value || '').trim();
     //console.log(ticket_number_value);
@@ -1600,6 +1613,8 @@ function save_changes_to_dict(silent_flag)
             settings.tixcraft.allow_less_tickets = tixcraft_allow_less_tickets.checked;
             settings.advanced.reset_browser_interval = parseInt(reset_browser_interval.value);
             settings.advanced.server_port = parseInt(server_port.value) || 16888;
+            settings.advanced.browser_connection_mode = browser_connection_mode.value;
+            settings.advanced.browser_port = browserPortValue;
             settings.advanced.proxy_server_port = proxy_server_port.value;
             settings.advanced.window_size = window_size.value;
 
@@ -1829,6 +1844,8 @@ function check_unsaved_fields()
             }
         });
         const field_list_advance = [
+            "browser_connection_mode",
+            "browser_port",
             "user_guess_string",
             "remote_url",
             "auto_reload_page_interval",
