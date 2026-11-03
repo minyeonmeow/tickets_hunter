@@ -709,15 +709,20 @@ async def reload_config(config_dict, last_mtime, config_filepath):
     return config_dict, last_mtime
 
 async def main(args):
-    session = {}
+    session = {"heartbeat": "heartbeat.txt"}
     try:
         await _run_bot(args, session)
+    except Exception:
+        util.write_instance_status("error", "搶票程序發生錯誤，請重新開始；若持續發生，請查看命令視窗。")
+        raise
     finally:
         await nodriver_disconnect_browser(session.get("browser"))
         if session.get("lock"):
             session["lock"].close()
         if session.get("heartbeat"):
             util.force_remove_file(util.get_instance_state_path(session["heartbeat"]))
+        if util.read_instance_status().get("state") != "error":
+            util.write_instance_status("stopped")
 
 
 async def _run_bot(args, session):
@@ -737,6 +742,7 @@ async def _run_bot(args, session):
         else:
             print(f"[INSTANCE] Invalid instance id '{instance_id}' (allowed: [A-Za-z0-9_-], max 32 chars), fallback to default")
 
+    util.write_instance_status("starting")
     config_dict = get_config_dict(args)
 
     # Global log prefix: override builtins.print to prepend an optional
@@ -771,9 +777,11 @@ async def _run_bot(args, session):
                 session["browser"] = driver
                 external_target_id = tab.target.target_id
             except ValueError as exc:
+                util.write_instance_status("error", str(exc))
                 logger.error(str(exc))
                 return
             except Exception:
+                util.write_instance_status("error", "無法連接購票瀏覽器，請確認 Chrome 已開啟、Port 相同，且已開啟購票分頁。")
                 logger.error("無法連接購票瀏覽器。請先執行 start-browser.cmd，確認 Port 與設定相同，且已開啟購票網站。")
                 return
         else:
@@ -823,6 +831,7 @@ async def _run_bot(args, session):
         print("Load config error!")
         sys.exit()
 
+    util.write_instance_status("running")
     url = ""
     last_url = ""
     cloudflare_checked = False
@@ -905,6 +914,7 @@ async def _run_bot(args, session):
                     session["browser"] = None
                     external_disconnected = True
                     tab = None
+                    util.write_instance_status("paused")
                     logger.info("搶票已暫停，瀏覽器已斷開並保持開啟。")
                 await asyncio.sleep(0.1)
                 continue
@@ -913,7 +923,9 @@ async def _run_bot(args, session):
                     driver, tab = await nodriver_attach_browser(conf, config_dict, external_target_id)
                     session["browser"] = driver
                     external_disconnected = False
+                    util.write_instance_status("running")
                 except Exception:
+                    util.write_instance_status("error", "重新連接失敗。請確認瀏覽器及原購票分頁仍開啟，再按開始。")
                     logger.error("重新連接失敗，已結束搶票；請確認瀏覽器及原購票分頁仍開啟，再按開始。")
                     util.force_remove_file(util.get_instance_state_path(heartbeat_filename))
                     return

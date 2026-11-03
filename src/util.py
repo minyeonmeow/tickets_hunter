@@ -111,6 +111,27 @@ def get_app_root():
 
 CONST_AUTO_REFRESH_DISABLED_FILE = "MAXBOT_AUTO_REFRESH_DISABLED.txt"
 CONST_BROWSER_DISCONNECT_FILE = "MAXBOT_BROWSER_DISCONNECT.txt"
+CONST_INSTANCE_STATUS_FILE = "MAXBOT_INSTANCE_STATUS.json"
+
+
+def write_instance_status(state, message=""):
+    """Publish safe, user-facing lifecycle information for this bot instance."""
+    path = get_instance_state_path(CONST_INSTANCE_STATUS_FILE)
+    temporary = path + ".tmp"
+    payload = {"state": state, "message": message, "event_id": str(uuid.uuid4()),
+               "updated_at": datetime.now().timestamp()}
+    with open(temporary, "w", encoding="utf-8") as output:
+        json.dump(payload, output, ensure_ascii=False)
+    os.replace(temporary, path)
+
+
+def read_instance_status(path=None):
+    try:
+        with open(path or get_instance_state_path(CONST_INSTANCE_STATUS_FILE), encoding="utf-8") as source:
+            value = json.load(source)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def is_auto_refresh_enabled():

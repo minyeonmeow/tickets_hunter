@@ -857,7 +857,8 @@ async def nodriver_funone_assign_ticket_number(tab, config_dict):
         target_qty = config_dict.get("ticket_number", 2)
         if not isinstance(target_qty, int) or target_qty < 1:
             return False
-        matches = _funone_matching_rows(rows, config_dict)
+        eligible = [r for r in rows if r["canAdd"] or r["value"] >= target_qty]
+        matches = _funone_matching_rows(eligible, config_dict)
         if not matches:
             _state["qty_fail_reason"] = "no_match"
             return False

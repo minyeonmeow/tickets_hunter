@@ -23,6 +23,7 @@ __pycache__/
 /src/MAXBOT_QUESTION.txt
 /src/heartbeat.txt
 /src/MAXBOT_*.txt
+/src/MAXBOT_INSTANCE_STATUS.json
 /src/profiles/
 /src/instances/
 src/webdriver/*/data/settings.json

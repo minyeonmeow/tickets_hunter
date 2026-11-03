@@ -495,7 +495,8 @@
         <div class="row mb-3">
           <label for="area_keyword" class="col-sm-2 col-form-label">區域關鍵字<span class="help-icon" data-help="area_keyword" title="區域關鍵字說明" tabindex="0" role="button" aria-label="區域關鍵字 說明"></span></label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
-            <textarea class="form-control" id="area_keyword" rows="3"></textarea>
+            <textarea class="form-control" id="area_keyword" rows="3" placeholder="A區;B區;C區"></textarea>
+            <div class="form-text">依填寫順序優先選擇：A區;B區;C區 會先找 A，再找 B、C。同一組內用空格表示同時符合；同組多個結果才套用區域選擇順序。</div>
             <div class="accordion mt-1" id="accordionAreaLogic">
               <div class="accordion-item">
                 <h2 class="accordion-header">

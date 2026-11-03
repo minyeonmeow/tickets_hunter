@@ -312,10 +312,30 @@ def get_instance_status(profile_name):
         except Exception:
             alive = False
     paused = os.path.exists(get_instance_state_filepath(profile_name, CONST_MAXBOT_INT28_FILE))
+    record = util.read_instance_status(get_instance_state_filepath(profile_name, util.CONST_INSTANCE_STATUS_FILE))
+    stopped = os.path.exists(get_instance_state_filepath(profile_name, CONST_MAXBOT_INT28_QUIT_FILE))
+    state = "paused" if paused else "running"
+    if record.get("state") == "error":
+        state, alive = "error", False
+    elif stopped:
+        state = "stopping" if alive else "stopped"
+    elif not alive:
+        state = "stopped" if record.get("state") == "stopped" else "idle"
+        if record.get("state") == "starting" and time.time() - record.get("updated_at", 0) < 20:
+            state = "starting"
+    elif record.get("state") == "stopped":
+        state, alive = "stopped", False
+    elif paused:
+        state = "paused"
+    elif record.get("state") == "paused":
+        state = "starting"
     return {
-        "id": profile_name,
+        "id": profile_name or CONST_DEFAULT_PROFILE,
         "alive": alive,
         "paused": paused,
+        "state": state,
+        "error": record.get("message", "") if state == "error" else "",
+        "error_id": record.get("event_id", "") if state == "error" else "",
         "last_url": read_last_url_from_file(profile_name),
     }
 
@@ -448,6 +468,7 @@ def launch_maxbot(profile_name="", instance_override=""):
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_QUIT_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, util.CONST_BROWSER_DISCONNECT_FILE))
+    util.force_remove_file(get_instance_state_filepath(effective_instance, util.CONST_INSTANCE_STATUS_FILE))
 
     config_filepath, config_dict = load_json(profile_name)
 
@@ -641,8 +662,8 @@ class StatusHandler(tornado.web.RequestHandler):
         idle_filepath = get_instance_state_filepath(profile_name, CONST_MAXBOT_INT28_FILE)
         is_paused = os.path.exists(idle_filepath)
         url = read_last_url_from_file(profile_name)
-        alive = get_instance_status(profile_name)["alive"]
-        self.write({"status": alive and not is_paused, "alive": alive, "last_url": url})
+        details = get_instance_status(profile_name)
+        self.write({**details, "status": details["state"] == "running", "last_url": url})
 
 class InstancesHandler(tornado.web.RequestHandler):
     """Multi-instance overview: one row per instance with liveness, pause

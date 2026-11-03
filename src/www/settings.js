@@ -1,5 +1,6 @@
 
 // action bar
+const instanceErrorNotifications = new Set();
 const run_button = document.querySelector('#run_btn');
 const save_button = document.querySelector('#save_btn');
 const reset_button = document.querySelector('#reset_btn');
@@ -1518,7 +1519,9 @@ function maxbot_run_api(instance_override)
         console.log("[MaxBot] Launch API response:", data);
     })
     .fail(function(xhr, status, error) {
-        run_message(xhr.responseJSON?.error || uiText('launch_failed', status));
+        const errorText = xhr.responseJSON?.error || uiText('launch_failed', status);
+        run_message(errorText);
+        message(errorText);
         console.error("[MaxBot] Launch API error:", status, error);
         console.error("[MaxBot] Response content:", xhr.responseText);
     })
@@ -1935,6 +1938,14 @@ function maxbot_status_api()
             $("#pause_btn, #resume_btn").addClass("disappear");
         }
         $("#disconnect_btn").prop("disabled", data.alive === false);
+        if (data.state) {
+            status_text = instanceStateLabel(data.state);
+            status_class = "badge text-bg-" + (data.state === 'running' ? 'success' : data.state === 'error' ? 'danger' : 'secondary');
+            if (['starting', 'stopping', 'error', 'stopped', 'idle'].includes(data.state)) {
+                $("#pause_btn, #resume_btn").addClass("disappear");
+            }
+            notifyInstanceError(data);
+        }
         $("#last_url").text(data.last_url || (currentLanguage === 'en' ? 'No activity yet' : '尚無執行紀錄'));
         $("#maxbot_status").html(status_text).prop( "class", status_class);
     })
@@ -1992,20 +2003,23 @@ function render_instances(rows) {
         const tr = $('<tr></tr>');
         tr.append($('<td></td>').text(it.id));
         const live_badge = it.alive
-            ? $('<span class="badge text-bg-success"></span>').text(uiText('instance_alive'))
+            ? $('<span class="badge text-bg-secondary"></span>').text(it.paused ? (currentLanguage === 'en' ? 'Standby' : '保留待命') : uiText('instance_alive'))
             : $('<span class="badge text-bg-secondary"></span>').text(uiText('instance_offline'));
         tr.append($('<td></td>').append(live_badge));
-        const state_badge = it.paused
-            ? $('<span class="badge text-bg-danger"></span>').text(uiText('instance_paused'))
-            : $('<span class="badge text-bg-success"></span>').text(uiText('instance_running'));
+        const state = it.state || (!it.alive ? 'idle' : it.paused ? 'paused' : 'running');
+        const color = state === 'running' ? 'success' : state === 'error' ? 'danger' : 'secondary';
+        const state_badge = $('<span class="badge"></span>').addClass('text-bg-' + color).text(instanceStateLabel(state));
+        notifyInstanceError(it);
         tr.append($('<td></td>').append(state_badge));
         const url = it.last_url || '';
-        tr.append($('<td class="text-truncate" style="max-width:240px;"></td>').text(url).attr('title', url));
+        const detail = $('<td class="text-truncate" style="max-width:240px;"></td>').text(url).attr('title', url);
+        if (it.error) detail.append($('<div class="small text-danger text-wrap"></div>').text(it.error));
+        tr.append(detail);
         const action_td = $('<td class="text-end"></td>');
         const action_btn = it.paused
             ? $('<button type="button" class="btn btn-sm btn-outline-success"></button>').text(uiText('btn_resume')).on('click', function(){ instance_resume(it.id); })
             : $('<button type="button" class="btn btn-sm btn-outline-danger"></button>').text(uiText('btn_pause')).on('click', function(){ instance_pause(it.id); });
-        action_td.append(action_btn);
+        if (it.alive && !['stopping', 'error'].includes(state)) action_td.append(action_btn);
         // Stop is only meaningful for a live process; offline rows have nothing to stop.
         if (it.alive) {
             const stop_btn = $('<button type="button" class="btn btn-sm btn-outline-secondary ms-1"></button>').text(uiText('disconnect')).on('click', function(){ instance_disconnect(it.id); });
@@ -2631,4 +2645,20 @@ function instance_disconnect(id) {
         instances_dashboard_api();
         maxbot_status_api();
     }).fail(() => run_message(currentLanguage === 'en' ? 'Could not disconnect.' : '斷開失敗，請確認設定服務仍在執行。'));
+}
+
+function instanceStateLabel(state) {
+    const labels = {
+        idle: ['未啟動', 'Not running'], starting: ['連接中', 'Connecting'],
+        running: ['執行中', 'Running'], paused: ['已暫停', 'Paused'],
+        stopping: ['停止中', 'Stopping'], stopped: ['已停止', 'Stopped'], error: ['錯誤', 'Error']
+    };
+    return (labels[state] || labels.idle)[currentLanguage === 'en' ? 1 : 0];
+}
+function notifyInstanceError(it) {
+    if (!it.error) return;
+    const key = `${it.id}:${it.error_id || it.error}`;
+    if (instanceErrorNotifications.has(key)) return;
+    instanceErrorNotifications.add(key);
+    message(`${it.id || current_profile}：${it.error}`);
 }
