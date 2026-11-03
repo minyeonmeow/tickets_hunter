@@ -139,6 +139,20 @@ def is_auto_refresh_enabled():
     return not os.path.isfile(os.path.join(get_app_root(), CONST_AUTO_REFRESH_DISABLED_FILE))
 
 
+def scheduled_start_delay(value, now=None):
+    """Seconds until a configured start; infinity blocks malformed nonempty dates."""
+    if not value or not str(value).strip():
+        return 0
+    now = now or datetime.now()
+    try:
+        value = str(value).strip()
+        target = (datetime.strptime(value, '%Y/%m/%d %H:%M:%S') if '/' in value else
+                  datetime.combine(now.date(), datetime.strptime(value, '%H:%M:%S').time()))
+        return max(0, (target - now).total_seconds())
+    except ValueError:
+        return float('inf')
+
+
 def set_auto_refresh_enabled(enabled):
     """Only controls bot refreshes; it never pauses detection or manual F5."""
     if not isinstance(enabled, bool):

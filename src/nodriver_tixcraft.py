@@ -572,11 +572,8 @@ async def _release_scheduled_start(tab, target_dt, config_dict):
         return
     url = await nodriver_current_url_safe(tab)
     parsed = urllib.parse.urlsplit(url or "")
-    if parsed.hostname == 'tickets.funone.io' and '/activity/activity_detail/' in parsed.path:
-        util.create_debug_logger(config_dict).log(
-            "[FUNONE] 已到指定時間，開始等待場次下一步可點擊。"
-            if config_dict.get("advanced", {}).get("funone_auto_next", False) is True else
-            "[FUNONE] 已到指定時間，等待手動按下一步。")
+    if parsed.hostname == 'tickets.funone.io':
+        util.create_debug_logger(config_dict).log("[FUNONE] 保留目前購票頁與預選狀態，不重整整頁。")
         return
     await reload_page_if_enabled(tab)
 
@@ -588,6 +585,13 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
     current_str = config_dict.get("refresh_datetime", "")
     if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
         return True
+
+    if current_str:
+        live_url = await nodriver_current_url_safe(tab)
+        parsed = urllib.parse.urlsplit(live_url or "")
+        if parsed.hostname == 'tickets.funone.io' and '/purchase/purchase_choose_ticket' in parsed.path:
+            # FunOne may prepare its selection before sale. Its submit handler gates the click.
+            return False
 
     # Detect config change: reset state if user changed the value
     if current_str != state["target_str"]:
@@ -691,8 +695,6 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                         "play_sound", "disable_adjacent_seat", "hide_some_image",
                         "auto_guess_options", "user_guess_string", "auto_reload_page_interval", "verbose",
                         "tixcraft_soft_block_delay",
-                        "funone_entry_retry_interval",
-                        "funone_auto_next",
                         "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
                         "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
                         "discount_code"

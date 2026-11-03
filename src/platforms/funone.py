@@ -33,7 +33,6 @@ __all__ = [
     "nodriver_funone_check_login_status",
     "nodriver_funone_verify_login",
     "nodriver_funone_close_popup",
-    "nodriver_funone_date_auto_select",
     "nodriver_funone_area_auto_select",
     "nodriver_funone_check_sold_out",
     "nodriver_funone_click_refresh_button",
@@ -44,7 +43,6 @@ __all__ = [
     "nodriver_funone_detect_step",
     "nodriver_funone_ticket_agree",
     "nodriver_funone_order_submit",
-    "nodriver_funone_auto_reload",
     "nodriver_funone_error_handler",
     "nodriver_funone_main",
 ]
@@ -252,154 +250,8 @@ async def nodriver_funone_close_popup(tab):
     return closed_any
 
 
-CONST_FUNONE_SESSION_SCAN_JS = r"""
-    const visible = e => e && e.getClientRects().length > 0 &&
-        getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).opacity !== '0';
-    const isNext = e => /^(下一步|next(?:\s+step)?)\s*[›»→>]?\s*$/i.test(
-        (e.textContent || e.value || '').trim());
-    const controlSelector = 'button, a[role="button"], input[type="button"], input[type="submit"]';
-    let roots = Array.from(document.querySelectorAll('.round_info--js'));
-    if (!roots.length) roots = Array.from(document.querySelectorAll('.round_info'));
-    const findNext = root => {
-        let scope = root;
-        for (let depth = 0; scope && depth < 4; depth++, scope = scope.parentElement) {
-            if (roots.filter(other => scope.contains(other)).length > 1) break;
-            const controls = [scope, ...scope.querySelectorAll(controlSelector)];
-            const button = controls.find(e => e.matches(controlSelector) && visible(e) && isNext(e));
-            if (button) return button;
-        }
-        return null;
-    };
-    const rows = roots.length ? roots.map((root, index) => ({
-        root, index, button: findNext(root),
-        text: ((root.querySelector('.info') || root).innerText || root.textContent || '').trim()
-    })) : Array.from(document.querySelectorAll(controlSelector))
-        .filter(e => visible(e) && isNext(e)).map((button, index) => ({
-            root: button, index, button,
-            text: ((button.closest('.round_item, .session-item, tr, li') ||
-                button.parentElement).innerText || '').trim()
-        }));
-    const enabled = row => row.button && visible(row.button) && !row.button.disabled &&
-        row.button.getAttribute('aria-disabled') !== 'true' &&
-        !row.root.classList.contains('disabled') && !row.root.classList.contains('sold-out');
-"""
-
-
-def _funone_session_text(text):
-    """Compare dates consistently across the site's slash/dot/hyphen formats."""
-    return re.sub(r'(?<!\d)(\d{1,2})[/.月-](\d{1,2})日?(?!\d)',
-                  lambda match: f'{int(match[1])}/{int(match[2])}', str(text).casefold())
-
-
-def _funone_entry_status(config_dict, reason):
-    if _state.get("entry_wait_reason") != reason:
-        util.create_debug_logger(config_dict, enabled=True).log("[FUNONE] " + reason)
-        _state["entry_wait_reason"] = reason
-
-
-async def _funone_entry_dialog(tab):
-    """Dismiss only an explicit not-open-yet response; leave account/verification dialogs."""
-    if await _funone_actions_paused():
-        return 'manual'
-    return await tab.evaluate(r"""(() => {
-        const visible = e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden' &&
-            getComputedStyle(e).opacity !== '0';
-        const dialogs = Array.from(document.querySelectorAll(
-            '[role="dialog"], .vfm__content, .modal_container, .modal')).filter(visible);
-        for (const dialog of dialogs) {
-            const text = dialog.innerText || '';
-            if (/尚未開賣|尚未開放購票|未到開賣|還未開賣|not (?:yet )?(?:on sale|open)|sale has not started/i.test(text)) {
-                const button = Array.from(dialog.querySelectorAll('button')).find(e =>
-                    visible(e) && !e.disabled && /^(確定|確認|知道了|關閉|ok|close)$/i.test((e.innerText || '').trim()));
-                if (button) { button.click(); return 'retry'; }
-            }
-        }
-        return dialogs.length ? 'manual' : '';
-    })()""")
-
-
 async def _funone_actions_paused(config_dict=None):
     return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
-
-
-async def nodriver_funone_date_auto_select(tab, url, config_dict):
-    """Select the intended session and click its enabled Next control."""
-    if config_dict.get("advanced", {}).get("funone_auto_next", False) is not True:
-        return False
-    if await _funone_actions_paused(config_dict):
-        return False
-    try:
-        retry_interval = max(0.1, min(30, float(config_dict.get("advanced", {}).get(
-            "funone_entry_retry_interval", 0.1))))
-    except (ValueError, TypeError):
-        retry_interval = 0.1
-    if (_state.get("session_click_url") == url and
-            time.monotonic() - _state.get("session_click_time", 0) < retry_interval):
-        return False
-    debug = util.create_debug_logger(config_dict)
-    try:
-        if '/activity/activity_detail/' not in (await nodriver_current_url_safe(tab) or ''):
-            return False
-        dialog = await _funone_entry_dialog(tab)
-        if dialog:
-            if dialog == 'retry':
-                _state["session_click_time"] = time.monotonic()
-                _state["session_click_url"] = url
-                _funone_entry_status(config_dict, "網站尚未開賣，稍後重試下一步。")
-            else:
-                _funone_entry_status(config_dict, "有待處理的視窗，請先確認登入、資格或提示內容。")
-            return False
-        sessions = await tab.evaluate("(() => {" + CONST_FUNONE_SESSION_SCAN_JS + """
-            return rows.map(row => ({index:row.index, text:row.text, enabled:!!enabled(row)}));
-        })()""")
-        _state["entry_has_sessions"] = bool(isinstance(sessions, list) and sessions)
-        if not isinstance(sessions, list) or not sessions:
-            _funone_entry_status(config_dict, "等待場次與下一步按鈕載入。")
-            return False
-        options = config_dict.get("date_auto_select", {})
-        keyword = options.get("date_keyword", "")
-        chosen = []
-        if keyword:
-            groups = util.parse_keyword_string_to_array(keyword)
-            if not groups:
-                groups = [part.strip() for part in keyword.split(";") if part.strip()]
-            for group in groups:
-                matched = [row for row in sessions if all(
-                    _funone_session_text(word) in _funone_session_text(row["text"]) for word in group.split())]
-                if matched:
-                    chosen = matched
-                    break
-            if not chosen and not config_dict.get("date_auto_fallback", False):
-                _funone_entry_status(config_dict, "沒有符合場次關鍵字的場次；請檢查日期關鍵字，或清空後由程式選擇。")
-                return False
-        # Keep waiting for a matching session instead of choosing an unrelated
-        # session just because the intended Next button is still disabled.
-        candidates = [row for row in (chosen or sessions) if row.get("enabled")]
-        if not candidates:
-            _funone_entry_status(config_dict, "目標場次下一步尚不可點擊，持續等待網站開放。")
-            return False
-        row = candidates[util.get_target_index_by_mode(len(candidates), options.get("mode", "random"))]
-        if await _funone_actions_paused(config_dict):
-            return False
-        if (await nodriver_current_url_safe(tab)) != url:
-            return False
-        script = ("(() => {" + CONST_FUNONE_SESSION_SCAN_JS +
-                  "\nconst index = " + json.dumps(row["index"]) +
-                  "; const expected = " + json.dumps(row["text"]) + r""";
-            const row = rows.find(item => item.index === index && item.text === expected);
-            if (!row || !enabled(row)) return false;
-            row.button.click();
-            return true;
-        })()""")
-        clicked = await tab.evaluate(script)
-        if clicked is True:
-            _state["session_click_url"] = url
-            _state["session_click_time"] = time.monotonic()
-            _funone_entry_status(config_dict, "已點擊場次下一步；若未跳轉且按鈕可用，將依間隔重試。")
-            return True
-    except Exception as exc:
-        debug.log(f"[FUNONE] 場次下一步處理失敗：{exc}")
-    return False
 
 
 async def nodriver_funone_area_auto_select(tab, url, config_dict):
@@ -1322,9 +1174,16 @@ async def _funone_submission_pending(tab, url, config_dict):
     return True
 
 
-async def nodriver_funone_order_submit(tab, config_dict):
+async def nodriver_funone_order_submit(tab, config_dict, selection_verified=False):
     """Submit a verified selection once; do not treat a click as order success."""
     if await _funone_actions_paused(config_dict):
+        return False
+    delay = util.scheduled_start_delay(config_dict.get("refresh_datetime", ""))
+    if delay > 0:
+        if not _state.get("scheduled_wait_logged"):
+            util.create_debug_logger(config_dict, enabled=True).log(
+                "[FUNONE] 預選已準備，等待指定開始時間及網站購買按鈕開放。")
+            _state["scheduled_wait_logged"] = True
         return False
     debug = util.create_debug_logger(config_dict)
     current_url = await nodriver_current_url_safe(tab)
@@ -1332,17 +1191,18 @@ async def nodriver_funone_order_submit(tab, config_dict):
         return False
     if await _funone_submission_pending(tab, current_url, config_dict):
         return False
-    if not await nodriver_funone_assign_ticket_number(tab, config_dict):
-        return False
-    if not await nodriver_funone_captcha_handler(tab, config_dict):
-        return False
+    if not selection_verified:
+        if not await nodriver_funone_assign_ticket_number(tab, config_dict):
+            return False
+        if not await nodriver_funone_captcha_handler(tab, config_dict):
+            return False
     if not config_dict.get("ocr_captcha", {}).get("force_submit", True):
         return False
     script = r"""
     (() => {
         for (const btn of document.querySelectorAll('button, input[type="submit"]')) {
             const text = (btn.textContent || btn.value || '').trim();
-            if (!/^(立即購買|確認購買|購買|下一步|確認|送出|Purchase|Confirm|Submit|Next)$/i.test(text)) continue;
+            if (!/^(立即購買|確認購買|購買|下一步|確認|送出|Purchase|Buy\s+now|Confirm|Submit|Next)$/i.test(text)) continue;
             const style = getComputedStyle(btn);
             if (btn.getClientRects().length && style.visibility !== 'hidden' &&
                 style.display !== 'none' && !btn.disabled &&
@@ -1373,141 +1233,6 @@ async def nodriver_funone_order_submit(tab, config_dict):
         debug.log(f"[FUNONE] Submit result uncertain; waiting for website: {exc}")
     return False
 
-
-async def nodriver_funone_auto_reload(tab, config_dict):
-    """
-    Auto reload page for error handling and coming soon detection
-
-    Returns:
-        bool: True if page was reloaded
-    """
-    if not util.is_auto_refresh_enabled():
-        return False
-
-    debug = util.create_debug_logger(config_dict)
-
-    # Skip auto-reload for non-activity pages (safety check)
-    try:
-        current_url = tab.url
-        if '/purchase_waiting_jump/' in current_url or '/purchase_fill_form/' in current_url:
-            return False
-    except:
-        pass
-
-    try:
-        # Check for error pages or coming soon
-        check_status_js = '''
-        (function() {
-            const bodyText = document.body.textContent || '';
-            const title = document.title || '';
-
-            // Error page patterns
-            if (bodyText.includes('503') || bodyText.includes('502') || bodyText.includes('500') ||
-                title.includes('Error') || bodyText.includes('Service Unavailable')) {
-                return { status: 'error', reason: 'server_error' };
-            }
-
-            // Coming soon / not yet available
-            if (bodyText.includes('即將開賣') || bodyText.includes('尚未開放') ||
-                bodyText.includes('Coming Soon') || bodyText.includes('Not Available')) {
-                return { status: 'coming_soon', reason: 'not_available' };
-            }
-
-            // Sold out detection - be smart about it
-            // On FunOne area selection page, "已售完" appears next to disabled areas
-            // Only trigger sold out if ALL available areas are sold out
-
-            // Check if we're on area selection page (has zone_box elements)
-            const zoneBoxes = document.querySelectorAll('.zone_box');
-            if (zoneBoxes.length > 0) {
-                // On area selection page - check if any area is available
-                let hasAvailable = false;
-                for (const box of zoneBoxes) {
-                    if (!box.classList.contains('disabled')) {
-                        hasAvailable = true;
-                        break;
-                    }
-                }
-                if (!hasAvailable) {
-                    return { status: 'sold_out', reason: 'all_areas_sold_out' };
-                }
-                // Some areas available, not sold out
-                return { status: 'ok' };
-            }
-
-            // Check if we're on quantity selection page (Step 2)
-            // Has ticket info table but may show "熱賣中" etc - not sold out
-            const step2Indicators = document.querySelectorAll('.ticket_info, [class*="step2"], [class*="quantity"]');
-            if (step2Indicators.length > 0 || bodyText.includes('張數') || bodyText.includes('票種')) {
-                // On quantity page, don't trigger sold out unless specific message
-                if (bodyText.includes('已無票券') || bodyText.includes('No tickets available')) {
-                    return { status: 'sold_out', reason: 'no_tickets_message' };
-                }
-                return { status: 'ok' };
-            }
-
-            // For other pages, check for actual sold out indicators
-            // Only if the page seems to be a final "sold out" page
-            const soldOutPatterns = ['已售完', 'Sold Out', 'sold out'];
-            let hasSoldOutText = false;
-            for (const pattern of soldOutPatterns) {
-                if (bodyText.includes(pattern)) {
-                    hasSoldOutText = true;
-                    break;
-                }
-            }
-
-            // Only report sold out if the entire page seems to be about sold out
-            // Not just a label next to some areas
-            if (hasSoldOutText) {
-                // Check if there are any actionable buttons (if yes, not sold out page)
-                const actionButtons = document.querySelectorAll('button:not(:disabled)');
-                let hasActionButton = false;
-                for (const btn of actionButtons) {
-                    const text = btn.textContent || '';
-                    if (text.includes('購買') || text.includes('下一步') || text.includes('確認') ||
-                        text.includes('選') || text.includes('+')) {
-                        hasActionButton = true;
-                        break;
-                    }
-                }
-                if (!hasActionButton) {
-                    return { status: 'sold_out', reason: 'no_tickets' };
-                }
-            }
-
-            return { status: 'ok' };
-        })()
-        '''
-        status = await tab.evaluate(check_status_js)
-        status = util.parse_nodriver_result(status)
-
-        if status and isinstance(status, dict):
-            page_status = status.get('status')
-            reason = status.get('reason', '')
-
-            if page_status == 'error':
-                debug.log(f"[FUNONE] Error page detected: {reason}, reloading...")
-                await reload_page_if_enabled(tab)
-                return True
-
-            elif page_status == 'coming_soon':
-                auto_reload_coming_soon = config_dict.get("tixcraft", {}).get("auto_reload_coming_soon_page", True)
-                if auto_reload_coming_soon:
-                    debug.log("[FUNONE] Coming soon page, auto-reloading...")
-                    await tab.sleep(1)
-                    await reload_page_if_enabled(tab)
-                    return True
-
-            elif page_status == 'sold_out':
-                debug.log("[FUNONE] Sold out detected")
-                return False
-
-        return False
-
-    except Exception as exc:
-        debug.log(f"[FUNONE] Auto reload error: {exc}")
-        return False
 
 async def nodriver_funone_error_handler(tab, error, config_dict):
     """
@@ -1569,9 +1294,9 @@ def _funone_reset_page_state(url, document_id=None):
         _state["flow_document_id"] = document_id
     for key in ("captcha_reload_from", "captcha_filled_signature", "ocr_exhausted_image",
                 "handoff_notified", "captcha_ready_logged", "next_ocr_time",
-                "session_click_url", "session_click_time", "captcha_error_handled", "entry_wait_reason", "entry_has_sessions"):
+                "captcha_error_handled", "scheduled_wait_logged"):
         _state.pop(key, None)
-    _state.update(ocr_retry_count=0, next_button_clicked=False, qty_fail_reason="")
+    _state.update(ocr_retry_count=0, qty_fail_reason="")
     if previous is not None:
         _state["submission_pending"] = False
 
@@ -1579,6 +1304,8 @@ def _funone_reset_page_state(url, document_id=None):
 async def _funone_refresh_stock(tab, config_dict):
     """Recheck the live route after waiting, before any refresh or reload."""
     if not util.is_auto_refresh_enabled():
+        return False
+    if util.scheduled_start_delay(config_dict.get("refresh_datetime", "")) > 0:
         return False
 
     document_id = _state.get("flow_document_id")
@@ -1615,18 +1342,21 @@ async def _funone_handle_ticket_flow(tab, url, config_dict):
     _state["last_step"] = step
     if step not in (1, 2):
         return
-    if step == 1 and config_dict.get("area_auto_select", {}).get("enable", True):
-        if await nodriver_funone_area_auto_select(tab, url, config_dict):
-            return
     qty_ready = await nodriver_funone_assign_ticket_number(tab, config_dict)
     if not qty_ready:
+        if (_state.get("qty_fail_reason") == "no_match" and step == 1 and
+                config_dict.get("area_auto_select", {}).get("enable", True)):
+            if await nodriver_funone_area_auto_select(tab, url, config_dict):
+                return
         if _state.get("qty_fail_reason") in ("sold_out", "insufficient_stock"):
             await _funone_refresh_stock(tab, config_dict)
         return
-    await nodriver_funone_ticket_agree(tab)
+    if not await nodriver_funone_ticket_agree(tab):
+        return
     captcha_ready = await nodriver_funone_captcha_handler(tab, config_dict)
     if captcha_ready:
-        await nodriver_funone_order_submit(tab, config_dict)
+        # Quantity and CAPTCHA were verified in this iteration; avoid duplicate CDP reads.
+        await nodriver_funone_order_submit(tab, config_dict, selection_verified=True)
 
 
 async def _funone_handle_form(tab, config_dict):
@@ -1668,8 +1398,7 @@ async def nodriver_funone_main(tab, url, config_dict):
     if not document or not document.get("ready") or document["url"] != url:
         return tab
     _funone_reset_page_state(url, document["documentId"])
-    if ("/activity/activity_detail/" in url and
-            config_dict.get("advanced", {}).get("funone_auto_next", False) is not True):
+    if "/activity/activity_detail/" in url:
         return tab
     if "/purchase_fill_form/" in url:
         await _funone_handle_form(tab, config_dict)
@@ -1681,18 +1410,10 @@ async def nodriver_funone_main(tab, url, config_dict):
     if _state.get("submission_pending"):
         if await _funone_submission_pending(tab, url, config_dict):
             return tab
-    if "/activity/activity_detail/" not in url or not _state.get("next_button_clicked"):
-        await nodriver_funone_close_popup(tab)
+    await nodriver_funone_close_popup(tab)
     if not await nodriver_funone_verify_login(tab, config_dict):
         return tab
-    if "/activity/activity_detail/" in url:
-        if config_dict.get("date_auto_select", {}).get("enable", True):
-            clicked = await nodriver_funone_date_auto_select(tab, url, config_dict)
-            if clicked:
-                _state["next_button_clicked"] = True
-        if not _state.get("next_button_clicked") and not _state.get("entry_has_sessions"):
-            await nodriver_funone_auto_reload(tab, config_dict)
-    elif "/purchase_choose_ticket" in url:
+    if "/purchase_choose_ticket" in url:
         await _funone_handle_ticket_flow(tab, url, config_dict)
     elif url.rstrip("/") == "https://tickets.funone.io":
         homepage = config_dict.get("homepage", url)

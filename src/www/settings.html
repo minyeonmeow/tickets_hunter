@@ -307,17 +307,6 @@
             <input class="form-control" id="browser_port" type="number" min="1024" max="65535" value="19327" />
             <small class="form-text text-muted">預設 19327。自訂時執行 start-browser.cmd 19328，並在此填相同數字。變更後需結束再開始。每個執行中的搶票實例請使用不同 Port。</small>
           </div>
-        </div></div></details><details class="ticket-settings-group mb-4"><summary>FunOne 自動進場（選用）</summary><div class="pt-3">
-<div class="row mb-3"><label class="col-sm-2 col-form-label" for="funone_auto_next">自動按下一步</label>
-<div class="col-sm-10 col-lg-8 col-xl-6"><div class="form-check form-switch">
-<input class="form-check-input" type="checkbox" id="funone_auto_next"><label class="form-check-label" for="funone_auto_next">啟用 FunOne 自動按下一步</label></div>
-<div class="form-text">預設關閉，由你手動進入購票頁，程式再接手選票。開啟後依場次關鍵字自動點擊並重試；也需開啟自動選場次。</div></div></div>
-<div class="row mb-3">
-          <label for="funone_entry_retry_interval" class="col-sm-2 col-form-label">FunOne 下一步重試間隔（秒）</label>
-          <div class="col-sm-10 col-lg-8 col-xl-6">
-            <input class="form-control" id="funone_entry_retry_interval" type="number" min="0.1" max="30" step="0.1" value="0.1" />
-            <small class="form-text text-muted">未跳轉且按鈕可用時重試；等待網站回應、跳轉後或有待人工處理的視窗時不連點。場次關鍵字須符合。</small>
-          </div>
         </div></div></details><h5 class="ticket-section-title">購票目標與選票方式</h5>
 
         <div class="row mb-3">
@@ -429,7 +418,7 @@
         </div>
 
         <div class="row mb-3">
-          <label for="refresh_datetime" class="col-sm-2 col-form-label">刷新在指定時間<span class="help-icon" data-help="refresh_datetime" title="刷新在指定時間說明" tabindex="0" role="button" aria-label="刷新在指定時間 說明"></span>
+          <label for="refresh_datetime" class="col-sm-2 col-form-label">指定開始時間<span class="help-icon" data-help="refresh_datetime" title="刷新在指定時間說明" tabindex="0" role="button" aria-label="刷新在指定時間 說明"></span>
           </label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <input class="form-control" id="refresh_datetime" value="" placeholder="YYYY/MM/DD HH:MM:SS" />

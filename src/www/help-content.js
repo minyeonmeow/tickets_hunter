@@ -611,7 +611,7 @@ const HELP_CONTENT = {
       <p>設定程式在指定的日期時間才開始嘗試搶票。用於場次在特定時間才開放售票的情境。</p>
       <p><strong>格式：</strong><code>YYYY/MM/DD HH:MM:SS</code></p>
       <p>範例：<code>2025/12/25 10:00:00</code></p>
-      <p>在指定時間到達前，程式會持續等待並每秒確認時間。時間到達後立即開始刷新搶票。FunOne 活動頁會保留原頁面，等目標場次的「下一步」可點擊時自動點擊；請先開啟自動選場次。</p>
+      <p>在指定時間到達前，程式會持續等待並每秒確認時間。時間到達後立即開始刷新搶票。FunOne 請先手動進入票區，可提前準備張數與條款；到點後保留預選、不重整整頁，等待「立即購買」可用時嘗試送出。</p>
       <p class="text-muted small mb-0">提示：建議設定比開售時間早 1-2 秒，補償網路與處理延遲。</p>`,
     faq: [
       {
@@ -1452,7 +1452,7 @@ const HELP_CONTENT_EN_META = {
       <p>Set the exact date and time when the bot should start trying to get tickets. This is useful when sales open at a specific moment.</p>
       <p><strong>Format:</strong> <code>YYYY/MM/DD HH:MM:SS</code></p>
       <p>Example: <code>2025/12/25 10:00:00</code></p>
-      <p>Before the target time, the bot waits and checks the time once per second. As soon as the target time is reached, it starts refreshing and ticketing immediately. On a FunOne activity page, it keeps the current page and clicks the target session’s Next button once enabled. Enable automatic session selection first.</p>
+      <p>Before the target time, the bot waits and checks the time once per second. As soon as the target time is reached, it starts refreshing and ticketing immediately. For FunOne, enter the ticket page manually. Selection and terms can be prepared early; at the configured time the bot preserves the page and attempts Purchase once the site enables it.</p>
       <p class="text-muted small mb-0">Tip: set this 1-2 seconds before the official sale time to compensate for network and processing delay.</p>`,
     faq: [
       {

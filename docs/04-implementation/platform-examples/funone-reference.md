@@ -40,17 +40,13 @@
 
 ## 設定與重試
 
-- date_auto_select.enable、area_auto_select.enable 控制場次／票區自動選取。
-- advanced.funone_auto_next 預設 False；需開啟且 date_auto_select.enable 為 True 才自動操作活動頁。
-  關閉時不點擊活動頁、不處理其彈窗或自動重整；手動進入購票頁後仍按原設定接手。
-- refresh_datetime 設定到點開始；FunOne 活動頁保留原頁面，等目標場次的
-  「下一步」可點擊才操作，不強制啟用網站停用的按鈕。未設定時間則立即偵測。
-- 場次日期以月／日標準化比對，可接受斜線、點、連字號及月日格式。
-  沒有符合關鍵字時會說明原因，不會擅自點選其他場次。
-- advanced.funone_entry_retry_interval 控制未跳轉時的下一步重試間隔，預設 0.1 秒，
-  可於進階設定調整至 0.1–30 秒。按鈕停用時等待；已跳轉時不再點擊活動頁。
-  僅自動關閉明確的「尚未開賣」確認提示，其餘登入／資格視窗留給使用者處理。
-  場次已載入時不因等待下一步而重新載入整頁。
+- 活動頁由使用者手動進入票區；已移除自動下一步、入口重試與其設定鍵。
+- area_auto_select.enable 控制尚未選區時的票區自動選取。已有可用預選時不重新進區。
+- refresh_datetime 在 FunOne 購票頁只限制「購買」送出：可於時間到達前準備張數、條款及驗證碼，
+  到點後保留原頁與預選，不整頁重整。未設定時間則依網站按鈕可用狀態處理。
+- 未到指定時間不進行票況刷新，以免破壞預選；日期格式錯誤時不送出。
+- 同輪已確認張數與驗證碼時，不在送出函式重讀一次，減少開賣時的 CDP 往返。
+- 網站停用的購買按鈕不強制啟用；已點擊則等待回應，不因逾時重送。
 - ticket_number、area_auto_fallback、keyword_exclude 限制可選票券。
 - ocr_captcha.enable=False 時等待人工填寫，不覆蓋未完成輸入。
 - ocr_captcha.force_submit=False 時保留選票結果，等待人工送出。
@@ -72,11 +68,11 @@
 test_funone_flow.py 測試逾時、重複送出、失敗重試與資料頁通知。
 test_funone_browser.py 使用真實 Chrome 操作本機 HTML，
 測試票區索引、關鍵字、張數、人工選位、刷新與驗證碼生命週期。
-也測試下一步按鈕位於場次區塊外、停用按鈕、隱藏錯誤與大小寫。
+也測試隱藏錯誤與大小寫；活動頁入口測試已隨功能移除。
 test_scheduled_start.py 測試到點釋放、倒數暫停及其他平台的刷新行為。
 2026-11-04 新增 HAR 含活動頁、場次元件與 GetNowTime 回應，
 可確認下一步位於 .round_info 內，以及網站使用伺服器時間。
 GetNowTime 為 POST /api/ApiFront/GetNowTime，回傳 IsSuccess、Value（台灣時間，精度到秒）；
 本次未新增呼叫、未將其用於校正排程時鐘。排程仍使用本機時間，之後追蹤網站按鈕狀態。
-活動入口及重試以本機 Chrome 驗證，尚未以實際開售活動驗證。
+預選準備與定時購買以本機 Chrome／離線測試驗證，尚未以實際開售活動驗證。
 可透過 FUNONE_TEST_CHROME 指定 Chrome 路徑；不連接票務網站。

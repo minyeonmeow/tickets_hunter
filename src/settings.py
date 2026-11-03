@@ -254,8 +254,6 @@ def get_default_config():
     config_dict["advanced"]["remote_url"] = ""
 
     config_dict["advanced"]["auto_reload_page_interval"] = 5
-    config_dict["advanced"]["funone_entry_retry_interval"] = 0.1
-    config_dict["advanced"]["funone_auto_next"] = False
     config_dict["advanced"]["tixcraft_soft_block_delay"] = ""
     config_dict["advanced"]["reset_browser_interval"] = 0
     config_dict["advanced"]["proxy_server_port"] = ""
@@ -358,6 +356,8 @@ def migrate_config(config_dict):
 
     # Migrate server_port: ensure old config has this field (Issue #156)
     if "advanced" in config_dict:
+        config_dict["advanced"].pop("funone_auto_next", None)
+        config_dict["advanced"].pop("funone_entry_retry_interval", None)
         config_dict["advanced"].setdefault("browser_connection_mode", "attach")
         config_dict["advanced"].setdefault("browser_port", 19327)
         if "server_port" not in config_dict["advanced"]:
