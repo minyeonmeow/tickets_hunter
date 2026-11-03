@@ -1155,7 +1155,38 @@ def settgins_gui_timer():
         if GLOBAL_SERVER_SHUTDOWN:
             break
 
+def apply_startup_ports():
+    """Persist validated choices from the local launcher before opening the UI."""
+    overrides = {}
+    for key, variable in (("browser_port", "TICKETS_HUNTER_START_BROWSER_PORT"),
+                          ("server_port", "TICKETS_HUNTER_START_SERVER_PORT")):
+        value = os.environ.get(variable)
+        if value is None:
+            continue
+        try:
+            port = int(value)
+        except ValueError:
+            raise ValueError("啟動 Port 必須是 1024 到 65535 的整數。") from None
+        if not 1024 <= port <= 65535:
+            raise ValueError("啟動 Port 必須是 1024 到 65535 的整數。")
+        overrides[key] = port
+    if not overrides:
+        return
+    config_filepath = get_profile_filepath("")
+    if os.path.isfile(config_filepath):
+        with open(config_filepath, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    else:
+        config = get_default_config()
+    advanced = config.setdefault("advanced", {})
+    advanced.update(overrides)
+    if advanced.get("browser_port", 19327) == advanced.get("server_port", CONST_SERVER_PORT):
+        raise ValueError("Chrome 連接 Port 與設定網頁 Port 不可相同。")
+    util.save_json(config, config_filepath)
+
+
 if __name__ == "__main__":
+    apply_startup_ports()
     global GLOBAL_SERVER_SHUTDOWN
     GLOBAL_SERVER_SHUTDOWN = False
     

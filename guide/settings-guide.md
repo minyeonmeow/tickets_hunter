@@ -14,9 +14,11 @@
 
 預設使用「連接已開啟的專用 Chrome」，Port 為 **19327**。
 
-1. 雙擊專案根目錄的 `start-browser.cmd`。
+1. 雙擊專案根目錄的 `start-browser.cmd`，輸入 Chrome 連接 Port，或按 Enter 使用預設值。
 2. 在開啟的 Chrome 登入售票網站，並開好要操作的購票頁面。
-3. 執行 `start-settings.cmd`，到進階設定確認瀏覽器啟動方式及 Chrome 連接 Port。
+3. 執行 `start-settings.cmd`，不會詢問 Port。腳本中的 `TICKETS_CHROME_PORT` 預設為 19327，
+   如瀏覽器使用其他 Port，先用記事本修改這個數字，使兩者相同。
+   啟動時會寫入 Chrome 連接 Port，介面自動帶入。設定網頁 Port 沿用設定，預設 16888。
 4. 購票網址需與已開啟的購票頁面為相同網站。儲存設定後按開始，程式會接手既有分頁，
    不重新導向首頁、不注入設定中的舊登入 Cookie。
 
@@ -24,8 +26,9 @@
 「結束」會停止搶票程序並斷開，仍保留 Chrome。暫停期間不偵測票況。
 「停止自動重整」是獨立功能，仍保持連接與票況偵測。
 
-若要使用其他 Port，在命令提示字元執行 `start-browser.cmd 19328`，
-並將介面的 Chrome 連接 Port 設成相同數字。變更後需結束舊搶票程序再開始。
+瀏覽器也可保留參數用法，例如 `start-browser.cmd 19328`，明確指定時不再詢問。
+設定腳本若需配合，將 `set "TICKETS_CHROME_PORT=19327"` 改為 `set "TICKETS_CHROME_PORT=19328"`。
+Chrome 連接 Port 與設定網頁 Port 不可相同。變更後需結束舊搶票程序再開始。
 每個 Port 的登入資料分別保存在 `%LOCALAPPDATA%\TicketsHunter\Chrome-<Port>`，
 重新開啟相同 Port 就會沿用資料；網站若讓登入過期仍需重新登入。
 

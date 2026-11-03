@@ -2,11 +2,36 @@
     [ValidateRange(1024,65535)][int]$Port = 19327,
     [string]$UserDataDir = '',
     [string]$ChromePath = '',
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$PromptPort
 )
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+function Read-StartupPort($taskLabel, [int]$taskDefault) {
+    while ($true) {
+        $taskAnswer = Read-Host "$taskLabel [直接按 Enter 使用 $taskDefault]"
+        if ([string]::IsNullOrWhiteSpace($taskAnswer)) { return $taskDefault }
+        $taskParsedPort = 0
+        if ([int]::TryParse($taskAnswer.Trim(), [ref]$taskParsedPort) -and $taskParsedPort -ge 1024 -and $taskParsedPort -le 65535) {
+            return $taskParsedPort
+        }
+        Write-Host '請輸入 1024 到 65535 的整數。' -ForegroundColor Yellow
+    }
+}
+$taskSettingsFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\settings.json'
+if (Test-Path -LiteralPath $taskSettingsFile) {
+    try {
+        $taskSavedAdvanced = (Get-Content -LiteralPath $taskSettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json).advanced
+        if (-not $PSBoundParameters.ContainsKey('Port') -and ($taskSavedAdvanced.browser_port -is [int] -or $taskSavedAdvanced.browser_port -is [long])) {
+            if ($taskSavedAdvanced.browser_port -ge 1024 -and $taskSavedAdvanced.browser_port -le 65535) { $Port = [int]$taskSavedAdvanced.browser_port }
+        }
+
+    } catch { }
+}
+if ($PromptPort -and -not $PSBoundParameters.ContainsKey('Port')) {
+    $Port = Read-StartupPort 'Chrome 連接 Port（需與另一個啟動腳本相同）' $Port
+}
 if (-not $UserDataDir) {
     $UserDataDir = Join-Path $env:LOCALAPPDATA "TicketsHunter\Chrome-$Port"
 }

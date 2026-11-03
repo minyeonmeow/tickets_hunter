@@ -1,10 +1,27 @@
-﻿param([switch]$CheckOnly)
+﻿param(
+    [ValidateRange(1024,65535)][int]$Port = 19327,
+    [ValidateRange(1024,65535)][int]$ServerPort = 16888,
+    [switch]$CheckOnly
+)
 
 $ErrorActionPreference = 'Stop'
 $env:PYTHONHOME = $null
 $env:PYTHONPATH = $null
 $env:PYTHONUTF8 = '1'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$taskSettingsFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\settings.json'
+if (Test-Path -LiteralPath $taskSettingsFile) {
+    try {
+        $taskSavedAdvanced = (Get-Content -LiteralPath $taskSettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json).advanced
+        if (-not $PSBoundParameters.ContainsKey('Port') -and ($taskSavedAdvanced.browser_port -is [int] -or $taskSavedAdvanced.browser_port -is [long])) {
+            if ($taskSavedAdvanced.browser_port -ge 1024 -and $taskSavedAdvanced.browser_port -le 65535) { $Port = [int]$taskSavedAdvanced.browser_port }
+        }
+        if (-not $PSBoundParameters.ContainsKey('ServerPort') -and ($taskSavedAdvanced.server_port -is [int] -or $taskSavedAdvanced.server_port -is [long])) {
+            if ($taskSavedAdvanced.server_port -ge 1024 -and $taskSavedAdvanced.server_port -le 65535) { $ServerPort = [int]$taskSavedAdvanced.server_port }
+        }
+    } catch { }
+}
+if ($Port -eq $ServerPort) { throw 'Chrome 連接 Port 與設定網頁 Port 不可相同，請重新執行並使用不同數字。' }
 $taskRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $taskEnvironment = Join-Path $taskRoot '.venv'
 $taskPython = Join-Path $taskEnvironment 'Scripts\python.exe'
@@ -71,9 +88,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw '套件相依性檢查失敗，請檢查上方訊息。' }
         Set-Content -LiteralPath $taskMarker -Value $taskHash -Encoding ASCII
     }
-    if ($CheckOnly) { Write-Host '本機開發環境已準備完成。'; exit 0 }
+    if ($CheckOnly) { Write-Host "本機開發環境已準備完成。Chrome Port=$Port；設定網頁 Port=$ServerPort"; exit 0 }
     Set-Location -LiteralPath (Join-Path $taskRoot 'src')
     Write-Host '正在啟動設定介面…'
+    $env:TICKETS_HUNTER_START_BROWSER_PORT = [string]$Port
+    $env:TICKETS_HUNTER_START_SERVER_PORT = [string]$ServerPort
     & $taskPython settings.py
     exit $LASTEXITCODE
 } catch {
