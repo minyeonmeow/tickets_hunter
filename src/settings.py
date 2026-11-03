@@ -1126,11 +1126,29 @@ async def main_server():
     app.listen(server_port)
     print("server running on port:", server_port)
 
-    url = "http://127.0.0.1:" + str(server_port) + "/settings.html"
-    print("goto url:", url)
-    if os.environ.get("TICKETS_HUNTER_NO_BROWSER") != "1":
-        webbrowser.open_new(url)
+    open_settings_page(server_port)
     await asyncio.Event().wait()
+
+
+def open_settings_page(server_port):
+    """Open the UI for both a new server and an already running server."""
+    url = f"http://127.0.0.1:{server_port}/settings.html"
+    print("goto url:", url)
+    if os.environ.get("TICKETS_HUNTER_NO_BROWSER") == "1":
+        return
+    try:
+        if webbrowser.open_new(url):
+            return
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            os.startfile(url)
+            return
+        except OSError:
+            pass
+    print("無法自動開啟設定頁，請在瀏覽器開啟：", url)
+
 
 def get_server_port():
     """Get server port from config file, fallback to default."""
@@ -1148,6 +1166,7 @@ def web_server():
         asyncio.run(main_server())
     else:
         print("port:", server_port, " is in used.")
+        open_settings_page(server_port)
 
 def settgins_gui_timer():
     while True:
@@ -1188,6 +1207,10 @@ def apply_startup_ports():
 
 if __name__ == "__main__":
     apply_startup_ports()
+    startup_port = get_server_port()
+    if util.is_connectable(startup_port):
+        open_settings_page(startup_port)
+        sys.exit(0)
     global GLOBAL_SERVER_SHUTDOWN
     GLOBAL_SERVER_SHUTDOWN = False
     
