@@ -5,6 +5,9 @@
 .venv.backup-*/
 .build-venv/
 
+# Local tests (keep on disk, do not commit)
+/tests/
+
 # Python cache
 __pycache__/
 *.pyc
