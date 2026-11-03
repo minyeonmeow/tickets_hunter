@@ -41,6 +41,8 @@
 ## 設定與重試
 
 - date_auto_select.enable、area_auto_select.enable 控制場次／票區自動選取。
+- advanced.funone_auto_next 預設 False；需開啟且 date_auto_select.enable 為 True 才自動操作活動頁。
+  關閉時不點擊活動頁、不處理其彈窗或自動重整；手動進入購票頁後仍按原設定接手。
 - refresh_datetime 設定到點開始；FunOne 活動頁保留原頁面，等目標場次的
   「下一步」可點擊才操作，不強制啟用網站停用的按鈕。未設定時間則立即偵測。
 - 場次日期以月／日標準化比對，可接受斜線、點、連字號及月日格式。

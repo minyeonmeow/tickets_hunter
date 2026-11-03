@@ -98,6 +98,10 @@ const server_port = document.querySelector('#server_port');
 const browser_connection_mode = document.querySelector('#browser_connection_mode');
 const browser_port = document.querySelector('#browser_port');
 const funone_entry_retry_interval = document.querySelector('#funone_entry_retry_interval');
+const funone_auto_next = document.querySelector('#funone_auto_next');
+funone_auto_next.addEventListener('change', () => {
+    funone_entry_retry_interval.disabled = !funone_auto_next.checked;
+});
 const proxy_server_port = document.querySelector('#proxy_server_port');
 const window_size = document.querySelector('#window_size');
 const disable_adjacent_seat = document.querySelector('#disable_adjacent_seat');
@@ -1285,6 +1289,8 @@ function load_settins_to_form(settings)
         browser_connection_mode.value = settings.advanced.browser_connection_mode || 'attach';
         browser_port.value = settings.advanced.browser_port ?? 19327;
         funone_entry_retry_interval.value = settings.advanced.funone_entry_retry_interval ?? 0.1;
+        funone_auto_next.checked = settings.advanced.funone_auto_next === true;
+        funone_entry_retry_interval.disabled = !funone_auto_next.checked;
         proxy_server_port.value  = settings.advanced.proxy_server_port;
         window_size.value  = settings.advanced.window_size;
 
@@ -1614,6 +1620,7 @@ function save_changes_to_dict(silent_flag)
             settings.advanced.browser_connection_mode = browser_connection_mode.value;
             settings.advanced.browser_port = browserPortValue;
             settings.advanced.funone_entry_retry_interval = funoneRetry;
+            settings.advanced.funone_auto_next = funone_auto_next.checked;
             settings.advanced.proxy_server_port = proxy_server_port.value;
             settings.advanced.window_size = window_size.value;
 

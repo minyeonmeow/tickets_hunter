@@ -324,6 +324,8 @@ async def _funone_actions_paused(config_dict=None):
 
 async def nodriver_funone_date_auto_select(tab, url, config_dict):
     """Select the intended session and click its enabled Next control."""
+    if config_dict.get("advanced", {}).get("funone_auto_next", False) is not True:
+        return False
     if await _funone_actions_paused(config_dict):
         return False
     try:
@@ -1665,6 +1667,9 @@ async def nodriver_funone_main(tab, url, config_dict):
     if not document or not document.get("ready") or document["url"] != url:
         return tab
     _funone_reset_page_state(url, document["documentId"])
+    if ("/activity/activity_detail/" in url and
+            config_dict.get("advanced", {}).get("funone_auto_next", False) is not True):
+        return tab
     if "/purchase_fill_form/" in url:
         await _funone_handle_form(tab, config_dict)
         return tab
