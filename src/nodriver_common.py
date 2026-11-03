@@ -1407,10 +1407,16 @@ def get_extension_config(config_dict, args=None):
     conf = Config(browser_args=browser_args, sandbox=sandbox, headless=config_dict["advanced"]["headless"], browser_executable_path=chrome_path)
     return conf
 
-async def nodriver_disconnect_browser(browser):
+async def nodriver_disconnect_browser(browser, preserve_process=False):
     """Close CDP sockets only; never send Browser.close to a user-owned Chrome."""
     if browser is None:
         return
+    if preserve_process and browser._process is not None:
+        # Transfer ownership: Zendriver's exit callback must not kill Chrome
+        # or delete its live temporary profile after an explicit disconnect.
+        browser.config.user_data_dir = browser.config.user_data_dir
+        browser._process = None
+        browser._process_pid = None
     probe = _url_probe_state.get("task")
     if probe and not probe.done():
         probe.cancel()

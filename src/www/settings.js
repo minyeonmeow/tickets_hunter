@@ -460,19 +460,20 @@ function renderPageChrome() {
     applyOrRestore('#readme-tab', 'textContent', 'Getting Started');
     applyOrRestore('#home-tab', 'textContent', 'Basic Settings');
     applyOrRestore('#advanced-tab', 'textContent', 'Advanced');
-    applyOrRestore('#verification-tab', 'textContent', 'Verification');
-    applyOrRestore('#autofill-tab', 'textContent', 'Autofill');
-    applyOrRestore('#runtime-tab', 'textContent', 'Runtime');
+    applyOrRestore('#verification-tab', 'textContent', 'CAPTCHA & questions');
+    applyOrRestore('#autofill-tab', 'textContent', 'Accounts & forms');
+    applyOrRestore('#runtime-tab', 'textContent', 'Instances & schedule');
     applyOrRestore('a[href="https://discord.gg/GCE5s6W6dV"]', 'textContent', 'Discord');
     applyOrRestore('a[href="https://github.com/bouob/tickets_hunter/issues"]', 'textContent', 'Report Issue');
     applyOrRestore('label[for="language_selector"]', 'textContent', 'Language');
     restoreElementValue('#language_selector option[value="zh-TW"]', 'textContent');
     applyOrRestore('#language_selector option[value="en"]', 'textContent', 'English');
     applyOrRestore('label[for="dark_mode_toggle"]', 'textContent', 'Dark Mode');
-    applyOrRestore('#run_btn', 'textContent', 'Run');
-    applyOrRestore('#save_btn', 'textContent', 'Save');
+    applyOrRestore('#run_btn', 'textContent', 'Start ticketing');
+    applyOrRestore('#disconnect_btn', 'textContent', 'Disconnect browser');
+    applyOrRestore('#save_btn', 'textContent', 'Save settings');
     applyOrRestore('#reset_btn', 'textContent', 'Reset to Defaults');
-    applyOrRestore('#exit_btn', 'textContent', 'Exit');
+    applyOrRestore('#exit_btn', 'textContent', 'Exit application');
     applyOrRestore('#message_modal .btn-close', 'aria-label', 'Close');
     applyOrRestore('#message_modal .modal-footer button', 'textContent', 'Close');
     applyOrRestore('#helpPanelTitle', 'textContent', 'Help');
@@ -733,20 +734,8 @@ function renderAutofillTabTranslations() {
 }
 
 function renderRuntimeTabTranslations() {
-    // Exclude the dynamically-added instances panel so the positional labels
-    // below still map to the status / url / system-time rows.
-    const runtimeRows = document.querySelectorAll('#runtime-tab-pane > .row:not(#instances_panel)');
-    if (runtimeRows.length >= 3) {
-        if (currentLanguage === 'en') {
-            applyNodeValue('runtime-label-0', runtimeRows[0].querySelector('label.col-sm-2'), 'textContent', 'Runtime status');
-            applyNodeValue('runtime-label-1', runtimeRows[1].querySelector('label.col-sm-2'), 'textContent', 'Current URL');
-            applyNodeValue('runtime-label-2', runtimeRows[2].querySelector('label.col-sm-2'), 'textContent', 'System time');
-        } else {
-            restoreNodeValue('runtime-label-0', runtimeRows[0].querySelector('label.col-sm-2'), 'textContent');
-            restoreNodeValue('runtime-label-1', runtimeRows[1].querySelector('label.col-sm-2'), 'textContent');
-            restoreNodeValue('runtime-label-2', runtimeRows[2].querySelector('label.col-sm-2'), 'textContent');
-        }
-    }
+    setRowLabelForField('last_url', 'Current URL');
+    setRowLabelForField('system_time', 'System time');
     applyOrRestore('#pause_btn', 'textContent', 'Pause');
     applyOrRestore('#resume_btn', 'textContent', 'Resume');
     setRowLabelForField('idle_keyword', fieldLabel('System time - <span class="text-danger">Pause</span> keywords', 'idle_keyword'));
@@ -864,6 +853,8 @@ function uiText(key, extra = '') {
         'saved': { 'zh-TW': '已存檔', en: 'Saved' },
         'missing_ticket_number': { 'zh-TW': '提示: 請指定張數', en: 'Please select the number of tickets.' },
         'invalid_tixcraft_soft_block_delay': { 'zh-TW': '提示: 暫時鎖定等待秒數請填 1 到 600 的整數，或留空使用預設值。', en: 'Enter an integer from 1 to 600 for the TixCraft soft-block delay, or leave it empty to use the default.' },
+        'status_idle': { 'zh-TW': '未啟動', en: 'Not running' },
+        'disconnect': { 'zh-TW': '斷開', en: 'Disconnect' },
         'status_paused': { 'zh-TW': '已暫停', en: 'Paused' },
         'status_running': { 'zh-TW': '已啟動', en: 'Running' },
         'discord_empty': { 'zh-TW': '請先輸入 Discord Webhook URL。', en: 'Please enter the Discord webhook URL first.' },
@@ -1931,7 +1922,13 @@ function maxbot_status_api()
             $("#pause_btn").addClass("disappear");
             $("#resume_btn").removeClass("disappear");
         }
-        $("#last_url").text(data.last_url);
+        if (data.alive === false) {
+            status_text = uiText('status_idle');
+            status_class = "badge text-bg-secondary";
+            $("#pause_btn, #resume_btn").addClass("disappear");
+        }
+        $("#disconnect_btn").prop("disabled", data.alive === false);
+        $("#last_url").text(data.last_url || (currentLanguage === 'en' ? 'No activity yet' : '尚無執行紀錄'));
         $("#maxbot_status").html(status_text).prop( "class", status_class);
     })
     .fail(function() {
@@ -2004,7 +2001,7 @@ function render_instances(rows) {
         action_td.append(action_btn);
         // Stop is only meaningful for a live process; offline rows have nothing to stop.
         if (it.alive) {
-            const stop_btn = $('<button type="button" class="btn btn-sm btn-outline-secondary ms-1"></button>').text(uiText('btn_stop')).on('click', function(){ instance_stop(it.id); });
+            const stop_btn = $('<button type="button" class="btn btn-sm btn-outline-secondary ms-1"></button>').text(uiText('disconnect')).on('click', function(){ instance_disconnect(it.id); });
             action_td.append(stop_btn);
         }
         tr.append(action_td);
@@ -2057,6 +2054,7 @@ run_button.addEventListener('click', maxbot_launch);
 save_button.addEventListener('click', maxbot_save);
 reset_button.addEventListener('click', maxbot_reset_api);
 exit_button.addEventListener('click', maxbot_shutdown_api);
+document.querySelector('#disconnect_btn').addEventListener('click', () => instance_disconnect(current_profile));
 pause_button.addEventListener('click', maxbot_pause_api);
 resume_button.addEventListener('click', maxbot_resume_api);
 auto_refresh_button.addEventListener('click', toggleAutoRefresh);
@@ -2176,7 +2174,8 @@ function run_message(msg)
 }
 
 function home_tab_clicked() {
-    document.getElementById("homepage").focus();
+    document.getElementById("run_btn").focus({preventScroll: true});
+    window.scrollTo({top: 0, behavior: 'smooth'});
 }
 
 // Dark Mode Functions
@@ -2618,3 +2617,11 @@ window.addEventListener('pageshow', (event) => {
     }
 });
 connectSettingsPage();
+
+function instance_disconnect(id) {
+    $.get('/disconnect' + instance_query(id)).done(() => {
+        run_message(currentLanguage === 'en' ? 'Disconnected. The browser and settings page stay open.' : '已送出斷開要求；瀏覽器與設定介面保持開啟。');
+        instances_dashboard_api();
+        maxbot_status_api();
+    }).fail(() => run_message(currentLanguage === 'en' ? 'Could not disconnect.' : '斷開失敗，請確認設定服務仍在執行。'));
+}

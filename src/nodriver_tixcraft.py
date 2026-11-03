@@ -921,8 +921,9 @@ async def _run_bot(args, session):
 
         if is_quit_bot:
             try:
-                if external_browser:
-                    await nodriver_disconnect_browser(driver)
+                disconnect_requested = os.path.isfile(util.get_instance_state_path(util.CONST_BROWSER_DISCONNECT_FILE))
+                if external_browser or disconnect_requested:
+                    await nodriver_disconnect_browser(driver, preserve_process=disconnect_requested)
                 else:
                     await driver.stop()
                 driver = None
@@ -931,6 +932,7 @@ async def _run_bot(args, session):
             # Remove this instance's stop + heartbeat files so the dashboard
             # shows offline on the next poll (no 30s heartbeat timeout wait).
             util.force_remove_file(util.get_instance_state_path(CONST_MAXBOT_INT28_QUIT_FILE))
+            util.force_remove_file(util.get_instance_state_path(util.CONST_BROWSER_DISCONNECT_FILE))
             util.force_remove_file(util.get_instance_state_path(heartbeat_filename))
             break
 

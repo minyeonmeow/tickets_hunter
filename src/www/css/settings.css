@@ -343,3 +343,19 @@ textarea {
    lighter blue. Bootstrap tunes $primary to land exactly on the WCAG AA 4.5:1
    floor against white, so any lighter blue drops below it -- which would have
    left the most-used button the only unreadable one. */
+
+/* Primary workflow: target profile, controls, then ticket preferences. */
+.ticket-control-panel {
+    border: 1px solid var(--bs-border-color);
+    border-radius: 12px;
+    background: var(--bs-tertiary-bg);
+    padding: 1.25rem;
+    margin-top: 1rem;
+}
+.ticket-control-panel h5 { margin-bottom: 1.25rem; }
+.ticket-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.ticket-control-panel .row:last-of-type { margin-bottom: 0 !important; }
+.ticket-settings-group { border: 1px solid var(--bs-border-color); border-radius: 10px; padding: 1rem; }
+.ticket-settings-group summary { cursor: pointer; font-weight: 600; }
+.ticket-section-title { margin: 1.5rem 0 1rem; }
+#last_url { overflow-wrap: anywhere; }

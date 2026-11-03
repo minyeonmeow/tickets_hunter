@@ -9,7 +9,7 @@
   <link href="dist/bootstrap/bootstrap.min.css" rel="stylesheet" />
   <script src="dist/bootstrap/bootstrap.min.js"></script>
   <script src="dist/jquery.min.js"></script>
-  <link rel="stylesheet" type="text/css" href="css/settings.css?v=2026101712" />
+  <link rel="stylesheet" type="text/css" href="css/settings.css?v=20261104ui1" />
   <link rel="icon" href="/favicon-32x32.png" sizes="32x32" type="image/png">
   <link rel="icon" href="/favicon-16x16.png" sizes="16x16" type="image/png">
   <link rel="icon" href="/favicon.ico">
@@ -105,12 +105,14 @@
     <span id="profile_warnings" class="d-flex flex-wrap gap-1 ms-2"></span>
   </div>
     <ul class="nav nav-tabs" id="myTab" role="tablist">
-      <li class="nav-item" role="presentation">
+      <!-- Archived instructions navigation (restore if needed)
+<li class="nav-item" role="presentation">
         <button class="nav-link active" id="readme-tab" data-bs-toggle="tab" data-bs-target="#readme-tab-pane" type="button" role="tab" aria-controls="readme-tab-pane" aria-selected="true">使用需知</button>
       </li>
+-->
 
       <li class="nav-item" role="presentation">
-        <button class="nav-link" id="home-tab" data-bs-toggle="tab" data-bs-target="#home-tab-pane" type="button" role="tab" aria-controls="home-tab-pane" aria-selected="false" onclick="home_tab_clicked();">基本設定</button>
+        <button class="nav-link active" id="home-tab" data-bs-toggle="tab" data-bs-target="#home-tab-pane" type="button" role="tab" aria-controls="home-tab-pane" aria-selected="true" onclick="home_tab_clicked();">基本設定</button>
       </li>
 
       <li class="nav-item" role="presentation">
@@ -118,18 +120,19 @@
       </li>
 
       <li class="nav-item" role="presentation">
-        <button class="nav-link" id="verification-tab" data-bs-toggle="tab" data-bs-target="#verification-tab-pane" type="button" role="tab" aria-controls="verification-tab-pane" aria-selected="false">驗證問題</button>
+        <button class="nav-link" id="verification-tab" data-bs-toggle="tab" data-bs-target="#verification-tab-pane" type="button" role="tab" aria-controls="verification-tab-pane" aria-selected="false">驗證碼與問題</button>
       </li>
 
       <li class="nav-item" role="presentation">
-        <button class="nav-link" id="autofill-tab" data-bs-toggle="tab" data-bs-target="#autofill-tab-pane" type="button" role="tab" aria-controls="autofill-tab-pane" aria-selected="false">自動填表單</button>
+        <button class="nav-link" id="autofill-tab" data-bs-toggle="tab" data-bs-target="#autofill-tab-pane" type="button" role="tab" aria-controls="autofill-tab-pane" aria-selected="false">帳號與填表</button>
       </li>
 
       <li class="nav-item" role="presentation">
-        <button class="nav-link" id="runtime-tab" data-bs-toggle="tab" data-bs-target="#runtime-tab-pane" type="button" role="tab" aria-controls="runtime-tab-pane" aria-selected="false">執行階段</button>
+        <button class="nav-link" id="runtime-tab" data-bs-toggle="tab" data-bs-target="#runtime-tab-pane" type="button" role="tab" aria-controls="runtime-tab-pane" aria-selected="false">實例與排程</button>
       </li>
 
-      <li class="nav-item ms-auto d-flex align-items-center" role="presentation">
+      <!-- Archived community and upstream issue links (restore if needed)
+<li class="nav-item ms-auto d-flex align-items-center" role="presentation">
         <a href="https://discord.gg/GCE5s6W6dV" target="_blank" class="btn btn-sm btn-outline-primary me-2">
           Discord 社群
         </a>
@@ -137,6 +140,7 @@
           回報問題
         </a>
       </li>
+-->
 
       <li class="nav-item ms-3 d-flex align-items-center" role="presentation">
         <label for="language_selector" class="form-label mb-0 me-2">語言</label>
@@ -160,14 +164,15 @@
   <div class="row g-3">
     <div class="tab-content" id="myTabContent">
       <!-- tab 1 -->
-      <div class="tab-pane fade show active" id="readme-tab-pane" role="tabpanel" aria-labelledby="readme-tab" tabindex="0">
+      <!-- Archived instructions page (restore if needed)
+<div class="tab-pane fade show active" id="readme-tab-pane" role="tabpanel" aria-labelledby="readme-tab" tabindex="0">
 
-<!-- 版本資訊 -->
+[original comment: 版本資訊 ]
 <div class="alert alert-info" role="alert">
   <p class="mb-0"><strong>版本</strong>：Tickets Hunter (2026.10.17) | <strong>技術支援</strong>：Claude Code AI 輔助開發</p>
 </div>
 
-<!-- 開發狀態提示（可展開） -->
+[original comment: 開發狀態提示（可展開） ]
 <div class="accordion mb-3" id="devStatusAccordion">
   <div class="accordion-item border-warning">
     <h2 class="accordion-header" id="devStatusHeading">
@@ -200,7 +205,7 @@
 
 <hr/>
 
-<!-- 法律資訊 -->
+[original comment: 法律資訊 ]
 <h3>法律資訊</h3>
 
 <div class="bd-callout bd-callout-warning">
@@ -212,7 +217,7 @@
 
 <hr/>
 
-<!-- 使用者快速手冊 -->
+[original comment: 使用者快速手冊 ]
 <h3>使用者快速手冊</h3>
 
 <p>本手冊專為<strong>第一次使用搶票機器人的一般使用者</strong>設計，不需要程式背景即可輕鬆上手。</p>
@@ -230,7 +235,7 @@
 
 <hr/>
 
-<!-- 支持專案 -->
+[original comment: 支持專案 ]
 <h4>支持專案</h4>
 <p>如果這個專案對您有幫助，歡迎請開發者喝杯珍珠奶茶，支持我們持續改進與維護。</p>
 
@@ -242,9 +247,48 @@
 </div>
 
 </div>
+-->
 
       <!-- tab 2 -->
-      <div class="tab-pane fade" id="home-tab-pane" role="tabpanel" aria-labelledby="home-tab" tabindex="0">
+      <div class="tab-pane fade show active" id="home-tab-pane" role="tabpanel" aria-labelledby="home-tab" tabindex="0">
+<section class="ticket-control-panel mb-4" aria-label="搶票控制"><h5>搶票控制</h5><div class="row mb-3">
+          <label class="col-sm-2 col-form-label">執行狀態</label>
+          <div class="col-sm-10">
+            <span id="maxbot_status" role="status" aria-live="polite">讀取狀態中…</span><div class="ticket-actions mt-3"><button class="btn btn-primary" id="run_btn">開始搶票</button>
+            <button class="btn btn-warning disappear" id="pause_btn">暫停搶票</button>
+            <button class="btn btn-success disappear" id="resume_btn">繼續搶票</button>
+            <button type="button" class="btn btn-outline-secondary" id="disconnect_btn" disabled>斷開瀏覽器</button></div>
+            <p class="form-text mb-0">暫停可繼續原流程；斷開會停止目前實例，保留設定介面與瀏覽器。</p>
+          </div>
+        </div><div class="row mb-3" id="auto_refresh_panel">
+          <label class="col-sm-2 col-form-label" for="auto_refresh_btn">全域自動重整</label>
+          <div class="col-sm-10">
+            <button type="button" class="btn btn-outline-primary" id="auto_refresh_btn" disabled aria-pressed="true">讀取中…</button>
+            <span class="small ms-2" id="auto_refresh_status" role="status" aria-live="polite"></span>
+            <div class="form-text" id="auto_refresh_help">所有平台與實例共用，切換後即時生效並記住選擇。關閉後可手動 F5，程式仍持續偵測及自動選票；網站自身更新與驗證碼換圖不受影響。</div>
+          </div>
+        </div><div class="row mb-3">
+          <label for="last_url" class="col-sm-2 col-form-label">執行網址</label>
+          <div class="col-sm-10">
+            <p class="form-control-plaintext" id="last_url"></p>
+          </div>
+        </div><span class="text-danger" id="run_btn_pressed_message"></span></section><details class="ticket-settings-group mb-4"><summary>瀏覽器連線設定</summary><div class="pt-3"><div class="row mb-3">
+          <label for="browser_connection_mode" class="col-sm-2 col-form-label">瀏覽器啟動方式</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <select class="form-select" id="browser_connection_mode">
+              <option value="attach">連接已開啟的專用 Chrome（保存登入）</option>
+              <option value="launch">由程式開啟新的 Chrome</option>
+            </select>
+            <small class="form-text text-muted">先執行 start-browser.cmd 並登入、開好購票頁面，再按開始。連接模式暫停或結束時會斷開，保留瀏覽器；繼續時重新連接原分頁。</small>
+          </div>
+        </div><div class="row mb-3">
+          <label for="browser_port" class="col-sm-2 col-form-label">Chrome 連接 Port</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <input class="form-control" id="browser_port" type="number" min="1024" max="65535" value="19327" />
+            <small class="form-text text-muted">預設 19327。自訂時執行 start-browser.cmd 19328，並在此填相同數字。變更後需結束再開始。每個執行中的搶票實例請使用不同 Port。</small>
+          </div>
+        </div></div></details><h5 class="ticket-section-title">購票目標與選票方式</h5>
+
         <div class="row mb-3">
           <label for="homepage" class="col-sm-2 col-form-label">網址<span class="help-icon" data-help="homepage" title="售票網站說明" tabindex="0" role="button" aria-label="售票網站 說明"></span></label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
@@ -608,23 +652,8 @@
             <small class="form-text text-muted">未跳轉且按鈕可用時重試；等待網站回應、跳轉後或有待人工處理的視窗時不連點。場次關鍵字須符合。</small>
           </div>
         </div>
-        <div class="row mb-3">
-          <label for="browser_connection_mode" class="col-sm-2 col-form-label">瀏覽器啟動方式</label>
-          <div class="col-sm-10 col-lg-8 col-xl-6">
-            <select class="form-select" id="browser_connection_mode">
-              <option value="attach">連接已開啟的專用 Chrome（保存登入）</option>
-              <option value="launch">由程式開啟新的 Chrome</option>
-            </select>
-            <small class="form-text text-muted">先執行 start-browser.cmd 並登入、開好購票頁面，再按開始。連接模式暫停或結束時會斷開，保留瀏覽器；繼續時重新連接原分頁。</small>
-          </div>
-        </div>
-        <div class="row mb-3">
-          <label for="browser_port" class="col-sm-2 col-form-label">Chrome 連接 Port</label>
-          <div class="col-sm-10 col-lg-8 col-xl-6">
-            <input class="form-control" id="browser_port" type="number" min="1024" max="65535" value="19327" />
-            <small class="form-text text-muted">預設 19327。自訂時執行 start-browser.cmd 19328，並在此填相同數字。變更後需結束再開始。每個執行中的搶票實例請使用不同 Port。</small>
-          </div>
-        </div>
+
+
         <div class="row mb-3">
           <label for="server_port" class="col-sm-2 col-form-label">設定介面 Port<span class="help-icon" data-help="server_port" title="設定介面 Port 說明" tabindex="0" role="button" aria-label="設定介面 Port 說明"></span>
           </label>
@@ -1114,23 +1143,9 @@
 
       <!-- tab 6 -->
       <div class="tab-pane fade" id="runtime-tab-pane" role="tabpanel" aria-labelledby="runtime-tab" tabindex="2">
-        <div class="row mb-3">
-          <label class="col-sm-2 col-form-label">執行狀態</label>
-          <div class="col-sm-10 col-lg-8 col-xl-6">
-            <span id="maxbot_status"></span>
-            <button class="btn btn-primary" id="pause_btn">暫停搶票</button>
-            <button class="btn btn-primary" id="resume_btn">繼續搶票</button>
-          </div>
-        </div>
 
-        <div class="row mb-3" id="auto_refresh_panel">
-          <label class="col-sm-2 col-form-label" for="auto_refresh_btn">全域自動重整</label>
-          <div class="col-sm-10 col-lg-8 col-xl-6">
-            <button type="button" class="btn btn-outline-primary" id="auto_refresh_btn" disabled aria-pressed="true">讀取中…</button>
-            <span class="small ms-2" id="auto_refresh_status" role="status" aria-live="polite"></span>
-            <div class="form-text" id="auto_refresh_help">所有平台與實例共用，切換後即時生效並記住選擇。關閉後可手動 F5，程式仍持續偵測及自動選票；網站自身更新與驗證碼換圖不受影響。</div>
-          </div>
-        </div>
+
+
 
         <!-- Phase 3: live overview of every instance (profiles + CLI runs) -->
         <div class="row mb-3" id="instances_panel">
@@ -1151,21 +1166,16 @@
           </div>
         </div>
 
-        <div class="row mb-3">
-          <label for="last_url" class="col-sm-2 col-form-label">執行網址</label>
-          <div class="col-sm-10 col-lg-8 col-xl-6">
-            <p class="form-control-plaintext" id="last_url"></p>
-          </div>
-        </div>
+
 
         <div class="row mb-3">
-          <label class="col-sm-2 col-form-label">系統時間</label>
+          <label for="system_time" class="col-sm-2 col-form-label">系統時間</label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <span id="system_time"></span>
           </div>
         </div>
 
-        <div class="row mb-3">
+        <details class="ticket-settings-group"><summary>自動暫停與繼續排程（選用）</summary><div class="pt-3"><div class="row mb-3">
           <label for="idle_keyword" class="col-sm-2 col-form-label">系統時間 - <span class="text-danger">暫停</span>關鍵字<span class="help-icon" data-help="idle_keyword" title="系統時間暫停關鍵字說明" tabindex="0" role="button" aria-label="系統時間暫停關鍵字 說明"></span></label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <input type="text" class="form-control" id="idle_keyword" placeholder="例如：09:30:00;14:15:30">
@@ -1251,7 +1261,7 @@
           </div>
         </div>
 
-      </div>
+      </div></details></div>
 
     </div>
   </div>
@@ -1261,11 +1271,11 @@
        actions stay reachable at any scroll position -->
   <div class="action-bar" id="action_bar">
     <div class="action-bar-inner">
-      <button class="btn btn-primary" id="run_btn">搶票</button>
-      <button class="btn btn-success" id="save_btn">存檔</button>
-      <button class="btn btn-warning" id="reset_btn">重設為預設值</button>
-      <button class="btn btn-danger" id="exit_btn">結束</button>
-      <span class="text-danger" id="run_btn_pressed_message"></span>
+
+      <button class="btn btn-success" id="save_btn">儲存設定</button>
+      <button class="btn btn-outline-secondary" id="reset_btn">重設為預設值</button>
+      <button class="btn btn-outline-danger" id="exit_btn">結束程式</button>
+
     </div>
   </div>
 
@@ -1324,6 +1334,6 @@
 </div>
 
   <script src="help-content.js?v=2026101712"></script>
-  <script src="settings.js?v=2026101712"></script>
+  <script src="settings.js?v=20261104ui1"></script>
 </body>
 </html>

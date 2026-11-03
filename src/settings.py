@@ -446,6 +446,7 @@ def launch_maxbot(profile_name="", instance_override=""):
     effective_instance = instance_override if instance_override else profile_name
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_QUIT_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_FILE))
+    util.force_remove_file(get_instance_state_filepath(effective_instance, util.CONST_BROWSER_DISCONNECT_FILE))
 
     config_filepath, config_dict = load_json(profile_name)
 
@@ -639,7 +640,8 @@ class StatusHandler(tornado.web.RequestHandler):
         idle_filepath = get_instance_state_filepath(profile_name, CONST_MAXBOT_INT28_FILE)
         is_paused = os.path.exists(idle_filepath)
         url = read_last_url_from_file(profile_name)
-        self.write({"status": not is_paused, "last_url": url})
+        alive = get_instance_status(profile_name)["alive"]
+        self.write({"status": alive and not is_paused, "alive": alive, "last_url": url})
 
 class InstancesHandler(tornado.web.RequestHandler):
     """Multi-instance overview: one row per instance with liveness, pause
@@ -701,6 +703,21 @@ class StopHandler(tornado.web.RequestHandler):
             return
         maxbot_stop(profile_name)
         self.write({"stop": True})
+
+class DisconnectHandler(tornado.web.RequestHandler):
+    def get(self):
+        profile_name = self.get_query_argument("profile", "")
+        if profile_name and not is_valid_profile_name(profile_name):
+            self.set_status(400)
+            self.write({"error": "invalid profile name"})
+            return
+        filepath = get_instance_state_filepath(profile_name, util.CONST_BROWSER_DISCONNECT_FILE)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w"):
+            pass
+        maxbot_stop(profile_name)
+        self.write({"disconnected": True})
+
 
 class RunHandler(tornado.web.RequestHandler):
     async def get(self):
@@ -1129,6 +1146,7 @@ def create_application(ocr=None):
         ("/pause", PauseHandler),
         ("/resume", ResumeHandler),
         ("/stop", StopHandler),
+        ("/disconnect", DisconnectHandler),
         ("/run", RunHandler),
         
         # json api
