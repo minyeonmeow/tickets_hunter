@@ -567,11 +567,25 @@ def parse_refresh_datetime(target_str):
         return None
 
 
+async def _release_scheduled_start(tab, target_dt, config_dict):
+    if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
+        return
+    url = await nodriver_current_url_safe(tab)
+    parsed = urllib.parse.urlsplit(url or "")
+    if parsed.hostname == 'tickets.funone.io' and '/activity/activity_detail/' in parsed.path:
+        util.create_debug_logger(config_dict).log(
+            "[FUNONE] 已到指定時間，開始等待場次下一步可點擊。")
+        return
+    await reload_page_if_enabled(tab)
+
+
 async def check_refresh_datetime_gate(tab, config_dict, state):
     # Gate platform dispatching until refresh_datetime is reached.
     # Returns True if gate is active (caller should continue),
     # False if gate is cleared (proceed with dispatching).
     current_str = config_dict.get("refresh_datetime", "")
+    if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
+        return True
 
     # Detect config change: reset state if user changed the value
     if current_str != state["target_str"]:
@@ -595,7 +609,7 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
     if now >= target_dt:
         state["reached"] = True
         try:
-            await reload_page_if_enabled(tab)
+            await _release_scheduled_start(tab, target_dt, config_dict)
             print("[REFRESH] Target time reached, starting:", target_dt.strftime('%Y/%m/%d %H:%M:%S'))
         except Exception:
             pass
@@ -633,9 +647,11 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
     if remaining <= 2.0:
         if remaining > 0:
             await asyncio.sleep(remaining)
+        if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
+            return True
         state["reached"] = True
         try:
-            await reload_page_if_enabled(tab)
+            await _release_scheduled_start(tab, target_dt, config_dict)
             print("[REFRESH] Target time reached, starting:", target_dt.strftime('%Y/%m/%d %H:%M:%S'))
         except Exception:
             pass

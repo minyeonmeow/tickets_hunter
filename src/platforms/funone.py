@@ -18,6 +18,8 @@ from nodriver_common import evaluate_refresh_if_enabled, sleep_before_auto_refre
 from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled
 from nodriver_common import (
     check_and_handle_pause,
+    check_and_handle_quit,
+    CONST_NATIVE_INPUT_SETTER_JS,
     create_ocr_for_platform,
     nodriver_current_url_safe,
     play_sound_while_ordering,
@@ -249,209 +251,99 @@ async def nodriver_funone_close_popup(tab):
 
     return closed_any
 
+
+CONST_FUNONE_SESSION_SCAN_JS = r"""
+    const visible = e => e && e.getClientRects().length > 0 &&
+        getComputedStyle(e).visibility !== 'hidden' && getComputedStyle(e).opacity !== '0';
+    const isNext = e => /^(下一步|next(?:\s+step)?)\s*[›»→>]?\s*$/i.test(
+        (e.textContent || e.value || '').trim());
+    const controlSelector = 'button, a[role="button"], input[type="button"], input[type="submit"]';
+    let roots = Array.from(document.querySelectorAll('.round_info--js'));
+    if (!roots.length) roots = Array.from(document.querySelectorAll('.round_info'));
+    const findNext = root => {
+        let scope = root;
+        for (let depth = 0; scope && depth < 4; depth++, scope = scope.parentElement) {
+            if (roots.filter(other => scope.contains(other)).length > 1) break;
+            const controls = [scope, ...scope.querySelectorAll(controlSelector)];
+            const button = controls.find(e => e.matches(controlSelector) && visible(e) && isNext(e));
+            if (button) return button;
+        }
+        return null;
+    };
+    const rows = roots.length ? roots.map((root, index) => ({
+        root, index, button: findNext(root),
+        text: ((root.querySelector('.info') || root).innerText || root.textContent || '').trim()
+    })) : Array.from(document.querySelectorAll(controlSelector))
+        .filter(e => visible(e) && isNext(e)).map((button, index) => ({
+            root: button, index, button,
+            text: ((button.closest('.round_item, .session-item, tr, li') ||
+                button.parentElement).innerText || '').trim()
+        }));
+    const enabled = row => row.button && visible(row.button) && !row.button.disabled &&
+        row.button.getAttribute('aria-disabled') !== 'true' &&
+        !row.root.classList.contains('disabled') && !row.root.classList.contains('sold-out');
+"""
+
+
+async def _funone_actions_paused(config_dict=None):
+    return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
+
+
 async def nodriver_funone_date_auto_select(tab, url, config_dict):
-    """
-    Auto-select session/date on activity detail page
-
-    Returns:
-        bool: True if session selected and next button clicked
-    """
+    """Select the intended session and click its enabled Next control."""
+    if await _funone_actions_paused(config_dict):
+        return False
+    if (_state.get("session_click_url") == url and
+            time.monotonic() - _state.get("session_click_time", 0) < 5):
+        return False
     debug = util.create_debug_logger(config_dict)
-
-    # Wait for page to fully load before selecting session
-    # Check for key elements: next button or activity info
-    wait_js = '''
-    (function() {
-        const buttons = document.querySelectorAll('button');
-        for (const btn of buttons) {
-            const text = btn.textContent || '';
-            if (text.includes('下一步') || text.includes('Next')) {
-                return true;
-            }
-        }
-        // Also check for activity title
-        const body = document.body.textContent || '';
-        if (body.includes('活動場次') || body.includes('活動時間')) {
-            return true;
-        }
-        return false;
-    })()
-    '''
-    page_ready = await tab.evaluate(wait_js)
-    page_ready = util.parse_nodriver_result(page_ready)
-    if not page_ready:
-        # Page not ready, return False to retry next iteration
-        return False
-
-    # Get date keyword from config
-    date_keyword = config_dict.get("date_auto_select", {}).get("date_keyword", "")
-    auto_select_mode = config_dict.get("date_auto_select", {}).get("mode", "random")
-    date_auto_fallback = config_dict.get("date_auto_fallback", False)
-
-    debug.log(f"[FUNONE] Date selection - keyword: '{date_keyword}', mode: {auto_select_mode}")
-
     try:
-        # Get all session options
-        get_sessions_js = '''
-        (function() {
-            const sessions = [];
-
-            // Priority 1: Look for FunOne-specific round_info divs (session containers)
-            const roundInfos = document.querySelectorAll('.round_info, .round_info--js');
-            if (roundInfos.length > 0) {
-                for (const container of roundInfos) {
-                    // Get session info from .info div inside container
-                    const infoDiv = container.querySelector('.info');
-                    const text = infoDiv ? infoDiv.textContent.trim() : container.textContent.trim();
-                    const isDisabled = container.classList.contains('disabled') || container.classList.contains('sold-out');
-
-                    if (!isDisabled && text.length > 3) {
-                        sessions.push({
-                            text: text,
-                            index: sessions.length
-                        });
-                    }
-                }
-                return sessions;
-            }
-
-            // Priority 2: Fallback to generic button search (for other layouts)
-            const buttons = document.querySelectorAll('button, [role="button"], .session-item, [class*="session"], [class*="date"]');
-            for (const btn of buttons) {
-                const text = btn.textContent || '';
-                const isDisabled = btn.disabled || btn.classList.contains('disabled') || btn.classList.contains('sold-out');
-
-                // Filter out non-session buttons
-                if (text.length > 3 && text.length < 200 && !isDisabled) {
-                    // Check if it looks like a date/session
-                    if (/\\d{4}|\\d{1,2}[/.-]\\d{1,2}|\\d{1,2}:\\d{2}/.test(text) ||
-                        text.includes('場') || text.includes('場次')) {
-                        sessions.push({
-                            text: text.trim(),
-                            index: sessions.length
-                        });
-                    }
-                }
-            }
-            return sessions;
-        })()
-        '''
-        sessions = await tab.evaluate(get_sessions_js)
-
-        # Parse CDP format if needed
-        # NoDriver may return format: {'type': 'object', 'value': [['key', {'type': 'string', 'value': 'val'}], ...]}
-        if sessions:
-            parsed_sessions = []
-            for s in sessions:
-                if isinstance(s, dict) and 'type' in s and s['type'] == 'object' and 'value' in s:
-                    # Parse CDP object format
-                    obj = {}
-                    for pair in s['value']:
-                        if isinstance(pair, list) and len(pair) == 2:
-                            key, val_dict = pair
-                            if isinstance(val_dict, dict) and 'value' in val_dict:
-                                obj[key] = val_dict['value']
-                    parsed_sessions.append(obj)
-                else:
-                    parsed_sessions.append(s)
-            sessions = parsed_sessions
-
-        if not sessions or len(sessions) == 0:
-            debug.log("[FUNONE] No sessions found")
+        sessions = await tab.evaluate("(() => {" + CONST_FUNONE_SESSION_SCAN_JS + """
+            return rows.map(row => ({index:row.index, text:row.text, enabled:!!enabled(row)}));
+        })()""")
+        if not isinstance(sessions, list) or not sessions:
             return False
-
-        debug.log(f"[FUNONE] Found {len(sessions)} sessions")
-
-        # Find matching session by keyword
-        target_index = -1
-
-        if date_keyword and len(date_keyword) > 0:
-            keywords = util.parse_keyword_string_to_array(date_keyword)
-
-            for i, session in enumerate(sessions):
-                session_text = session.get('text', '') if isinstance(session, dict) else str(session)
-                for kw in keywords:
-                    if kw.lower() in session_text.lower():
-                        target_index = i
-                        debug.log(f"[FUNONE] Keyword '{kw}' matched session: {session_text}")
-                        break
-                if target_index >= 0:
+        options = config_dict.get("date_auto_select", {})
+        keyword = options.get("date_keyword", "")
+        chosen = []
+        if keyword:
+            groups = util.parse_keyword_string_to_array(keyword)
+            if not groups:
+                groups = [part.strip() for part in keyword.split(";") if part.strip()]
+            for group in groups:
+                matched = [row for row in sessions if all(
+                    word.casefold() in row["text"].casefold() for word in group.split())]
+                if matched:
+                    chosen = matched
                     break
-
-        # Fallback selection if no keyword match
-        if target_index < 0:
-            if date_keyword and len(date_keyword) > 0 and not date_auto_fallback:
-                debug.log("[FUNONE] No keyword match, date_auto_fallback=False, stopping")
+            if not chosen and not config_dict.get("date_auto_fallback", False):
                 return False
-
-            # Use auto_select_mode for fallback
-            target_index = util.get_target_index_by_mode(len(sessions), auto_select_mode)
-            debug.log(f"[FUNONE] Using fallback mode '{auto_select_mode}', selected index: {target_index}")
-
-        if target_index < 0 or target_index >= len(sessions):
-            target_index = 0
-
-        # Click the selected session's next button
-        click_session_js = f'''
-        (function() {{
-            // Priority 1: FunOne-specific round_info divs
-            const roundInfos = document.querySelectorAll('.round_info, .round_info--js');
-            if (roundInfos.length > 0) {{
-                const sessionContainers = [];
-                for (const container of roundInfos) {{
-                    const isDisabled = container.classList.contains('disabled') || container.classList.contains('sold-out');
-                    if (!isDisabled) {{
-                        sessionContainers.push(container);
-                    }}
-                }}
-
-                if (sessionContainers.length > {target_index}) {{
-                    // Find the "下一步" button inside the selected session container
-                    const selectedContainer = sessionContainers[{target_index}];
-                    const nextBtn = selectedContainer.querySelector('button');
-                    if (nextBtn) {{
-                        nextBtn.click();
-                        return true;
-                    }}
-                }}
-                return false;
-            }}
-
-            // Priority 2: Fallback to generic button search
-            const sessions = [];
-            const buttons = document.querySelectorAll('button, [role="button"], .session-item, [class*="session"], [class*="date"]');
-
-            for (const btn of buttons) {{
-                const text = btn.textContent || '';
-                const isDisabled = btn.disabled || btn.classList.contains('disabled') || btn.classList.contains('sold-out');
-
-                if (text.length > 3 && text.length < 200 && !isDisabled) {{
-                    if (/\\d{{4}}|\\d{{1,2}}[/.-]\\d{{1,2}}|\\d{{1,2}}:\\d{{2}}/.test(text) ||
-                        text.includes('場') || text.includes('場次')) {{
-                        sessions.push(btn);
-                    }}
-                }}
-            }}
-
-            if (sessions.length > {target_index}) {{
-                sessions[{target_index}].click();
-                return true;
-            }}
-            return false;
-        }})()
-        '''
-        clicked = await tab.evaluate(click_session_js)
-
-        if clicked:
-            debug.log(f"[FUNONE] Session {target_index} next button clicked")
-            await tab.sleep(0.5)
+        # Keep waiting for a matching session instead of choosing an unrelated
+        # session just because the intended Next button is still disabled.
+        candidates = [row for row in (chosen or sessions) if row.get("enabled")]
+        if not candidates:
+            return False
+        row = candidates[util.get_target_index_by_mode(len(candidates), options.get("mode", "random"))]
+        if await _funone_actions_paused(config_dict):
+            return False
+        script = ("(() => {" + CONST_FUNONE_SESSION_SCAN_JS +
+                  "\nconst index = " + json.dumps(row["index"]) +
+                  "; const expected = " + json.dumps(row["text"]) + r""";
+            const row = rows.find(item => item.index === index && item.text === expected);
+            if (!row || !enabled(row)) return false;
+            row.button.click();
+            return true;
+        })()""")
+        clicked = await tab.evaluate(script)
+        if clicked is True:
+            _state["session_click_url"] = url
+            _state["session_click_time"] = time.monotonic()
+            debug.log("[FUNONE] 已點擊場次下一步，等待網站回應。")
             return True
-
-        return False
-
     except Exception as exc:
-        debug.log(f"[FUNONE] Date selection error: {exc}")
-        return False
+        debug.log(f"[FUNONE] 場次下一步處理失敗：{exc}")
+    return False
+
 
 async def nodriver_funone_area_auto_select(tab, url, config_dict):
     """
@@ -460,6 +352,8 @@ async def nodriver_funone_area_auto_select(tab, url, config_dict):
     Returns:
         bool: True if ticket type selected
     """
+    if await _funone_actions_paused(config_dict):
+        return False
     debug = util.create_debug_logger(config_dict)
 
     # Get area keyword from config
@@ -607,6 +501,8 @@ async def nodriver_funone_area_auto_select(tab, url, config_dict):
             return true;
         }})()
         """
+        if await _funone_actions_paused(config_dict):
+            return False
         clicked = await tab.evaluate(click_ticket_js)
 
         if clicked:
@@ -884,6 +780,8 @@ def _funone_matching_rows(rows, config_dict):
 
 async def nodriver_funone_assign_ticket_number(tab, config_dict):
     """Change one ticket row, then verify actual quantities on a later read."""
+    if await _funone_actions_paused(config_dict):
+        return False
     try:
         if _is_past_ticket_selection(await nodriver_current_url_safe(tab)):
             return False
@@ -940,6 +838,8 @@ async def nodriver_funone_assign_ticket_number(tab, config_dict):
             return true;
         })(INDEX, ACTION)
         """
+        if await _funone_actions_paused(config_dict):
+            return False
         await tab.evaluate(script.replace("INDEX", json.dumps(chosen["index"])).replace(
             "ACTION", json.dumps(action)))
         _state["qty_fail_reason"] = "updating"
@@ -967,7 +867,7 @@ async def _funone_read_captcha(tab):
         const minimum = input && input.minLength > 0 ? input.minLength :
             (maximum < 6 ? maximum : 4);
         const errors = Array.from(document.querySelectorAll(
-            '.captcha_form .form_additional_text, .captcha_form .error, [role="alert"]'));
+            '.captcha_form .input_error.show, .captcha_form .error, [role="alert"]'));
         return {hasCaptcha: !!(image || input), image: src,
             ready: !!(input && (!image || (visible(image) && image.complete &&
                 image.naturalWidth > 0))),
@@ -985,6 +885,8 @@ async def _funone_read_captcha(tab):
 
 async def nodriver_funone_captcha_handler(tab, config_dict, require_captcha=False):
     """Wait for rendering; retry per image without locking out later CAPTCHA loads."""
+    if await _funone_actions_paused(config_dict):
+        return False
     debug = util.create_debug_logger(config_dict)
     try:
         info = await _funone_read_captcha(tab)
@@ -995,14 +897,22 @@ async def nodriver_funone_captcha_handler(tab, config_dict, require_captcha=Fals
         if not info.get("ready"):
             return False
         image = info.get("image", "")
+        if await _funone_actions_paused(config_dict):
+            return False
         signature = (image, info.get("value", ""))
         last_filled = _state.get("captcha_filled_signature", (None, None))
-        if info.get("invalid") and (
+        if not info.get("invalid"):
+            _state["captcha_error_handled"] = False
+        if info.get("invalid") and not _state.get("captcha_error_handled") and (
                 signature == last_filled or
                 (not info.get("value") and image == last_filled[0])):
+            if _state.get("ocr_retry_count", 0) >= 5:
+                _state["ocr_exhausted_image"] = image
+                return False
             if image != _state.get("captcha_reload_from"):
-                _state["captcha_reload_from"] = image
-                await nodriver_funone_reload_captcha(tab)
+                if await nodriver_funone_reload_captcha(tab):
+                    _state["captcha_reload_from"] = image
+                    _state["captcha_error_handled"] = True
             return False
         if info.get("value"):
             if info.get("valid"):
@@ -1021,19 +931,25 @@ async def nodriver_funone_captcha_handler(tab, config_dict, require_captcha=Fals
         if _state.get("ocr_exhausted_image") and _state["ocr_exhausted_image"] != image:
             _state["ocr_retry_count"] = 0
             _state.pop("ocr_exhausted_image", None)
+        if _state.get("ocr_retry_count", 0) >= 5:
+            _state["ocr_exhausted_image"] = image
+            return False
         if time.monotonic() < _state.get("next_ocr_time", 0):
             return False
         _state["next_ocr_time"] = time.monotonic() + 0.5
         _state["ocr_retry_count"] = _state.get("ocr_retry_count", 0) + 1
         if await nodriver_funone_ocr_captcha(tab, config_dict, image):
-            _state["ocr_retry_count"] = 0
+            if _state["ocr_retry_count"] >= 5:
+                _state["ocr_exhausted_image"] = image
             return True
+        if await _funone_actions_paused(config_dict):
+            return False
         if _state["ocr_retry_count"] >= 5:
             _state["ocr_exhausted_image"] = image
             debug.log("[FUNONE] OCR retries exhausted; enter CAPTCHA or refresh it manually.")
         else:
-            _state["captcha_reload_from"] = image
-            await nodriver_funone_reload_captcha(tab)
+            if await nodriver_funone_reload_captcha(tab):
+                _state["captcha_reload_from"] = image
         return False
     except Exception as exc:
         debug.log(f"[FUNONE] CAPTCHA processing failed: {exc}")
@@ -1042,6 +958,8 @@ async def nodriver_funone_captcha_handler(tab, config_dict, require_captcha=Fals
 
 async def nodriver_funone_reload_captcha(tab):
     """Click the captcha reload button to get a new image"""
+    if await _funone_actions_paused(None):
+        return False
     try:
         reload_js = '''
         (function() {
@@ -1073,6 +991,8 @@ async def nodriver_funone_reload_captcha(tab):
 
 async def nodriver_funone_ocr_captcha(tab, config_dict, base64_data):
     """Honor model settings and verify that the same image is still displayed."""
+    if await _funone_actions_paused(config_dict):
+        return False
     debug = util.create_debug_logger(config_dict)
     try:
         config_key = json.dumps(config_dict.get("ocr_captcha", {}), sort_keys=True)
@@ -1082,12 +1002,16 @@ async def nodriver_funone_ocr_captcha(tab, config_dict, base64_data):
                 if ddddocr is None:
                     return False
                 ocr = await asyncio.to_thread(ddddocr.DdddOcr, show_ad=False, beta=False)
-                ocr.set_ranges(5)
+                ocr.set_ranges(6)
             _state["ocr_instance"] = ocr
             _state["ocr_config_key"] = config_key
+        if await _funone_actions_paused(config_dict):
+            return False
         image_bytes = base64.b64decode(base64_data.split(",", 1)[-1])
         answer = await asyncio.to_thread(_state["ocr_instance"].classification, image_bytes)
-        answer = re.sub(r"[^A-Za-z0-9]", "", answer or "").upper()
+        if await _funone_actions_paused(config_dict):
+            return False
+        answer = re.sub(r"[^A-Za-z0-9]", "", answer or "")
         info = await _funone_read_captcha(tab)
         if not info or not info.get("ready") or info.get("image") != base64_data:
             return False
@@ -1100,16 +1024,16 @@ async def nodriver_funone_ocr_captcha(tab, config_dict, base64_data):
             const img = document.querySelector('img[alt="vCode"], img.captcha_img, img[src*="captcha"]');
             const input = document.querySelectorAll('input')[index];
             if (!img || img.getAttribute('src') !== image || !input || input.value) return false;
-            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-            setter.call(input, answer);
-            input.dispatchEvent(new Event('input', {bubbles:true}));
-            input.dispatchEvent(new Event('change', {bubbles:true}));
-            return input.value === answer;
+            NATIVE_SETTER
+            return setNativeInputValue(input, answer);
         })(INDEX, ANSWER, IMAGE)
         """
+        script = script.replace("NATIVE_SETTER", CONST_NATIVE_INPUT_SETTER_JS)
         script = script.replace("INDEX", json.dumps(info["index"])).replace(
             "ANSWER", json.dumps(answer)).replace("IMAGE", json.dumps(base64_data))
-        if not util.parse_nodriver_result(await tab.evaluate(script)):
+        if await _funone_actions_paused(config_dict):
+            return False
+        if not await tab.evaluate(script):
             return False
         verified = await _funone_read_captcha(tab)
         if not verified or verified.get("image") != base64_data or not verified.get("valid"):
@@ -1221,6 +1145,8 @@ async def nodriver_funone_ticket_agree(tab):
     Returns:
         bool: True if agreements checked
     """
+    if await _funone_actions_paused(None):
+        return False
     try:
         check_agree_js = '''
         (function() {
@@ -1340,6 +1266,8 @@ async def _funone_submission_pending(tab, url, config_dict):
 
 async def nodriver_funone_order_submit(tab, config_dict):
     """Submit a verified selection once; do not treat a click as order success."""
+    if await _funone_actions_paused(config_dict):
+        return False
     debug = util.create_debug_logger(config_dict)
     current_url = await nodriver_current_url_safe(tab)
     if not current_url or _is_past_ticket_selection(current_url):
@@ -1368,6 +1296,8 @@ async def nodriver_funone_order_submit(tab, config_dict):
         return {clicked:false};
     })()
     """
+    if await _funone_actions_paused(config_dict):
+        return False
     # Stamp before CDP: a timeout after a real click must not trigger another click.
     _state.update(submission_pending=True, order_submitted_url=current_url,
                   order_submitted_time=time.monotonic(),
@@ -1580,7 +1510,8 @@ def _funone_reset_page_state(url, document_id=None):
     if document_id is not None:
         _state["flow_document_id"] = document_id
     for key in ("captcha_reload_from", "captcha_filled_signature", "ocr_exhausted_image",
-                "handoff_notified", "captcha_ready_logged", "next_ocr_time"):
+                "handoff_notified", "captcha_ready_logged", "next_ocr_time",
+                "session_click_url", "session_click_time", "captcha_error_handled"):
         _state.pop(key, None)
     _state.update(ocr_retry_count=0, next_button_clicked=False, qty_fail_reason="")
     if previous is not None:
@@ -1598,7 +1529,7 @@ async def _funone_refresh_stock(tab, config_dict):
         interval = max(0.5, float(interval))
     except (ValueError, TypeError):
         interval = 5
-    if not await sleep_before_auto_refresh(interval):
+    if not await sleep_before_auto_refresh(interval) or await _funone_actions_paused(config_dict):
         return
     live_url = await nodriver_current_url_safe(tab)
     if not live_url or _is_past_ticket_selection(live_url) or _state.get("submission_pending"):
@@ -1642,9 +1573,11 @@ async def _funone_handle_ticket_flow(tab, url, config_dict):
 
 async def _funone_handle_form(tab, config_dict):
     """Only fill CAPTCHA on the data page; leave order creation/payment to the user."""
+    if await _funone_actions_paused(config_dict):
+        return
     ready = await nodriver_funone_captcha_handler(tab, config_dict, require_captcha=True)
     info = await _funone_read_captcha(tab)
-    if not info or not info.get("ready"):
+    if not info or not info.get("ready") or await _funone_actions_paused(config_dict):
         return
     debug = util.create_debug_logger(config_dict)
     if ready and not _state.get("captcha_ready_logged"):

@@ -41,6 +41,7 @@ class FunOneBrowserTests(unittest.IsolatedAsyncioTestCase):
             self.config["advanced"]["verbose"] = False
             self.config["keyword_exclude"] = ""
             self.config["area_auto_select"]["area_keyword"] = '"VIP"'
+            await self.check_session_next()
             with patch.object(funone, "nodriver_current_url_safe", AsyncMock(return_value=TICKET_URL)):
                 await self.check_area_index()
                 await self.check_keyword_priority()
@@ -79,6 +80,21 @@ class FunOneBrowserTests(unittest.IsolatedAsyncioTestCase):
             <div class="zone_box" onclick="document.body.dataset.clicked='General'"><span class="zone_name">General</span></div>''')
         self.assertTrue(await funone.nodriver_funone_area_auto_select(self.tab, TICKET_URL, self.config))
         self.assertEqual(await self.tab.evaluate("document.body.dataset.clicked"), "VIP")
+
+    async def check_session_next(self):
+        # The Next button can be a sibling of .round_info, not its child.
+        await self.html('''<section><div class="round_info"><div class="info">11/15 台北場</div></div>
+            <button disabled onclick="document.body.dataset.entered='yes'">下一步</button></section>''')
+        url = "https://tickets.funone.io/activity/activity_detail/test"
+        self.config['date_auto_select']['date_keyword'] = '"11/15 台北"'
+        self.assertFalse(await funone.nodriver_funone_date_auto_select(self.tab, url, self.config))
+        await self.tab.evaluate("document.querySelector('button').disabled=false")
+        self.assertTrue(await funone.nodriver_funone_date_auto_select(self.tab, url, self.config))
+        self.assertEqual(await self.tab.evaluate("document.body.dataset.entered"), "yes")
+        self.assertFalse(await funone.nodriver_funone_date_auto_select(self.tab, url, self.config))
+        await self.html('''<section><div class="round_info">11/15 台北場</div><button disabled>下一步</button></section>
+            <section><div class="round_info">11/16 台中場</div><button>下一步</button></section>''')
+        self.assertFalse(await funone.nodriver_funone_date_auto_select(self.tab, url, self.config))
 
     async def check_refresh_target(self):
         await self.html('<button onclick="document.body.dataset.clicked=\'plus\'"><svg></svg></button>')
@@ -128,19 +144,24 @@ class FunOneBrowserTests(unittest.IsolatedAsyncioTestCase):
     async def check_ocr_and_rejected_image(self):
         first, second = png("white"), png("black")
         await self.html('<div class="captcha_form"><img alt="vCode" src="' + first + '''">
-            <input placeholder="驗證碼" maxlength="5"><div class="form_additional_text"></div>
+            <input placeholder="驗證碼" maxlength="5"><div class="form_additional_text">
+            <p class="input_error" style="display:none">驗證碼錯誤</p></div>
             <button class="captcha_reload_btn">換圖</button></div>''')
         self.config["ocr_captcha"]["enable"] = True
         await self.tab.evaluate("document.querySelector('button').onclick=()=>{document.querySelector('img').src=" +
                                 json.dumps(second) + ";document.querySelector('input').value='';}")
-        with patch.object(funone, "create_ocr_for_platform", return_value=SimpleNamespace(classification=lambda image: "ABCDE")):
+        with patch.object(funone, "create_ocr_for_platform", return_value=SimpleNamespace(classification=lambda image: "AbCdE")):
             self.assertTrue(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
-            await self.tab.evaluate("document.querySelector('.form_additional_text').textContent='驗證碼錯誤'")
+            self.assertTrue(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
+            self.assertEqual(await self.tab.evaluate("document.querySelector('input').value"), "AbCdE")
+            await self.tab.evaluate("document.querySelector('.input_error').classList.add('show');document.querySelector('.input_error').style.display='' ")
             self.assertFalse(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
             await asyncio.sleep(0.6)
             # An old error label may remain visible while the new image is filled.
             self.assertTrue(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
-            self.assertEqual(await self.tab.evaluate("document.querySelector('input').value"), "ABCDE")
+            self.assertEqual(await self.tab.evaluate("document.querySelector('input').value"), "AbCdE")
+            self.assertTrue(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
+            self.assertEqual(funone._state['ocr_retry_count'], 2)
 
     async def check_explicit_step(self):
         evaluate = self.tab.evaluate

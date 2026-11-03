@@ -1,5 +1,7 @@
 """Offline regressions for FunOne submission and stage transitions."""
 import sys
+import json
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -170,6 +172,68 @@ class FunOneFlowTests(unittest.IsolatedAsyncioTestCase):
             await funone.nodriver_funone_main(self.tab, TICKET_URL, self.config)
             flow.assert_not_awaited()
         self.assertTrue(funone._state["submission_pending"])
+
+    async def test_paused_captcha_reload_never_clicks(self):
+        with patch.object(funone, 'check_and_handle_pause', AsyncMock(return_value=True)):
+            self.assertFalse(await funone.nodriver_funone_reload_captcha(self.tab))
+            self.assertFalse(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
+        self.tab.evaluate.assert_not_awaited()
+
+    async def test_pause_during_ocr_blocks_later_reload(self):
+        paused = False
+
+        async def pause(*args):
+            return paused
+
+        async def ocr(*args):
+            nonlocal paused
+            paused = True
+            return False
+
+        info = {'hasCaptcha': True, 'ready': True, 'image': 'data:image/png;base64,AA==', 'value': ''}
+        with patch.object(funone, '_funone_actions_paused', side_effect=pause), \
+                patch.object(funone, '_funone_read_captcha', AsyncMock(return_value=info)), \
+                patch.object(funone, 'nodriver_funone_ocr_captcha', side_effect=ocr) as recognize, \
+                patch.object(funone, 'nodriver_funone_reload_captcha', AsyncMock()) as reload:
+            self.assertFalse(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
+            recognize.assert_awaited_once()
+            reload.assert_not_awaited()
+
+    async def test_pause_after_classification_blocks_input_fill(self):
+        paused = False
+
+        def classify(image):
+            nonlocal paused
+            paused = True
+            return 'AbCdE'
+
+        async def is_paused(*args):
+            return paused
+
+        funone._state.update(ocr_config_key=json.dumps(self.config['ocr_captcha'], sort_keys=True),
+                             ocr_instance=SimpleNamespace(classification=classify))
+        with patch.object(funone, '_funone_actions_paused', side_effect=is_paused), \
+                patch.object(funone, '_funone_read_captcha', AsyncMock()) as read:
+            self.assertFalse(await funone.nodriver_funone_ocr_captcha(
+                self.tab, self.config, 'data:image/png;base64,AA=='))
+            read.assert_not_awaited()
+        self.tab.evaluate.assert_not_awaited()
+
+    async def test_successful_fill_and_rejection_still_share_retry_budget(self):
+        with patch.object(funone, '_funone_read_captcha', AsyncMock()) as read, \
+                patch.object(funone, 'nodriver_funone_ocr_captcha', AsyncMock(return_value=True)) as ocr, \
+                patch.object(funone, 'nodriver_funone_reload_captcha', AsyncMock(return_value=True)) as reload:
+            for attempt in range(5):
+                image = 'data:image/png;base64,image' + str(attempt)
+                funone._state['next_ocr_time'] = 0
+                read.return_value = {'hasCaptcha': True, 'ready': True, 'image': image, 'value': '', 'invalid': False}
+                self.assertTrue(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
+                funone._state['captcha_filled_signature'] = (image, 'AbCdE')
+                read.return_value = {'hasCaptcha': True, 'ready': True, 'image': image, 'value': 'AbCdE', 'valid': True, 'invalid': True}
+                self.assertFalse(await funone.nodriver_funone_captcha_handler(self.tab, self.config, True))
+            self.assertEqual(ocr.await_count, 5)
+            self.assertEqual(reload.await_count, 4)
+            self.assertEqual(funone._state['ocr_retry_count'], 5)
 
 
 if __name__ == "__main__":
