@@ -67,6 +67,10 @@ python settings.py
 
 ### 步驟 1：開啟設定介面
 
+Windows 可直接雙擊專案根目錄的 **start-settings.cmd**。首次執行會自動建立
+本機 .venv 並安裝套件，之後直接啟動。電腦需先安裝 64 位元 Python 3.10 或 3.11。
+Git 與原始碼 ZIP 不包含 .venv，因此換電腦後需要首次初始化；不要搬用另一台的虛擬環境。
+
 **網頁介面**
 ```bash
 cd tickets_hunter/src
