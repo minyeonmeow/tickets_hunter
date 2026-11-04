@@ -63,6 +63,7 @@ CONST_MAXBOT_QUESTION_FILE = "MAXBOT_QUESTION.txt"
 # loop for >10s, and a tight value would misreport a busy instance as dead.
 CONST_HEARTBEAT_FILE = "heartbeat.txt"
 CONST_HEARTBEAT_ALIVE_SEC = 30
+CONST_SETTINGS_STARTED_AT = time.time()
 
 CONST_SERVER_PORT = 16888
 
@@ -334,6 +335,7 @@ def get_instance_status(profile_name):
         "state": state,
         "error": record.get("message", "") if state == "error" else "",
         "error_id": record.get("event_id", "") if state == "error" else "",
+        "notify_error": state == "error" and record.get("updated_at", 0) >= CONST_SETTINGS_STARTED_AT,
         "detail": record.get("message", "") if state == "running" else "",
         "last_url": read_last_url_from_file(profile_name),
     }

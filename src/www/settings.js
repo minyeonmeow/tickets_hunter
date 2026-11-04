@@ -2644,7 +2644,7 @@ function instanceStateLabel(state) {
     return (labels[state] || labels.idle)[currentLanguage === 'en' ? 1 : 0];
 }
 function notifyInstanceError(it) {
-    if (!it.error) return;
+    if (!it.error || it.notify_error === false) return;
     const key = `${it.id}:${it.error_id || it.error}`;
     if (instanceErrorNotifications.has(key)) return;
     instanceErrorNotifications.add(key);
