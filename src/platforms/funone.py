@@ -128,14 +128,19 @@ async def _funone_clock_probe(tab):
 async def _funone_clock_subscribe(tab):
     requests = {}
 
-    def requested(event):
+    async def requested(event, connection=None):
+        # Async dispatch binds the event before zendriver's listener advances.
+        if not isinstance(event, cdp.network.RequestWillBeSent):
+            return
         path = _funone_clock_endpoint(event.request.url)
         if path and _state.get("clock_tab") is tab:
             requests[event.request_id] = (path, time.monotonic())
             if path == '/Ticket/GetArrangeActivityList':
                 _state["web_refresh_inflight"] = True
 
-    async def completed(event):
+    async def completed(event, connection=None):
+        if not isinstance(event, cdp.network.LoadingFinished):
+            return
         record = requests.pop(event.request_id, None)
         if not record or _state.get("clock_tab") is not tab:
             return
@@ -153,7 +158,9 @@ async def _funone_clock_subscribe(tab):
         except Exception:
             pass
 
-    def failed(event):
+    async def failed(event, connection=None):
+        if not isinstance(event, cdp.network.LoadingFailed):
+            return
         record = requests.pop(event.request_id, None)
         if record and record[0] == '/Ticket/GetArrangeActivityList' and _state.get("clock_tab") is tab:
             _state["web_refresh_inflight"] = False
