@@ -471,7 +471,7 @@ def launch_maxbot(profile_name="", instance_override=""):
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_QUIT_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, util.CONST_BROWSER_DISCONNECT_FILE))
-    util.force_remove_file(get_instance_state_filepath(effective_instance, util.CONST_INSTANCE_STATUS_FILE))
+    util.write_instance_status("starting", path=get_instance_state_filepath(effective_instance, util.CONST_INSTANCE_STATUS_FILE))
 
     config_filepath, config_dict = load_json(profile_name)
 
@@ -744,8 +744,45 @@ class DisconnectHandler(tornado.web.RequestHandler):
         self.write({"disconnected": True})
 
 
+class ForceStopHandler(tornado.web.RequestHandler):
+    async def post(self):
+        profile = self.get_query_argument("profile", "")
+        if profile and not is_valid_profile_name(profile):
+            self.set_status(400)
+            self.write({"error": "invalid profile name"})
+            return
+        for filename in (util.CONST_BROWSER_DISCONNECT_FILE, CONST_MAXBOT_INT28_QUIT_FILE):
+            path = get_instance_state_filepath(profile, filename)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w"):
+                pass
+        try:
+            pids = await asyncio.to_thread(util.stop_bot_processes, profile, True)
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            self.set_status(409)
+            self.write({"error": "無法確認搶票程序已停止，請關閉原啟動視窗後重試。"})
+            return
+        util.force_remove_file(get_instance_state_filepath(profile, CONST_HEARTBEAT_FILE))
+        util.force_remove_file(get_instance_state_filepath(profile, util.CONST_INSTANCE_STATUS_FILE))
+        self.write({"stopped": True, "count": len(pids)})
+
+
 class RunHandler(tornado.web.RequestHandler):
     async def get(self):
+        key = self.get_query_argument("instance", "") or self.get_query_argument("profile", "") or CONST_DEFAULT_PROFILE
+        pending = getattr(self.application, 'launching_instances', set())
+        self.application.launching_instances = pending
+        if key in pending:
+            self.set_status(409)
+            self.write({"run": False, "error": "此實例正在連接，請稍候。"})
+            return
+        pending.add(key)
+        try:
+            await self.launch()
+        finally:
+            pending.discard(key)
+
+    async def launch(self):
         profile_name = self.get_query_argument("profile", "")
         if profile_name and not is_valid_profile_name(profile_name):
             self.set_status(400)
@@ -759,6 +796,18 @@ class RunHandler(tornado.web.RequestHandler):
             self.write({"run": False, "error": "invalid instance name"})
             return
         display_name = instance_override or profile_name or CONST_DEFAULT_PROFILE
+        # A failed duplicate launch used to overwrite the original bot's status.
+        # Reject it before launch, including when its heartbeat has stalled.
+        try:
+            existing = await asyncio.to_thread(util.stop_bot_processes, display_name)
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            self.set_status(409)
+            self.write({"run": False, "error": "無法確認舊搶票程序狀態，請先強制停止此實例。"})
+            return
+        if existing or get_instance_status(display_name)["state"] == "starting":
+            self.set_status(409)
+            self.write({"run": False, "error": "此實例已有搶票程序。暫停時請按繼續；需重新連接請先斷開，無反應可用強制停止。"})
+            return
         _, config = load_json(profile_name)
         advanced = config.get("advanced", {})
         if advanced.get("browser_connection_mode", "attach") == "attach":
@@ -1172,6 +1221,7 @@ def create_application(ocr=None):
         ("/resume", ResumeHandler),
         ("/stop", StopHandler),
         ("/disconnect", DisconnectHandler),
+        ("/force_stop", ForceStopHandler),
         ("/run", RunHandler),
         
         # json api

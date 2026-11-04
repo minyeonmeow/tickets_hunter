@@ -2008,11 +2008,14 @@ function render_instances(rows) {
             ? $('<button type="button" class="btn btn-sm btn-outline-success"></button>').text(uiText('btn_resume')).on('click', function(){ instance_resume(it.id); })
             : $('<button type="button" class="btn btn-sm btn-outline-danger"></button>').text(uiText('btn_pause')).on('click', function(){ instance_pause(it.id); });
         if (it.alive && !['stopping', 'error'].includes(state)) action_td.append(action_btn);
-        // Stop is only meaningful for a live process; offline rows have nothing to stop.
-        if (it.alive) {
+        if (it.alive || state === 'error') {
             const stop_btn = $('<button type="button" class="btn btn-sm btn-outline-secondary ms-1"></button>').text(uiText('disconnect')).on('click', function(){ instance_disconnect(it.id); });
             action_td.append(stop_btn);
         }
+        action_td.append($('<button type="button" class="btn btn-sm btn-outline-danger ms-1"></button>')
+            .text(currentLanguage === 'en' ? 'Force stop' : '強制停止')
+            .attr('title', currentLanguage === 'en' ? 'Stop this bot process; keep Chrome open' : '結束此實例的搶票程序，保留 Chrome')
+            .on('click', function(){ instance_force_stop(it.id); }));
         tr.append(action_td);
         tbody.append(tr);
     });
@@ -2643,6 +2646,16 @@ function instanceStateLabel(state) {
     };
     return (labels[state] || labels.idle)[currentLanguage === 'en' ? 1 : 0];
 }
+function instance_force_stop(id) {
+    $.post('/force_stop' + instance_query(id)).done(function(data) {
+        run_message(currentLanguage === 'en' ? 'Bot stopped. Chrome stays open.' : '已停止此實例的搶票程序，Chrome 保持開啟。');
+        maxbot_status_api();
+        instances_dashboard_api();
+    }).fail(function(xhr) {
+        message(xhr.responseJSON?.error || (currentLanguage === 'en' ? 'Could not stop the bot.' : '強制停止失敗，請查看原啟動視窗。'));
+    });
+}
+
 function notifyInstanceError(it) {
     if (!it.error || it.notify_error === false) return;
     const key = `${it.id}:${it.error_id || it.error}`;

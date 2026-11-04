@@ -114,10 +114,11 @@ CONST_BROWSER_DISCONNECT_FILE = "MAXBOT_BROWSER_DISCONNECT.txt"
 CONST_INSTANCE_STATUS_FILE = "MAXBOT_INSTANCE_STATUS.json"
 
 
-def write_instance_status(state, message=""):
+def write_instance_status(state, message="", path=None):
     """Publish safe, user-facing lifecycle information for this bot instance."""
-    path = get_instance_state_path(CONST_INSTANCE_STATUS_FILE)
-    temporary = path + ".tmp"
+    path = path or get_instance_state_path(CONST_INSTANCE_STATUS_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + "." + str(os.getpid()) + ".tmp"
     payload = {"state": state, "message": message, "event_id": str(uuid.uuid4()),
                "updated_at": datetime.now().timestamp()}
     with open(temporary, "w", encoding="utf-8") as output:
@@ -2170,6 +2171,69 @@ def acquire_browser_port_lock(port):
     except OSError:
         handle.close()
         raise ValueError(f"Port {port} 已由另一個搶票實例使用，請先結束該實例或改用不同 Port。") from None
+
+
+CONST_BOT_PROCESS_CONTROL_SCRIPT = """$ErrorActionPreference = 'Stop'
+$c = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('DATA')) | ConvertFrom-Json
+$matched = @()
+Get-CimInstance Win32_Process | ForEach-Object {
+    $p = $_
+    $line = $p.CommandLine
+    $isBot = $false
+    if ($c.frozen) {
+        $isBot = $p.ExecutablePath -eq (Join-Path $c.root 'nodriver_tixcraft.exe')
+    } elseif ($p.ExecutablePath -eq $c.exe -and $line) {
+        $pattern = '(?:^|\\s)(?:"' + [regex]::Escape($c.script) + '"|' + [regex]::Escape($c.script) + ')(?=\\s|$)'
+        $isBot = $line -match $pattern
+        if (!$isBot -and $c.localVenv) { $isBot = $line -match '(?:^|\\s)"?nodriver_tixcraft\\.py"?(?=\\s|$)' }
+    }
+    if ($isBot) {
+        $id = 'default'
+        if ($line -match '(?:^|\\s)"?--input=(?:"([^"]+)"|([^"]+)"|([^\\s"]+))') {
+            $inputPath = if ($Matches[1]) { $Matches[1] } elseif ($Matches[2]) { $Matches[2] } else { $Matches[3] }
+            $id = [IO.Path]::GetFileNameWithoutExtension($inputPath)
+            if ($id -eq 'settings') { $id = 'default' }
+        }
+        if ($line -match '(?:^|\\s)--instance=(?:"([A-Za-z0-9_-]+)"|([A-Za-z0-9_-]+))(?=\\s|$)') {
+            $id = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+        }
+        if ($id -eq $c.instance) {
+            if ($c.kill) { Invoke-CimMethod -InputObject $p -MethodName Terminate -Arguments @{Reason=1} -ErrorAction Stop | ForEach-Object { if ($_.ReturnValue -ne 0) { throw 'terminate failed' } } }
+            $matched += [int]$p.ProcessId
+        }
+    }
+}
+ConvertTo-Json -InputObject @($matched) -Compress
+"""
+
+
+def stop_bot_processes(instance, terminate=False):
+    """Find/kill only this project's Windows bot processes for one instance.
+
+    Match the executable and script before interpreting arguments. Never kill
+    Chrome or a process tree, and never expose command lines in diagnostics.
+    """
+    if os.name != 'nt':
+        if terminate:
+            raise ValueError("強制停止目前僅支援 Windows。")
+        return []
+    root = os.path.abspath(get_app_root())
+    script = os.path.join(root, 'nodriver_tixcraft.py')
+    executable = os.path.abspath(sys.executable)
+    local_venv = os.path.normcase(executable).startswith(
+        os.path.normcase(os.path.join(os.path.dirname(root), '.venv') + os.sep))
+    # Pass paths as JSON data, never interpolate them as PowerShell source.
+    data = json.dumps({'root': root, 'script': script, 'exe': executable,
+                       'instance': instance or 'default', 'kill': terminate,
+                       'localVenv': local_venv, 'frozen': bool(getattr(sys, 'frozen', False))})
+    import base64
+    encoded = base64.b64encode(data.encode('utf-8')).decode('ascii')
+    command = CONST_BOT_PROCESS_CONTROL_SCRIPT.replace('DATA', encoded)
+    result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command],
+                            capture_output=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+    if result.returncode:
+        raise ValueError("無法檢查或停止搶票程序，請查看原啟動視窗。")
+    return json.loads(result.stdout.decode('utf-8-sig').strip() or '[]')
 
 
 def launch_maxbot(script_name="nodriver_tixcraft", filename="", homepage="", kktix_account = "", kktix_password="", window_size="", headless="", instance=""):

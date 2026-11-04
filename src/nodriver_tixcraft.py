@@ -718,9 +718,13 @@ async def main(args):
         util.write_instance_status("error", "搶票程序發生錯誤，請重新開始；若持續發生，請查看命令視窗。")
         raise
     finally:
-        await nodriver_disconnect_browser(session.get("browser"))
-        if session.get("lock"):
-            session["lock"].close()
+        try:
+            await asyncio.wait_for(nodriver_disconnect_browser(session.get("browser")), timeout=3)
+        except (Exception, asyncio.CancelledError):
+            pass
+        finally:
+            if session.get("lock"):
+                session["lock"].close()
         if session.get("heartbeat"):
             util.force_remove_file(util.get_instance_state_path(session["heartbeat"]))
         if util.read_instance_status().get("state") != "error":
