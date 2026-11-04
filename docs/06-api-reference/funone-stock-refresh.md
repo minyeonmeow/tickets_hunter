@@ -77,3 +77,18 @@ JP2 的錄製流程為：CheckCanAddCard（成功）→ WebSocket 0x04 讀取票
 優化為提前處理可準備的選票與條款；FunOne 購票頁不再被主程式的定時刷新 gate 阻擋。
 到指定時間才允許購買送出，並保留網站的 disabled 檢查及防重複送出狀態。
 排程留空則以網站按鈕可用狀態決定送出時機；沒有新增背景自動點擊腳本或繞過開賣限制。
+
+## SMN3：開賣狀態刷新與網站校時
+
+開賣前顯示的「更新頁面」為 .web_round_info_refresh，呼叫 TicketGetArrangeActivityList。
+實際請求為 POST /Ticket/GetArrangeActivityList，並重新啟動網站的開賣倒數，
+不是 F5，也不是票況 WebSocket 查詢。此入口使用相同 get_round_info_flag Cookie，但存活時間為 30 秒。
+SMN3 錄製於開賣前，資料仍為 close，不能據此斷言網站在真正開賣時必須手動刷新；
+網站另有依 serverTimeMs 將 isRoundOnSales 設為 True 的倒數邏輯。
+
+程式沿用「指定開始時間」：依本機時間觸發；另監聽 GetNowTime 並以 monotonic 外推參考時間。
+若尚未收到近期回應，使用目前分頁的 CSRF 資料做一次同源時間查詢；不保存或輸出 Token。
+API 只有秒精度，參考時間差包含網路誤差，不能作為毫秒校時依據。
+缺少有效網站時間樣本不阻擋本機定時操作。購買按鈕已可用時優先走購買流程；
+已到指定本機時間但仍顯示開賣前更新按鈕時才嘗試點擊，保留預選，尊重網站 Cookie 與 30 秒冷卻。
+本機 Chrome 測試使用本地 HTTP 回應驗證 Network 監聽，沒有對真實售票服務做壓力或購買測試。

@@ -334,6 +334,7 @@ def get_instance_status(profile_name):
         "state": state,
         "error": record.get("message", "") if state == "error" else "",
         "error_id": record.get("event_id", "") if state == "error" else "",
+        "detail": record.get("message", "") if state == "running" else "",
         "last_url": read_last_url_from_file(profile_name),
     }
 

@@ -7,6 +7,9 @@ import base64
 import json
 import re
 import time
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlsplit
+from zendriver import cdp
 
 try:
     import ddddocr
@@ -51,6 +54,193 @@ __all__ = [
 CONST_FUNONE_SUBMIT_COOLDOWN = 5.0
 
 _state = {}
+
+CONST_FUNONE_CLOCK_MAX_AGE = 120
+CONST_FUNONE_CLOCK_RESAMPLE = 20
+CONST_FUNONE_WEB_REFRESH_COOLDOWN = 30
+
+
+def _funone_clock_record(value, received=None, elapsed=0):
+    """Anchor the server's second-resolution lower bound to a monotonic clock."""
+    try:
+        server = datetime.strptime(value, '%Y-%m-%d %H:%M:%S').replace(
+            tzinfo=timezone(timedelta(hours=8))).timestamp()
+    except (ValueError, TypeError):
+        return False
+    _state["server_clock"] = {"floor": server, "received": received if received is not None else time.monotonic(),
+                              "rtt": elapsed}
+    return True
+
+
+def _funone_server_now():
+    sample = _state.get("server_clock")
+    if not sample:
+        return None
+    age = time.monotonic() - sample["received"]
+    if age < 0 or age > CONST_FUNONE_CLOCK_MAX_AGE:
+        return None
+    return datetime.fromtimestamp(sample["floor"] + age, timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+
+def _funone_scheduled_delay(config_dict):
+    target = str(config_dict.get("refresh_datetime") or "").strip()
+    if not target:
+        return 0
+    return util.scheduled_start_delay(target)
+
+
+def _funone_clock_endpoint(url):
+    parsed = urlsplit(url)
+    if parsed.hostname != 'tickets.funone.io':
+        return None
+    return parsed.path if parsed.path in ('/api/ApiFront/GetNowTime', '/Ticket/GetArrangeActivityList') else None
+
+
+def _funone_clock_notice(message):
+    if _state.get("clock_notice") != message:
+        _state["clock_notice"] = message
+        util.create_debug_logger(enabled=True).log("[FUNONE] " + message)
+        if util.read_instance_status().get("state") == "running":
+            util.write_instance_status("running", message)
+
+
+async def _funone_clock_probe(tab):
+    """One same-origin clock request when no recent passive sample was available."""
+    started = time.monotonic()
+    script = r"""(async () => {
+        if (location.hostname !== 'tickets.funone.io' || !window.appConfig?.csrfToken) return null;
+        const response = await fetch('/api/ApiFront/GetNowTime', {
+            method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({_token:window.appConfig.csrfToken})
+        });
+        if (!response.ok) return null;
+        const data = await response.json();
+        return data.IsSuccess === true ? data.Value : null;
+    })()"""
+    try:
+        value = await asyncio.wait_for(tab.evaluate(script, await_promise=True), timeout=6)
+        if _state.get("clock_tab") is tab and isinstance(value, str):
+            _funone_clock_record(value, elapsed=time.monotonic() - started)
+    except Exception:
+        pass
+
+
+async def _funone_clock_subscribe(tab):
+    requests = {}
+
+    def requested(event):
+        path = _funone_clock_endpoint(event.request.url)
+        if path and _state.get("clock_tab") is tab:
+            requests[event.request_id] = (path, time.monotonic())
+            if path == '/Ticket/GetArrangeActivityList':
+                _state["web_refresh_inflight"] = True
+
+    async def completed(event):
+        record = requests.pop(event.request_id, None)
+        if not record or _state.get("clock_tab") is not tab:
+            return
+        if record[0] == '/Ticket/GetArrangeActivityList':
+            _state["web_refresh_inflight"] = False
+            return
+        received = time.monotonic()
+        try:
+            body, encoded = await tab.send(cdp.network.get_response_body(event.request_id))
+            if encoded:
+                body = base64.b64decode(body).decode('utf-8')
+            result = json.loads(body)
+            if result.get("IsSuccess") is True:
+                _funone_clock_record(result.get("Value"), received, received - record[1])
+        except Exception:
+            pass
+
+    def failed(event):
+        record = requests.pop(event.request_id, None)
+        if record and record[0] == '/Ticket/GetArrangeActivityList' and _state.get("clock_tab") is tab:
+            _state["web_refresh_inflight"] = False
+
+    tab.add_handler(cdp.network.RequestWillBeSent, requested)
+    tab.add_handler(cdp.network.LoadingFinished, completed)
+    tab.add_handler(cdp.network.LoadingFailed, failed)
+    try:
+        await tab.send(cdp.network.enable())
+    except Exception:
+        pass  # The explicit same-origin probe can still provide calibration.
+
+
+async def _funone_clock_prepare(tab, config_dict):
+    if not str(config_dict.get("refresh_datetime") or "").strip():
+        if _state.pop("clock_notice", None) and util.read_instance_status().get("state") == "running":
+            util.write_instance_status("running")
+        return
+    if _state.get("clock_tab") is not tab:
+        old_probe = _state.pop("clock_probe", None)
+        if old_probe and not old_probe.done():
+            old_probe.cancel()
+        _state.pop("clock_probe_after", None)
+        _state.pop("clock_notice", None)
+        _state.pop("web_refresh_inflight", None)
+        _state["clock_tab"] = tab
+        _state.pop("server_clock", None)
+        await _funone_clock_subscribe(tab)
+    now = time.monotonic()
+    sample = _state.get("server_clock", {})
+    task = _state.get("clock_probe")
+    if (now - sample.get("received", float('-inf')) >= CONST_FUNONE_CLOCK_RESAMPLE and
+            now >= _state.get("clock_probe_after", 0) and (task is None or task.done())):
+        _state["clock_probe_after"] = now + CONST_FUNONE_CLOCK_RESAMPLE
+        _state["clock_probe"] = asyncio.create_task(_funone_clock_probe(tab))
+    server_now = _funone_server_now()
+    if server_now:
+        offset = (server_now - datetime.now()).total_seconds()
+        _funone_clock_notice(f"依本機時間觸發；網站時間參考差約 {offset:+.0f} 秒（網站減本機，含秒精度及網路誤差）。")
+    else:
+        _funone_clock_notice("依本機時間觸發；網站時間尚未取得，不影響指定時間操作。")
+
+
+async def _funone_refresh_open_status(tab, url, config_dict):
+    """Use the pre-sale Update Page button after the configured local time."""
+    if (not str(config_dict.get("refresh_datetime") or "").strip() or _funone_scheduled_delay(config_dict) > 0 or
+            not util.is_auto_refresh_enabled() or _state.get("submission_pending") or
+            await _funone_actions_paused(config_dict)):
+        return False
+    now = time.monotonic()
+    if _state.get("web_refresh_inflight"):
+        _state["pre_sale_page"] = True
+        return False
+    if now < _state.get("web_refresh_check_after", 0):
+        return False
+    _state["web_refresh_check_after"] = now + 0.25
+    previous = _state.get("web_refresh_at", float('-inf'))
+    allow = now - previous >= CONST_FUNONE_WEB_REFRESH_COOLDOWN
+    script = r"""((expected, allow) => {
+        if (location.href !== expected) return {status:'route'};
+        const visible = e => e && e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+        const buttons = Array.from(document.querySelectorAll('button'));
+        if (buttons.some(e => visible(e) && !e.disabled && /^(立即購買|購買|Buy\s+now|Purchase)$/i.test(e.textContent.trim())))
+            return {status:'ready'};
+        const refresh = buttons.find(e => visible(e) && e.matches('.web_round_info_refresh'));
+        if (!refresh) return {status:'none'};
+        if (!allow || refresh.disabled || refresh.getAttribute('aria-disabled') === 'true') return {status:'waiting'};
+        if (document.cookie.split(';').some(e => e.trim().startsWith('get_round_info_flag='))) return {status:'cooldown'};
+        refresh.click();
+        return {status:'clicked'};
+    })(EXPECTED, ALLOW)"""
+    # Reserve before CDP: an uncertain click must not consume the cooldown twice.
+    if allow:
+        _state["web_refresh_at"] = now
+    try:
+        result = await tab.evaluate(script.replace("EXPECTED", json.dumps(url)).replace("ALLOW", json.dumps(allow)))
+        status = result.get("status") if isinstance(result, dict) else None
+        _state["pre_sale_page"] = status in ('clicked', 'waiting', 'cooldown')
+        if status == 'clicked':
+            _funone_clock_notice("本機指定時間已到，已點更新頁面；保留預選，等待購買按鈕開放。")
+            return True
+        if status and allow:
+            _state["web_refresh_at"] = previous
+    except Exception:
+        # Preserve the reservation when CDP may have timed out after a real click.
+        pass
+    return False
 
 
 def _is_past_ticket_selection(url):
@@ -1178,7 +1368,7 @@ async def nodriver_funone_order_submit(tab, config_dict, selection_verified=Fals
     """Submit a verified selection once; do not treat a click as order success."""
     if await _funone_actions_paused(config_dict):
         return False
-    delay = util.scheduled_start_delay(config_dict.get("refresh_datetime", ""))
+    delay = _funone_scheduled_delay(config_dict)
     if delay > 0:
         if not _state.get("scheduled_wait_logged"):
             util.create_debug_logger(config_dict, enabled=True).log(
@@ -1294,7 +1484,7 @@ def _funone_reset_page_state(url, document_id=None):
         _state["flow_document_id"] = document_id
     for key in ("captcha_reload_from", "captcha_filled_signature", "ocr_exhausted_image",
                 "handoff_notified", "captcha_ready_logged", "next_ocr_time",
-                "captcha_error_handled", "scheduled_wait_logged"):
+                "captcha_error_handled", "scheduled_wait_logged", "pre_sale_page", "web_refresh_check_after"):
         _state.pop(key, None)
     _state.update(ocr_retry_count=0, qty_fail_reason="")
     if previous is not None:
@@ -1305,7 +1495,7 @@ async def _funone_refresh_stock(tab, config_dict):
     """Recheck the live route after waiting, before any refresh or reload."""
     if not util.is_auto_refresh_enabled():
         return False
-    if util.scheduled_start_delay(config_dict.get("refresh_datetime", "")) > 0:
+    if _funone_scheduled_delay(config_dict) > 0 or _state.get("pre_sale_page"):
         return False
 
     document_id = _state.get("flow_document_id")
@@ -1338,6 +1528,7 @@ async def _funone_refresh_stock(tab, config_dict):
 async def _funone_handle_ticket_flow(tab, url, config_dict):
     if await _funone_submission_pending(tab, url, config_dict):
         return
+    await _funone_refresh_open_status(tab, url, config_dict)
     step = await nodriver_funone_detect_step(tab)
     _state["last_step"] = step
     if step not in (1, 2):
@@ -1414,6 +1605,7 @@ async def nodriver_funone_main(tab, url, config_dict):
     if not await nodriver_funone_verify_login(tab, config_dict):
         return tab
     if "/purchase_choose_ticket" in url:
+        await _funone_clock_prepare(tab, config_dict)
         await _funone_handle_ticket_flow(tab, url, config_dict)
     elif url.rstrip("/") == "https://tickets.funone.io":
         homepage = config_dict.get("homepage", url)

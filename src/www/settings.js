@@ -1922,7 +1922,9 @@ function maxbot_status_api()
             status_class = "badge text-bg-secondary";
             $("#pause_btn, #resume_btn").addClass("disappear");
         }
-        $("#disconnect_btn").prop("disabled", data.alive === false);
+        // Errors can hide a still-running instance after another launch fails.
+        // Keep recovery available so its stop/disconnect flags can be delivered.
+        $("#disconnect_btn").prop("disabled", data.alive === false && data.state !== 'error');
         if (data.state) {
             status_text = instanceStateLabel(data.state);
             status_class = "badge text-bg-" + (data.state === 'running' ? 'success' : data.state === 'error' ? 'danger' : 'secondary');
@@ -1933,6 +1935,7 @@ function maxbot_status_api()
         }
         $("#last_url").text(data.last_url || (currentLanguage === 'en' ? 'No activity yet' : '尚無執行紀錄'));
         $("#maxbot_status").html(status_text).prop( "class", status_class);
+        $("#instance_detail").text(data.detail || '');
     })
     .fail(function() {
         //alert( "error" );
