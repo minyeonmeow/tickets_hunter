@@ -1,6 +1,6 @@
 **文件說明**：Tickets Hunter 的程式碼邊界規範，定義模組職責、依賴方向、命名慣例與禁止模式。提交 PR 前請先閱讀。
 
-**最後更新**：2026-09-16
+**最後更新**：2026-11-09
 
 ---
 
@@ -16,7 +16,9 @@
 - **`nodriver_common.py`** — 共用瀏覽器基礎設施：DOM 操作、暫停機制、Cloudflare、瀏覽器初始化、OCR 工廠、通知。禁止：平台業務邏輯、import `platforms/*` 或 `nodriver_tixcraft`。
 - **`platforms/*.py`** — 各平台 12 階段流程，一平台一檔（家族平台同檔，如 tixcraft + ticketmaster）。狀態用模組層級 `_state = {}`；平台常數定義在各自模組。禁止：跨平台 import、import `nodriver_tixcraft`。
 - **`util.py`** — 純跨平台工具：文字比對、關鍵字解析、字串正規化、檔案 I/O、DebugLogger、CAPTCHA 數學猜測。禁止：平台選擇器／URL、業務邏輯、import `settings` 或 `nodriver_tixcraft`。此檔為所有平台共用，修改前務必評估跨平台影響。
-- **`settings.py`** — 設定 CRUD 與 Tornado Web Server。禁止：搶票邏輯、import `nodriver_tixcraft`。僅允許 `import util`。
+- **`settings.py`** — 設定 CRUD 與 Tornado Web Server。禁止：搶票邏輯、import `nodriver_tixcraft`。允許匯入 `util`、`runtime_manager`，透過本機管道控制獨立工作程序。
+- **`runtime_manager.py`** — 管理工作程序的建立、指令、回應與生命週期；不得匯入瀏覽器、主迴圈或平台模組，不處理售票網站請求。
+- **`ticketplus_worker.py`** — TicketPlus 常駐程序入口，載入主迴圈後待命，收到開始指令才執行任務。每個實例同時只允許一個任務；斷開釋放鎖定與 CDP 連線，保留 Chrome。
 
 ---
 
@@ -26,7 +28,9 @@
 nodriver_tixcraft  -->  nodriver_common, platforms/*, util, settings
 platforms/*        -->  nodriver_common, util
 nodriver_common    -->  util, settings
-settings           -->  util
+settings           -->  util, runtime_manager
+runtime_manager    -->  util
+ticketplus_worker  -->  nodriver_tixcraft, platforms/ticketplus, util
 util               -->  (無專案內部匯入)
 ```
 

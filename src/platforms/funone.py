@@ -11,10 +11,6 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit
 from zendriver import cdp
 
-try:
-    import ddddocr
-except Exception:
-    ddddocr = None
 
 import util
 from nodriver_common import evaluate_refresh_if_enabled, sleep_before_auto_refresh
@@ -24,6 +20,7 @@ from nodriver_common import (
     check_and_handle_quit,
     CONST_NATIVE_INPUT_SETTER_JS,
     create_ocr_for_platform,
+    create_builtin_ocr,
     nodriver_current_url_safe,
     play_sound_while_ordering,
     send_discord_notification,
@@ -1106,10 +1103,7 @@ async def nodriver_funone_ocr_captcha(tab, config_dict, base64_data):
         if _state.get("ocr_config_key") != config_key:
             ocr = await asyncio.to_thread(create_ocr_for_platform, config_dict)
             if ocr is None:
-                if ddddocr is None:
-                    return False
-                ocr = await asyncio.to_thread(ddddocr.DdddOcr, show_ad=False, beta=False)
-                ocr.set_ranges(6)
+                ocr = await asyncio.to_thread(create_builtin_ocr, beta=False, ranges=6)
             _state["ocr_instance"] = ocr
             _state["ocr_config_key"] = config_key
         if await _funone_actions_paused(config_dict):

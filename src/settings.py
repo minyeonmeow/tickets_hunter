@@ -21,6 +21,7 @@ from tornado.web import StaticFileHandler
 
 import requests
 import util
+from runtime_manager import WorkerManager, supports_warm_worker
 
 from typing import (
     Dict,
@@ -39,11 +40,6 @@ from typing import (
     overload,
 )
 
-try:
-    import ddddocr
-except Exception as exc:
-    print(f"[WARNING] ddddocr module not available: {exc}")
-    print("[WARNING] OCR captcha auto-solve will be disabled.")
 
 # Get script directory for resource paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -251,6 +247,9 @@ def get_default_config():
     config_dict["advanced"]["server_port"] = CONST_SERVER_PORT
     config_dict["advanced"]["browser_connection_mode"] = "attach"
     config_dict["advanced"]["browser_port"] = 19327
+    config_dict["advanced"]["warm_ticketplus_worker"] = True
+    config_dict["advanced"]["ticketplus_queue_url_poll_interval"] = 0.05
+    config_dict["advanced"]["ticketplus_queue_timing"] = True
     # remote_url will be dynamically generated based on server_port
     config_dict["advanced"]["remote_url"] = ""
 
@@ -300,7 +299,7 @@ def list_instance_ids():
                 ids.append(item)
     return ids
 
-def get_instance_status(profile_name):
+def get_instance_status(profile_name, manager=None):
     """Liveness/pause/last-url snapshot for one instance, mirroring the bot's
     own state-file resolution (default -> root, named -> instances/<id>/)."""
     heartbeat_filepath = get_instance_state_filepath(profile_name, CONST_HEARTBEAT_FILE)
@@ -326,9 +325,13 @@ def get_instance_status(profile_name):
         state, alive = "stopped", False
     elif paused:
         state = "paused"
+    elif record.get("state") == "starting":
+        state = "starting"
+    elif record.get("state") == "waiting_manual":
+        state = "waiting_manual"
     elif record.get("state") == "paused":
         state = "starting"
-    return {
+    result = {
         "id": profile_name or CONST_DEFAULT_PROFILE,
         "alive": alive,
         "paused": paused,
@@ -336,9 +339,17 @@ def get_instance_status(profile_name):
         "error": record.get("message", "") if state == "error" else "",
         "error_id": record.get("event_id", "") if state == "error" else "",
         "notify_error": state == "error" and record.get("updated_at", 0) >= CONST_SETTINGS_STARTED_AT,
-        "detail": record.get("message", "") if state == "running" else "",
+        "detail": record.get("message", "") if state in ("running", "starting", "waiting_manual") else "",
         "last_url": read_last_url_from_file(profile_name),
     }
+    worker = manager.get(profile_name) if manager else None
+    if worker:
+        result.update(worker.snapshot())
+        if worker.busy and not alive and state in ('idle', 'stopped'):
+            result.update(state='starting', detail='正在準備工作程序並連接 Chrome。')
+        if not alive and not worker.busy and state in ('idle', 'stopped'):
+            result['detail'] = '工作程序已待命，尚未開始搶票。' if worker.ready.is_set() else '正在背景準備工作程序，尚未連接 Chrome。'
+    return result
 
 def migrate_config(config_dict):
     """Migrate old config structure to new structure."""
@@ -471,7 +482,7 @@ def launch_maxbot(profile_name="", instance_override=""):
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_QUIT_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, CONST_MAXBOT_INT28_FILE))
     util.force_remove_file(get_instance_state_filepath(effective_instance, util.CONST_BROWSER_DISCONNECT_FILE))
-    util.write_instance_status("starting", path=get_instance_state_filepath(effective_instance, util.CONST_INSTANCE_STATUS_FILE))
+    util.write_instance_status("starting", "正在啟動搶票程序。", path=get_instance_state_filepath(effective_instance, util.CONST_INSTANCE_STATUS_FILE))
 
     config_filepath, config_dict = load_json(profile_name)
 
@@ -616,10 +627,13 @@ def stop_all_bots():
         maxbot_stop(name)
 
 
-def request_settings_shutdown():
+def request_settings_shutdown(app=None):
     global GLOBAL_SERVER_SHUTDOWN
     stop_all_bots()
     GLOBAL_SERVER_SHUTDOWN = True
+    manager = getattr(app, 'workers', None) if app else globals().get('GLOBAL_WORKER_MANAGER')
+    if manager:
+        threading.Thread(target=manager.close, daemon=True).start()
 
 
 class SettingsPageConnection(tornado.websocket.WebSocketHandler):
@@ -647,12 +661,12 @@ class SettingsPageConnection(tornado.websocket.WebSocketHandler):
     def shutdown_if_empty(self):
         self.application.ui_shutdown_handle = None
         if not self.application.ui_connections:
-            request_settings_shutdown()
+            request_settings_shutdown(self.application)
 
 
 class ShutdownHandler(tornado.web.RequestHandler):
     def get(self):
-        request_settings_shutdown()
+        request_settings_shutdown(self.application)
         self.write({"showdown": GLOBAL_SERVER_SHUTDOWN})
 
 class StatusHandler(tornado.web.RequestHandler):
@@ -665,7 +679,7 @@ class StatusHandler(tornado.web.RequestHandler):
         idle_filepath = get_instance_state_filepath(profile_name, CONST_MAXBOT_INT28_FILE)
         is_paused = os.path.exists(idle_filepath)
         url = read_last_url_from_file(profile_name)
-        details = get_instance_status(profile_name)
+        details = get_instance_status(profile_name, self.application.workers)
         self.write({**details, "status": details["state"] == "running", "last_url": url})
 
 class InstancesHandler(tornado.web.RequestHandler):
@@ -673,7 +687,7 @@ class InstancesHandler(tornado.web.RequestHandler):
     state and last URL. The dashboard polls this; per-instance pause/resume
     and 'pause all' reuse the existing /pause /resume endpoints per id."""
     def get(self):
-        instances = [get_instance_status(name) for name in list_instance_ids()]
+        instances = [get_instance_status(name, self.application.workers) for name in list_instance_ids()]
         self.write({"instances": instances})
 
 class AutoRefreshHandler(tornado.web.RequestHandler):
@@ -720,17 +734,30 @@ class ResumeHandler(tornado.web.RequestHandler):
         self.write({"resume": True})
 
 class StopHandler(tornado.web.RequestHandler):
-    def get(self):
+    async def get(self):
         profile_name = self.get_query_argument("profile", "")
         if profile_name and not is_valid_profile_name(profile_name):
             self.set_status(400)
             self.write({"stop": False, "error": "invalid profile name"})
             return
         maxbot_stop(profile_name)
+        if not await disconnect_worker(self, profile_name):
+            return
         self.write({"stop": True})
 
+async def disconnect_worker(handler, profile):
+    worker = handler.application.workers.get(profile)
+    if worker:
+        try:
+            await asyncio.to_thread(worker.request, 'disconnect')
+        except (ValueError, OSError) as exc:
+            handler.set_status(409)
+            handler.write({"error": str(exc)})
+            return False
+    return True
+
 class DisconnectHandler(tornado.web.RequestHandler):
-    def get(self):
+    async def get(self):
         profile_name = self.get_query_argument("profile", "")
         if profile_name and not is_valid_profile_name(profile_name):
             self.set_status(400)
@@ -741,6 +768,8 @@ class DisconnectHandler(tornado.web.RequestHandler):
         with open(filepath, "w"):
             pass
         maxbot_stop(profile_name)
+        if not await disconnect_worker(self, profile_name):
+            return
         self.write({"disconnected": True})
 
 
@@ -757,6 +786,9 @@ class ForceStopHandler(tornado.web.RequestHandler):
             with open(path, "w"):
                 pass
         try:
+            worker = self.application.workers.get(profile)
+            if worker:
+                await asyncio.to_thread(worker.close, True)
             pids = await asyncio.to_thread(util.stop_bot_processes, profile, True)
         except (ValueError, OSError, subprocess.TimeoutExpired):
             self.set_status(409)
@@ -764,7 +796,7 @@ class ForceStopHandler(tornado.web.RequestHandler):
             return
         util.force_remove_file(get_instance_state_filepath(profile, CONST_HEARTBEAT_FILE))
         util.force_remove_file(get_instance_state_filepath(profile, util.CONST_INSTANCE_STATUS_FILE))
-        self.write({"stopped": True, "count": len(pids)})
+        self.write({"stopped": True, "count": len(pids) + int(worker is not None)})
 
 
 class RunHandler(tornado.web.RequestHandler):
@@ -796,11 +828,24 @@ class RunHandler(tornado.web.RequestHandler):
             self.write({"run": False, "error": "invalid instance name"})
             return
         display_name = instance_override or profile_name or CONST_DEFAULT_PROFILE
-        # A failed duplicate launch used to overwrite the original bot's status.
-        # Reject it before launch, including when its heartbeat has stalled.
+        _, config = load_json(profile_name)
+        worker = self.application.workers.get(display_name)
+        if worker and worker.snapshot()['worker_busy']:
+            self.set_status(409)
+            self.write({"run": False, "error": "此實例已有任務；暫停時請按繼續，重新開始前請先斷開。"})
+            return
+        advanced = config.get("advanced", {})
+        attach = advanced.get("browser_connection_mode", "attach") == "attach"
+        port = advanced.get("browser_port", 19327) if attach else None
         try:
-            existing = await asyncio.to_thread(util.stop_bot_processes, display_name)
-        except (ValueError, OSError, subprocess.TimeoutExpired):
+            util.check_bot_start_locks(display_name, port)
+            # Compatibility for legacy bots that own Chrome and predate locks.
+            existing = [] if attach else await asyncio.to_thread(util.stop_bot_processes, display_name)
+        except ValueError as exc:
+            self.set_status(409)
+            self.write({"run": False, "error": str(exc)})
+            return
+        except (OSError, subprocess.TimeoutExpired):
             self.set_status(409)
             self.write({"run": False, "error": "無法確認舊搶票程序狀態，請先強制停止此實例。"})
             return
@@ -808,17 +853,27 @@ class RunHandler(tornado.web.RequestHandler):
             self.set_status(409)
             self.write({"run": False, "error": "此實例已有搶票程序。暫停時請按繼續；需重新連接請先斷開，無反應可用強制停止。"})
             return
-        _, config = load_json(profile_name)
-        advanced = config.get("advanced", {})
-        if advanced.get("browser_connection_mode", "attach") == "attach":
-            port = advanced.get("browser_port", 19327)
+        if attach:
             if not await asyncio.to_thread(util.is_browser_debug_port, port):
                 self.set_status(409)
                 self.write({"run": False, "error": f"無法連接 Chrome Port {port}。請先執行 start-browser.cmd，並確認腳本與介面使用相同 Port。"})
                 return
         print('run button pressed. profile:', display_name)
+        if supports_warm_worker(config):
+            await self.start_worker(display_name, profile_name)
+            return
         launch_maxbot(profile_name, instance_override)
         self.write({"run": True, "profile": display_name})
+
+    async def start_worker(self, instance, profile):
+        try:
+            worker = self.application.workers.prepare(instance)
+            await asyncio.to_thread(worker.request, 'start', config_path=get_profile_filepath(profile))
+        except (ValueError, OSError) as exc:
+            self.set_status(409)
+            self.write({"run": False, "error": str(exc)})
+            return
+        self.write({"run": True, "profile": instance})
 
 class LoadJsonHandler(tornado.web.RequestHandler):
     def get(self):
@@ -828,6 +883,8 @@ class LoadJsonHandler(tornado.web.RequestHandler):
             self.write({"error": "invalid profile name"})
             return
         config_filepath, config_dict = load_json(profile_name)
+        if self.application.warm_enabled and supports_warm_worker(config_dict):
+            self.application.workers.prepare(profile_name)
 
         # Dynamically generate remote_url based on server_port (Issue #156)
         server_port = config_dict.get("advanced", {}).get("server_port", CONST_SERVER_PORT)
@@ -902,6 +959,8 @@ class SaveJsonHandler(tornado.web.RequestHandler):
                 config_dict["webdriver_type"] = CONST_WEBDRIVER_TYPE_NODRIVER
 
             util.save_json(config_dict, config_filepath)
+            if self.application.warm_enabled and supports_warm_worker(config_dict):
+                self.application.workers.prepare(profile_name)
 
         if not is_pass_check:
             self.set_status(401)
@@ -1241,6 +1300,8 @@ def create_application(ocr=None):
     app.version = CONST_APP_VERSION;
     app.ui_connections = set()
     app.ui_shutdown_handle = None
+    app.workers = WorkerManager(util.get_app_root())
+    app.warm_enabled = False
 
     return app
 
@@ -1248,12 +1309,16 @@ def create_application(ocr=None):
 async def main_server():
     ocr = None
     try:
+        import ddddocr
         ocr = ddddocr.DdddOcr(show_ad=False, beta=True)
     except Exception as exc:
         print(exc)
         pass
 
     app = create_application(ocr)
+    global GLOBAL_WORKER_MANAGER
+    GLOBAL_WORKER_MANAGER = app.workers
+    app.warm_enabled = True
 
     # Get server_port from config, fallback to default (Issue #156)
     _, config_dict = load_json()
@@ -1268,7 +1333,12 @@ async def main_server():
     print("server running on port:", server_port)
 
     open_settings_page(server_port)
-    await asyncio.Event().wait()
+    if supports_warm_worker(config_dict):
+        app.workers.prepare(CONST_DEFAULT_PROFILE)
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await asyncio.to_thread(app.workers.close)
 
 
 def open_settings_page(server_port):
@@ -1369,4 +1439,7 @@ if __name__ == "__main__":
         pass
     finally:
         stop_all_bots()
+        manager = globals().get('GLOBAL_WORKER_MANAGER')
+        if manager:
+            manager.close()
     print("Bye bye, see you next time.")

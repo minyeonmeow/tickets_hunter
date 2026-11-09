@@ -15,10 +15,6 @@ import time
 import traceback
 import webbrowser
 
-try:
-    import ddddocr
-except Exception:
-    pass
 
 from zendriver import cdp
 

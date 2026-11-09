@@ -86,6 +86,8 @@ src/
   nodriver_common.py     共用瀏覽器基礎設施（DOM、暫停、Cloudflare、瀏覽器初始化）
   util.py                共用純工具函式（文字比對、關鍵字解析、DebugLogger）
   settings.py            設定綱要與網頁設定介面
+  runtime_manager.py     常駐工作程序管理與本機管道（不匯入瀏覽器模組）
+  ticketplus_worker.py    TicketPlus 常駐程序入口（按開始才連接 Chrome）
   platforms/*.py         各平台獨立模組
   www/                   設定介面前端資源
 docs/                    技術文件（01 入門 ~ 07 部署）
@@ -100,6 +102,8 @@ build_scripts/           PyInstaller 打包腳本
 
 ```
 nodriver_tixcraft  ->  platforms/*  ->  nodriver_common  ->  util / settings
+settings -> runtime_manager -> util
+ticketplus_worker -> nodriver_tixcraft / platforms/ticketplus / util
 ```
 
 ### 平台與模組對照

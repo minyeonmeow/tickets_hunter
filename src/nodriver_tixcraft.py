@@ -18,6 +18,8 @@ import warnings
 import webbrowser
 from datetime import datetime
 
+_BOOT_STARTED = time.monotonic()
+
 # 強制使用 UTF-8 編碼輸出（解決 Windows CP950 編碼問題）
 # 適用於所有輸出環境（終端、IDE、重定向、管道）
 if sys.platform == 'win32':
@@ -34,11 +36,6 @@ import util
 import settings
 from NonBrowser import NonBrowser
 
-try:
-    import ddddocr
-except Exception as exc:
-    print(exc)
-    pass
 
 from nodriver_common import *
 from platforms.facebook import *
@@ -725,10 +722,12 @@ async def main(args):
         finally:
             if session.get("lock"):
                 session["lock"].close()
-        if session.get("heartbeat"):
+        if session.get("owns_state") and session.get("heartbeat"):
             util.force_remove_file(util.get_instance_state_path(session["heartbeat"]))
-        if util.read_instance_status().get("state") != "error":
+        if session.get("owns_state") and util.read_instance_status().get("state") != "error":
             util.write_instance_status("stopped")
+        if session.get("instance_lock"):
+            session['instance_lock'].close()
 
 
 async def _run_bot(args, session):
@@ -748,7 +747,14 @@ async def _run_bot(args, session):
         else:
             print(f"[INSTANCE] Invalid instance id '{instance_id}' (allowed: [A-Za-z0-9_-], max 32 chars), fallback to default")
 
-    util.write_instance_status("starting")
+    try:
+        session['instance_lock'] = util.acquire_bot_instance_lock(util.get_instance_id())
+    except ValueError as exc:
+        logger.error(str(exc))
+        return  # Do not overwrite the original instance's status/heartbeat.
+    session['owns_state'] = True
+    util.write_instance_status("starting", "正在連接 Chrome。")
+    logger.info(f'[啟動耗時] Python 模組就緒：{time.monotonic() - _BOOT_STARTED:.3f} 秒')
     config_dict = get_config_dict(args)
 
     # Global log prefix: override builtins.print to prepend an optional
@@ -837,7 +843,7 @@ async def _run_bot(args, session):
         print("Load config error!")
         sys.exit()
 
-    util.write_instance_status("running")
+    util.write_instance_status("starting", "瀏覽器已連接，正在準備搶票。")
     url = ""
     last_url = ""
     cloudflare_checked = False
@@ -847,11 +853,10 @@ async def _run_bot(args, session):
     ocr = None
     Captcha_Browser = None
     try:
-        if config_dict["ocr_captcha"]["enable"]:
+        if should_initialize_ocr(config_dict):
             ocr = create_ocr_for_platform(config_dict)
             if ocr is None:
-                ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                ocr.set_ranges(1)
+                ocr = create_builtin_ocr(beta=config_dict["ocr_captcha"]["beta"], ranges=1)
             Captcha_Browser = NonBrowser()
             if len(config_dict["accounts"]["tixcraft_sid"]) > 1:
                 #set_non_browser_cookies(driver, config_dict["homepage"], Captcha_Browser)
@@ -859,6 +864,9 @@ async def _run_bot(args, session):
     except Exception as exc:
         debug = util.create_debug_logger(config_dict)
         debug.log(f"[OCR INIT] Failed to initialize OCR: {exc}")
+
+    util.write_instance_status("running")
+    logger.info(f'[啟動耗時] 已接手瀏覽器，準備處理頁面：{time.monotonic() - _BOOT_STARTED:.3f} 秒')
 
     maxbot_last_reset_time = time.time()
     # Phase 3: liveness heartbeat. Touch instances/<id>/heartbeat.txt every few
@@ -876,7 +884,7 @@ async def _run_bot(args, session):
         "reached": False,
         "last_countdown_print": 0,
     }
-    ticketplus_purchase_done = False  # Guard: stop polling after purchase completed
+    ticketplus_handoff_done = False  # Leave buyer data and payment to the user.
 
     # Initialize config mtime (hot-reload watches the file actually loaded)
     app_root = util.get_app_root()
@@ -926,10 +934,16 @@ async def _run_bot(args, session):
                 continue
             if external_disconnected:
                 try:
+                    util.write_instance_status("starting", "正在重新連接 Chrome。")
+                    resume_started = time.monotonic()
                     driver, tab = await nodriver_attach_browser(conf, config_dict, external_target_id)
                     session["browser"] = driver
                     external_disconnected = False
-                    util.write_instance_status("running")
+                    if ticketplus_handoff_done:
+                        util.write_instance_status("waiting_manual", "已進入購票資料確認頁，請手動處理；尚未確認訂單與付款完成。")
+                    else:
+                        util.write_instance_status("running")
+                    logger.info(f'[繼續耗時] 已重新接手瀏覽器：{time.monotonic() - resume_started:.3f} 秒')
                 except Exception:
                     util.write_instance_status("error", "重新連接失敗。請確認瀏覽器及原購票分頁仍開啟，再按開始。")
                     logger.error("重新連接失敗，已結束搶票；請確認瀏覽器及原購票分頁仍開啟，再按開始。")
@@ -1080,18 +1094,11 @@ async def _run_bot(args, session):
             tab = await nodriver_kham_main(tab, url, config_dict, ocr)
 
         # https://ticketplus.com.tw/*
-        if 'ticketplus.com' in url and not ticketplus_purchase_done:
+        if 'ticketplus.com' in url and not ticketplus_handoff_done:
             tp_status = await nodriver_ticketplus_main(tab, url, config_dict, ocr, Captcha_Browser)
-
-            if isinstance(tp_status, dict):
-                if tp_status.get("purchase_completed", False):
-                    if not ticketplus_purchase_done:
-                        print("[SUCCESS] TicketPlus purchase completed")
-                        ticketplus_purchase_done = True
-                elif tp_status.get("is_ticket_assigned", False) and '/confirm/' in url.lower():
-                    if not ticketplus_purchase_done:
-                        print("[SUCCESS] TicketPlus on confirmation page, booking successful")
-                        ticketplus_purchase_done = True
+            if isinstance(tp_status, dict) and tp_status.get('handoff_ready', False):
+                print('[TICKETPLUS] 已交由使用者確認購票資料與後續付款；尚未確認購票完成。')
+                ticketplus_handoff_done = True
 
         if 'urbtix.hk' in url:
             #urbtix_main(driver, url, config_dict)

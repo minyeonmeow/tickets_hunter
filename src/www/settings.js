@@ -1924,11 +1924,11 @@ function maxbot_status_api()
         }
         // Errors can hide a still-running instance after another launch fails.
         // Keep recovery available so its stop/disconnect flags can be delivered.
-        $("#disconnect_btn").prop("disabled", data.alive === false && data.state !== 'error');
+        $("#disconnect_btn").prop("disabled", data.alive === false && !data.worker_busy && data.state !== 'error');
         if (data.state) {
             status_text = instanceStateLabel(data.state);
             status_class = "badge text-bg-" + (data.state === 'running' ? 'success' : data.state === 'error' ? 'danger' : 'secondary');
-            if (['starting', 'stopping', 'error', 'stopped', 'idle'].includes(data.state)) {
+            if (['starting', 'stopping', 'error', 'stopped', 'idle', 'waiting_manual'].includes(data.state)) {
                 $("#pause_btn, #resume_btn").addClass("disappear");
             }
             notifyInstanceError(data);
@@ -1993,6 +1993,7 @@ function render_instances(rows) {
         const live_badge = it.alive
             ? $('<span class="badge text-bg-secondary"></span>').text(it.paused ? (currentLanguage === 'en' ? 'Standby' : '保留待命') : uiText('instance_alive'))
             : $('<span class="badge text-bg-secondary"></span>').text(uiText('instance_offline'));
+        if (!it.alive && it.worker_alive) live_badge.text(it.worker_ready ? (currentLanguage === 'en' ? 'Ready' : '程序待命') : (currentLanguage === 'en' ? 'Preparing' : '準備中'));
         tr.append($('<td></td>').append(live_badge));
         const state = it.state || (!it.alive ? 'idle' : it.paused ? 'paused' : 'running');
         const color = state === 'running' ? 'success' : state === 'error' ? 'danger' : 'secondary';
@@ -2007,8 +2008,8 @@ function render_instances(rows) {
         const action_btn = it.paused
             ? $('<button type="button" class="btn btn-sm btn-outline-success"></button>').text(uiText('btn_resume')).on('click', function(){ instance_resume(it.id); })
             : $('<button type="button" class="btn btn-sm btn-outline-danger"></button>').text(uiText('btn_pause')).on('click', function(){ instance_pause(it.id); });
-        if (it.alive && !['stopping', 'error'].includes(state)) action_td.append(action_btn);
-        if (it.alive || state === 'error') {
+        if (it.alive && !['stopping', 'error', 'waiting_manual'].includes(state)) action_td.append(action_btn);
+        if (it.alive || it.worker_busy || state === 'error') {
             const stop_btn = $('<button type="button" class="btn btn-sm btn-outline-secondary ms-1"></button>').text(uiText('disconnect')).on('click', function(){ instance_disconnect(it.id); });
             action_td.append(stop_btn);
         }
@@ -2642,6 +2643,7 @@ function instanceStateLabel(state) {
     const labels = {
         idle: ['未啟動', 'Not running'], starting: ['連接中', 'Connecting'],
         running: ['執行中', 'Running'], paused: ['已暫停', 'Paused'],
+        waiting_manual: ['等待手動處理', 'Waiting for you'],
         stopping: ['停止中', 'Stopping'], stopped: ['已停止', 'Stopped'], error: ['錯誤', 'Error']
     };
     return (labels[state] || labels.idle)[currentLanguage === 'en' ? 1 : 0];

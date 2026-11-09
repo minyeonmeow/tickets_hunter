@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -118,12 +119,26 @@ def write_instance_status(state, message="", path=None):
     """Publish safe, user-facing lifecycle information for this bot instance."""
     path = path or get_instance_state_path(CONST_INSTANCE_STATUS_FILE)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    temporary = path + "." + str(os.getpid()) + ".tmp"
+    temporary = path + "." + uuid.uuid4().hex + ".tmp"
     payload = {"state": state, "message": message, "event_id": str(uuid.uuid4()),
                "updated_at": datetime.now().timestamp()}
     with open(temporary, "w", encoding="utf-8") as output:
         json.dump(payload, output, ensure_ascii=False)
-    os.replace(temporary, path)
+    try:
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.01)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def read_instance_status(path=None):
@@ -2153,8 +2168,13 @@ def is_browser_debug_port(port):
 def acquire_browser_port_lock(port):
     """One bot owns a port, including while paused; OS releases the lock on exit."""
     root = os.path.join(os.environ.get("LOCALAPPDATA") or get_app_root(), "TicketsHunter", "browser-locks")
-    os.makedirs(root, exist_ok=True)
-    handle = open(os.path.join(root, f"{port}.lock"), "a+b")
+    return _acquire_process_lock(os.path.join(root, f"{port}.lock"),
+        f"Port {port} 已由另一個搶票實例使用，請先結束該實例或改用不同 Port。")
+
+
+def _acquire_process_lock(path, message):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handle = open(path, "a+b")
     try:
         handle.seek(0, 2)
         if not handle.tell():
@@ -2170,7 +2190,32 @@ def acquire_browser_port_lock(port):
         return handle
     except OSError:
         handle.close()
-        raise ValueError(f"Port {port} 已由另一個搶票實例使用，請先結束該實例或改用不同 Port。") from None
+        raise ValueError(message) from None
+
+
+def acquire_bot_instance_lock(instance=""):
+    """Project-scoped lock; a dead process releases it automatically."""
+    import hashlib
+    project = hashlib.sha256(os.path.normcase(os.path.abspath(get_app_root())).encode('utf-8')).hexdigest()[:20]
+    instance = instance or 'default'
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', instance):
+        raise ValueError('invalid instance name')
+    root = os.path.join(os.environ.get('LOCALAPPDATA') or get_app_root(), 'TicketsHunter', 'instance-locks', project)
+    return _acquire_process_lock(os.path.join(root, instance + '.lock'), '此實例已有搶票程序，請先斷開或強制停止。')
+
+
+def check_bot_start_locks(instance="", port=None):
+    """Probe OS locks without launching a system-wide process scanner."""
+    handles = []
+    try:
+        if port is not None and (type(port) is not int or not 1024 <= port <= 65535):
+            raise ValueError('Chrome Port 必須是 1024 到 65535 的整數。')
+        handles.append(acquire_bot_instance_lock(instance))
+        if port is not None:
+            handles.append(acquire_browser_port_lock(port))
+    finally:
+        for handle in handles:
+            handle.close()
 
 
 CONST_BOT_PROCESS_CONTROL_SCRIPT = """$ErrorActionPreference = 'Stop'

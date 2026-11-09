@@ -9,6 +9,7 @@ No platform-specific logic should be placed here.
 Dependency: util.py, settings.py, chrome_downloader.py (no platform imports)
 """
 import asyncio
+import copy
 import json
 import os
 import traceback
@@ -73,10 +74,6 @@ async def click_refresh_if_enabled(element):
     await element.click()
     return True
 
-try:
-    import ddddocr
-except Exception:
-    pass
 
 
 # ===== Constants =====
@@ -135,6 +132,15 @@ CONST_TURNSTILE_MIN_TOKEN_LENGTH = 20
 
 # ===== OCR Factory =====
 
+def create_builtin_ocr(beta=False, ranges=None):
+    """Load OCR only for a platform/session that actually uses it."""
+    import ddddocr
+    ocr = ddddocr.DdddOcr(show_ad=False, beta=beta)
+    if ranges is not None:
+        ocr.set_ranges(ranges)
+    return ocr
+
+
 def create_universal_ocr(config_dict):
     """Create OCR instance using the universal captcha model based on settings.
 
@@ -160,6 +166,7 @@ def create_universal_ocr(config_dict):
         return None
 
     try:
+        import ddddocr
         return ddddocr.DdddOcr(
             det=False, ocr=False, show_ad=False,
             import_onnx_path=onnx_path,
@@ -173,6 +180,14 @@ def create_universal_ocr(config_dict):
 
 CONST_TIXCRAFT_TM_MODEL_PATH = "assets/model/tixcraft_tm"
 CONST_DEFAULT_UNIVERSAL_PATH = "assets/model/universal"
+
+def should_initialize_ocr(config_dict):
+    """TicketPlus's browser flow never invokes the OCR solver."""
+    from urllib.parse import urlsplit
+    host = urlsplit(config_dict.get('homepage', '')).hostname or ''
+    return bool(config_dict.get('ocr_captcha', {}).get('enable')) and host not in (
+        'ticketplus.com.tw', 'www.ticketplus.com.tw')
+
 
 def create_ocr_for_platform(config_dict):
     """Create the best OCR instance for the current platform.
@@ -1424,17 +1439,24 @@ async def nodriver_disconnect_browser(browser, preserve_process=False):
     connections = list(browser.targets)
     if browser.connection:
         connections.append(browser.connection)
-    for connection in connections:
+    async def close_connection(connection):
         listener = getattr(connection, "listener", None)
         task = getattr(listener, "task", None)
         try:
-            await asyncio.wait_for(connection.aclose(), timeout=3)
+            await connection.aclose()
         except Exception:
             pass
-        if task:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-    get_registered_instances().discard(browser)
+        finally:
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+    try:
+        # Close independent sockets together: many tabs must not each add 3s.
+        await asyncio.wait_for(asyncio.gather(*(close_connection(c) for c in connections)), timeout=3)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        get_registered_instances().discard(browser)
 
 
 async def nodriver_select_existing_tab(browser, homepage, preferred_id=None):
@@ -1467,7 +1489,15 @@ async def nodriver_select_existing_tab(browser, homepage, preferred_id=None):
 async def nodriver_attach_browser(conf, config_dict, preferred_id=None):
     # Browser.create/uc.start registers shutdown callbacks intended for owned browsers.
     # Direct construction avoids those callbacks for externally launched Chrome.
-    browser = Browser(conf)
+    attach_config = copy.copy(conf)
+    # Existing Chrome is already running; retain the retry budget while
+    # avoiding the launch-oriented 250ms delay before its very first probe.
+    interval = min(conf.browser_connection_timeout, 0.05)
+    if interval > 0:
+        attach_config.browser_connection_max_tries = max(conf.browser_connection_max_tries,
+            round(conf.browser_connection_max_tries * conf.browser_connection_timeout / interval))
+        attach_config.browser_connection_timeout = interval
+    browser = Browser(attach_config)
     try:
         await asyncio.wait_for(browser.start(), timeout=15)
         tab = await nodriver_select_existing_tab(browser, config_dict.get("homepage", ""), preferred_id)

@@ -7,6 +7,7 @@ import json
 import random
 import time
 import traceback
+from urllib.parse import urlsplit
 
 from zendriver import cdp
 
@@ -15,11 +16,11 @@ from nodriver_common import click_refresh_if_enabled
 from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     check_and_handle_pause,
+    check_and_handle_quit,
     evaluate_with_pause_check,
     play_sound_while_ordering,
     send_discord_notification,
     send_telegram_notification,
-    sleep_with_pause_check,
     CONST_NATIVE_INPUT_SETTER_JS,
 )
 
@@ -47,21 +48,39 @@ __all__ = [
 
 _state = {}
 
+
+def _ticketplus_runtime_guards():
+    return {key: _state[key] for key in
+            ('submit_pending', 'seat_next_pending', 'quantity_pending', 'selected_ticket_row')
+            if key in _state}
+
+
+def _ticketplus_reset_runtime_state(pending=None):
+    """Reset a run while retaining uncertain actions on the same document."""
+    _state.clear()
+    _state.update(fail_list=[], is_popup_confirm=False, is_ticket_assigned=False,
+                  start_time=None, done_time=None, elapsed_time=None,
+                  signin_form_filled=False, purchase_completed=False)
+    if pending:
+        _state.update({key: pending[key] for key in
+                      ('submit_pending', 'seat_next_pending', 'quantity_pending', 'selected_ticket_row')
+                      if key in pending})
+
 # After the next button is clicked the site does one of three things: navigate to
 # the confirmation page, open a failure dialog, or enter its in-page queue. Poll
 # for all three instead of sleeping blind for a fixed window (#389).
 CONST_TICKETPLUS_SUBMIT_WAIT_MAX = 10.0
 CONST_TICKETPLUS_SUBMIT_POLL_INTERVAL = 0.3
 
-# The queue re-check keeps a randomized 5-10s cadence (anti-detection), but the
-# URL is polled at this interval so a page transition is not missed for a cycle.
-CONST_TICKETPLUS_QUEUE_URL_POLL_INTERVAL = 0.5
+# URL checks read cached browser state; full DOM scans use separate cadences.
+CONST_TICKETPLUS_QUEUE_URL_POLL_INTERVAL = 0.05
+CONST_TICKETPLUS_QUEUE_FAILURE_POLL_INTERVAL = 0.5
 
 # Absolute fuse on queue monitoring. The queue keywords include wording as
 # generic as "processing" and "please wait", so any future dialog carrying one
 # can strand the loop the same way the failure popup did (#389). While stranded
-# the main loop never runs, which also leaves the stop flag unreadable -- only
-# the pause flag is checked in here. Ten minutes is well past any real queue.
+# the main loop never runs. Stop and pause are now checked inside this
+# monitor as well; keep the time limit as a final fallback.
 CONST_TICKETPLUS_QUEUE_MONITOR_MAX = 600.0
 
 # Order-failure wording. Shared by the dismissal scan and the queue check so the
@@ -110,7 +129,7 @@ CONST_TICKETPLUS_DISMISS_BUTTON_TEXTS = [
 # has to cover mount jitter; the caller has its own budget for what happens
 # after submit, and a longer wait here just delays the next main-loop pass.
 CONST_TICKETPLUS_NEXT_BUTTON_WAIT = 2.0
-CONST_TICKETPLUS_NEXT_BUTTON_POLL = 0.15
+CONST_TICKETPLUS_NEXT_BUTTON_POLL = 0.05
 
 # Locate and click the next button. Every selector here must be valid CSS:
 # document.querySelector throws a DOMException on anything else, and zendriver
@@ -195,8 +214,11 @@ def _ticketplus_filter_excluded(config_dict, items, text_of):
 def _get_status():
     """Return current ticketplus status for main loop (Approach B)."""
     return {
-        "purchase_completed": _state.get("purchase_completed", False),
+        # Reaching a confirmation page is not evidence of a completed order.
+        "purchase_completed": False,
         "is_ticket_assigned": _state.get("is_ticket_assigned", False),
+        "handoff_ready": _state.get("handoff_ready", False),
+        "stage": _state.get("stage", "selecting"),
     }
 
 
@@ -663,7 +685,7 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
             click_result = await tab.evaluate(f'''
                 (function() {{
                     const originalKeyword = '{original_keyword}';
-                    const autoSelectMode = '{auto_select_mode}';
+                    const autoSelectMode = {json.dumps(auto_select_mode)};
                     const dateAutoFallback = {'true' if date_auto_fallback else 'false'};
                     const allowedIndexes = {json.dumps(allowed_indexes)};
 
@@ -837,11 +859,246 @@ async def nodriver_ticketplus_date_auto_select(tab, config_dict):
     return is_date_clicked
 
 
+async def _ticketplus_actions_paused(config_dict):
+    return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
+
+
+async def _ticketplus_sleep(tab, seconds, config_dict):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if await _ticketplus_actions_paused(config_dict):
+            return True
+        await asyncio.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    return await _ticketplus_actions_paused(config_dict)
+
+
+CONST_TICKETPLUS_STABLE_TITLE_JS = r'''element => {
+    const copy = element?.cloneNode(true);
+    copy?.querySelectorAll('small, .v-chip, .v-icon, [role="tooltip"]').forEach(e => e.remove());
+    return (copy?.textContent || '').trim().replace(/\s+/g, ' ');
+}'''
+
+
+CONST_TICKETPLUS_QUANTITY_JS = r'''((name, expected, action) => {
+    const visible = e => e && e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+    const normalize = STABLE_TITLE;
+    const panels = Array.from(document.querySelectorAll('.seats-area .v-expansion-panel:not(:has(.seats-area))'));
+    const rows = panels.length ? panels : Array.from(document.querySelectorAll('.row.py-1.py-md-4'));
+    const title = row => normalize(row.querySelector('.v-expansion-panel-header, .font-weight-medium'));
+    const quantity = row => {
+        const controls = Array.from(row.querySelectorAll('.count-button input, .count-button div, .count-button span'));
+        const values = controls.filter(e => !e.children.length || e.tagName === 'INPUT')
+            .map(e => (e.value ?? e.textContent).trim()).filter(t => /^\d+$/.test(t));
+        return values.length === 1 ? Number(values[0]) : null;
+    };
+    const documentId = location.href + '|' + performance.timeOrigin;
+    const matches = rows.filter(row => title(row) === name);
+    if (matches.length !== 1) return {documentId, blocked:true};
+    const row = matches[0], value = quantity(row);
+    const otherSelected = rows.some(r => r !== row && quantity(r) > 0);
+    if (value === null || otherSelected) return {documentId, blocked:true};
+    if (!action || value !== expected) return {documentId, value};
+    const icon = row.querySelector(action === 'add' ? '.mdi-plus' : '.mdi-minus');
+    const button = icon?.closest('button') || icon;
+    if (!visible(button) || button.disabled || button.getAttribute('aria-disabled') === 'true' ||
+        button.closest('.v-btn--disabled, .disabledBtn')) return {documentId, value, blocked:true};
+    button.click();
+    return {documentId, value, clicked:true};
+})(NAME, EXPECTED, ACTION)'''.replace('STABLE_TITLE', CONST_TICKETPLUS_STABLE_TITLE_JS)
+
+
+async def _ticketplus_adjust_quantity(tab, config_dict, name):
+    """Change one quantity at a time; never count attempted clicks as tickets."""
+    target = config_dict.get('ticket_number')
+    if not isinstance(target, int) or isinstance(target, bool) or target < 1:
+        return False
+    deadline = time.monotonic() + CONST_TICKETPLUS_NEXT_BUTTON_WAIT
+    while time.monotonic() < deadline:
+        if await _ticketplus_actions_paused(config_dict):
+            return False
+        script = CONST_TICKETPLUS_QUANTITY_JS.replace('EXPECTED', 'null').replace('ACTION', 'null').replace('NAME', json.dumps(name))
+        current = await tab.evaluate(script)
+        if not isinstance(current, dict) or current.get('blocked'):
+            await _ticketplus_sleep(tab, 0.1, config_dict)
+            continue
+        value = current.get('value')
+        if value == target:
+            _state.pop('quantity_pending', None)
+            if _state.pop('quantity_wait_notice', None):
+                util.write_instance_status('running')
+            _state['selected_ticket_row'] = {'documentId': current.get('documentId'), 'name': name}
+            return True
+        signature = (current.get('documentId'), name, value)
+        if _state.get('quantity_pending') == signature:
+            await _ticketplus_sleep(tab, 0.1, config_dict)
+            continue
+        if not isinstance(value, int):
+            return False
+        action = 'add' if value < target else 'remove'
+        script = CONST_TICKETPLUS_QUANTITY_JS.replace('EXPECTED', str(value)).replace('ACTION', json.dumps(action)).replace('NAME', json.dumps(name))
+        # Reserve first: an uncertain CDP result must not repeat a real click.
+        _state['quantity_pending'] = signature
+        result = await tab.evaluate(script)
+        if isinstance(result, dict) and not result.get('clicked'):
+            _state.pop('quantity_pending', None)
+            if result.get('blocked'):
+                await _ticketplus_sleep(tab, 0.1, config_dict)
+                continue
+        await _ticketplus_sleep(tab, 0.05, config_dict)
+    return False
+
+
+def _ticketplus_hold_unresolved_quantity(document_id):
+    pending = _state.get('quantity_pending')
+    if not pending or pending[0] != document_id:
+        return False
+    if _state.get('quantity_wait_notice') != pending:
+        _state['quantity_wait_notice'] = pending
+        message = '票數變更尚未確認，保留目前選票並等待更新；若持續無反應，請查看瀏覽器或手動刷新。'
+        util.create_debug_logger(enabled=True).log('[TICKETPLUS] ' + message)
+        util.write_instance_status('running', message)
+    return True
+
+
+def _ticketplus_timing(stage, config_dict, document_id=None):
+    """Record one timing mark per stage; never log ticket/account identifiers."""
+    now = time.monotonic()
+    if document_id and _state.get('timing_document') != document_id:
+        _state['timing_document'] = document_id
+        start = _state.get('cycle_started_at', now)
+        _state['timing_start'] = start
+        _state['timing_marks'] = {}
+        _state['timing_last'] = start
+        ready = _state.get('cycle_ready_at', now)
+        _state['timing_marks']['頁面就緒'] = max(0, ready - start)
+        _state['timing_last'] = min(now, max(start, ready))
+        util.create_debug_logger(config_dict).log(f'[TICKETPLUS 耗時] 頁面就緒：累計 {max(0, ready-start):.3f} 秒')
+    if 'timing_start' not in _state or stage in _state.get('timing_marks', {}):
+        return
+    elapsed = now - _state['timing_start']
+    delta = now - _state['timing_last']
+    _state['timing_marks'][stage] = elapsed
+    _state['timing_last'] = now
+    util.create_debug_logger(config_dict).log(f'[TICKETPLUS 耗時] {stage}：累計 {elapsed:.3f} 秒，本階段 {delta:.3f} 秒')
+
+
+def _ticketplus_queue_mark(stage, config_dict):
+    trace = _state.get('queue_trace')
+    if not trace or stage in trace['marks']:
+        return
+    now = time.perf_counter()
+    trace['marks'][stage] = now
+    previous = trace['last']
+    trace['last'] = now
+    util.create_debug_logger(config_dict).log(
+        f'[TICKETPLUS 排隊計時] {stage}：送出後 {now-trace["start"]:.3f} 秒，距前一紀錄 {now-previous:.3f} 秒')
+
+
+def _ticketplus_begin_queue_trace(config_dict):
+    if not config_dict.get('advanced', {}).get('ticketplus_queue_timing', True):
+        return
+    trace = _state.get('queue_trace', {})
+    if trace.get('document') == _state.get('submit_pending') and not trace.get('closed'):
+        return
+    now = time.perf_counter()
+    _state['queue_trace'] = {'start': now, 'last': now, 'marks': {},
+                             'document': _state.get('submit_pending'), 'requests': {}, 'sequence': 0}
+    _ticketplus_queue_mark('開始點擊選票下一步', config_dict)
+
+
+def _ticketplus_queue_summary(config_dict):
+    trace = _state.get('queue_trace')
+    if not trace or trace.get('summarized'):
+        return
+    marks = trace['marks']
+    names = ('收到瀏覽器跳轉通知：confirmseat', '排隊監控偵測到確認頁',
+             '開始處理確認頁：confirmseat', '座位確認下一步點擊已返回')
+    if not all(name in marks for name in names):
+        return
+    navigation, detected, processing, clicked = (marks[name] for name in names)
+    trace['summarized'] = True
+    util.create_debug_logger(config_dict).log(
+        f'[TICKETPLUS 排隊摘要] 點擊送出→瀏覽器跳轉通知 {navigation-trace["start"]:.3f} 秒'
+        f'（含網站等待、網路、前端處理）；通知→監控偵測 {detected-navigation:+.3f} 秒；'
+        f'偵測→處理座位頁 {processing-detected:.3f} 秒；'
+        f'處理座位頁→下一步點擊返回 {clicked-processing:.3f} 秒。'
+        '瀏覽器事件以程式收到通知的時間為準，HTTP 200 不代表保留成功。')
+
+
+def _ticketplus_trace_endpoint(url):
+    parsed = urlsplit(url)
+    name = parsed.path.rstrip('/').rsplit('/', 1)[-1].lower()
+    hosts = {
+        'enqueue': ('queue.ticketplus.com.tw', 'apis.ticketplus.com.tw'),
+        'reserve': ('api.ticketplus.com.tw', 'apis.ticketplus.com.tw'),
+        'getusercurrentreservedorder': ('api.ticketplus.com.tw',),
+    }
+    if parsed.hostname in hosts.get(name, ()):
+        return 'getUserCurrentReservedOrder' if name == 'getusercurrentreservedorder' else name
+    return None
+
+
+async def _ticketplus_subscribe_queue_timing(tab, config_dict):
+    """Observe CDP metadata only; never read bodies, headers or credentials."""
+    if not config_dict.get('advanced', {}).get('ticketplus_queue_timing', True) or _state.get('trace_tab') is tab:
+        return
+    try:
+        tree = await tab.send(cdp.page.get_frame_tree())
+        main_frame = tree.frame.id_
+        subscription = object()
+        async def observed(event, connection=None):
+            trace = _state.get('queue_trace')
+            if _state.get('trace_subscription') is not subscription or not trace:
+                return
+            if isinstance(event, cdp.network.RequestWillBeSent):
+                name = _ticketplus_trace_endpoint(event.request.url)
+                if name and event.request.method.upper() != 'OPTIONS':
+                    if len(trace['requests']) >= 128:
+                        trace['requests'].pop(next(iter(trace['requests'])))
+                    trace['sequence'] += 1
+                    trace['requests'][event.request_id] = (name, float(event.timestamp), trace['sequence'])
+                    _ticketplus_queue_mark(f'網站發出 {name} #{trace["sequence"]}', config_dict)
+            elif isinstance(event, cdp.network.ResponseReceived):
+                request = trace['requests'].get(event.request_id)
+                if request:
+                    name, started, sequence = request
+                    duration = max(0, float(event.timestamp) - started)
+                    _ticketplus_queue_mark(f'收到 {name} #{sequence} 回應標頭（HTTP {int(event.response.status)}，請求至標頭 {duration:.3f} 秒）', config_dict)
+            elif isinstance(event, (cdp.network.LoadingFinished, cdp.network.LoadingFailed)):
+                request = trace['requests'].pop(event.request_id, None)
+                if request:
+                    name, started, sequence = request
+                    duration = max(0, float(event.timestamp) - started)
+                    outcome = '接收完成' if isinstance(event, cdp.network.LoadingFinished) else '載入失敗'
+                    _ticketplus_queue_mark(f'{name} #{sequence} {outcome}（請求累計 {duration:.3f} 秒）', config_dict)
+            elif isinstance(event, cdp.page.NavigatedWithinDocument) and event.frame_id == main_frame:
+                route = _ticketplus_confirmation_route(event.url)
+                if route:
+                    _ticketplus_queue_mark(f'收到瀏覽器跳轉通知：{route}', config_dict)
+                    _ticketplus_queue_summary(config_dict)
+            elif isinstance(event, cdp.page.FrameNavigated) and event.frame.parent_id is None:
+                route = _ticketplus_confirmation_route(event.frame.url)
+                if route:
+                    _ticketplus_queue_mark(f'收到瀏覽器跳轉通知：{route}', config_dict)
+                    _ticketplus_queue_summary(config_dict)
+        for event_type in (cdp.network.RequestWillBeSent, cdp.network.ResponseReceived,
+                           cdp.network.LoadingFinished, cdp.network.LoadingFailed,
+                           cdp.page.NavigatedWithinDocument, cdp.page.FrameNavigated):
+            tab.add_handler(event_type, observed)
+        _state['trace_tab'] = tab
+        _state['trace_subscription'] = subscription
+        await tab.send(cdp.network.enable())
+        await tab.send(cdp.page.enable())
+    except Exception:
+        util.create_debug_logger(config_dict).log('[TICKETPLUS 排隊計時] 瀏覽器事件監聽無法啟用，仍保留程式階段計時。')
+
+
 async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
     """TicketPlus unified selector - language-independent ticket type/area selection."""
     debug = util.create_debug_logger(config_dict)
     auto_select_mode = config_dict["area_auto_select"]["mode"]
-    area_auto_fallback = config_dict.get('area_auto_fallback', False)
+    # Fallback is applied only after all ordered keyword groups fail.
+    area_auto_fallback = not bool(area_keyword.strip())
     ticket_number = config_dict["ticket_number"]
     keyword_exclude = config_dict.get("keyword_exclude", "")
 
@@ -850,7 +1107,7 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
     is_selected = False
 
     try:
-        if await check_and_handle_pause(config_dict):
+        if await _ticketplus_actions_paused(config_dict):
             return False
 
         exclude_keywords = []
@@ -872,7 +1129,7 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
         last_log_time = 0
 
         while time.time() - vue_wait_start < max_vue_wait:
-            if await check_and_handle_pause(config_dict):
+            if await _ticketplus_actions_paused(config_dict):
                 return False
 
             try:
@@ -901,7 +1158,6 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
                 if vue_check.get('hasElements', False):
                     vue_elements_found = True
                     debug.log(f"[VUE WAIT] Vue elements found after {elapsed:.1f}s")
-                    await asyncio.sleep(0.1)
                     break
 
             except Exception as e:
@@ -915,14 +1171,17 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
 
         js_result = await tab.evaluate(f'''
             (function() {{
-                const keyword = '{area_keyword}';
+                const keyword = {json.dumps(area_keyword, ensure_ascii=True)};
                 const ticketNumber = {ticket_number};
-                const autoSelectMode = '{auto_select_mode}';
+                const autoSelectMode = {json.dumps(auto_select_mode)};
                 const areaAutoFallback = {'true' if area_auto_fallback else 'false'};
-                const keywordArray = keyword.split(' ');
+                const keywordArray = keyword.trim().split(/\\s+/).filter(Boolean);
                 const keyword1 = keywordArray[0] || '';
                 const keyword2 = keywordArray[1] || '';
-                const excludeKeywords = {exclude_keywords};
+                const excludeKeywords = {json.dumps(exclude_keywords, ensure_ascii=True)};
+                const previous = {json.dumps(_state.get('selected_ticket_row', {}), ensure_ascii=True)};
+                const preferredName = previous.documentId === location.href + '|' + performance.timeOrigin ? previous.name : '';
+                const stableTitle = {CONST_TICKETPLUS_STABLE_TITLE_JS};
 
                 console.log('Unified selector execution - keyword:', keyword, 'tickets:', ticketNumber, 'mode:', autoSelectMode, 'fallback:', areaAutoFallback);
 
@@ -980,7 +1239,7 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
                         const panel = panels[i];
                         const nameEl = panel.querySelector('.v-expansion-panel-header');
                         if (nameEl) {{
-                            const name = nameEl.textContent.trim().replace(/\\s+/g, ' ');
+                            const name = stableTitle(nameEl);
                             if (containsExcludeKeywords(name)) continue;
                             if (isSoldOut(panel)) {{
                                 soldOutNames.push(name);
@@ -998,16 +1257,16 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
                     let target = null;
                     if (keyword1) {{
                         // Every hit, then the select order picks one; .find() always took the top hit (#416)
-                        const hits = validPanels.filter(p => p.name.includes(keyword1) && (!keyword2 || p.name.includes(keyword2)));
-                        target = hits[getTargetIndex(hits, autoSelectMode)] || null;
+                        const hits = validPanels.filter(p => keywordArray.every(word => p.name.includes(word)));
+                        target = hits.find(p => p.name === preferredName) || hits[getTargetIndex(hits, autoSelectMode)] || null;
                     }}
                     if (!target && keyword1 && !areaAutoFallback) {{
-                        const keywordInSoldOut = soldOutNames.some(n => n.includes(keyword1) && (!keyword2 || n.includes(keyword2)));
+                        const keywordInSoldOut = soldOutNames.some(n => keywordArray.every(word => n.includes(word)));
                         return {{ success: false, strict_mode: true, attempted_keyword: keyword, keyword_in_sold_out: keywordInSoldOut }};
                     }}
                     if (!target) {{
                         const idx = getTargetIndex(validPanels, autoSelectMode);
-                        target = validPanels[idx];
+                        target = validPanels.find(p => p.name === preferredName) || validPanels[idx];
                     }}
 
                     if (!target) {{
@@ -1025,14 +1284,11 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
                                   target.panel.querySelector('.count-button .mdi-plus');
 
                     if (plusBtn) {{
-                        console.log('Found plus button, clicking', ticketNumber, 'times');
-                        for (let j = 0; j < ticketNumber; j++) {{
-                            plusBtn.click();
-                        }}
-                        return {{ success: true, type: 'expansion_panel', selected: target.name, clicked: true }};
+                        console.log('Found quantity controls for:', target.name);
+                        return {{ success: true, type: 'expansion_panel', selected: target.name, quantityPending: true }};
                     }}
 
-                    return {{ success: true, type: 'expansion_panel', selected: target.name, clicked: false, needRetry: true }};
+                    return {{ success: true, type: 'expansion_panel', selected: target.name, quantityPending: true }};
 
                 }} else if (hasCountButton) {{
                     const rows = document.querySelectorAll('.row.py-1.py-md-4');
@@ -1045,7 +1301,7 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
 
                         const nameEl = row.querySelector('.font-weight-medium');
                         if (nameEl) {{
-                            const name = nameEl.textContent.trim();
+                            const name = stableTitle(nameEl);
                             if (containsExcludeKeywords(name)) continue;
                             if (isSoldOut(row)) {{
                                 soldOutRowNames.push(name);
@@ -1062,24 +1318,21 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
 
                     let target = null;
                     if (keyword1) {{
-                        const hits = validRows.filter(r => r.name.includes(keyword1) && (!keyword2 || r.name.includes(keyword2)));
-                        target = hits[getTargetIndex(hits, autoSelectMode)] || null;
+                        const hits = validRows.filter(r => keywordArray.every(word => r.name.includes(word)));
+                        target = hits.find(r => r.name === preferredName) || hits[getTargetIndex(hits, autoSelectMode)] || null;
                     }}
                     if (!target && keyword1 && !areaAutoFallback) {{
-                        const keywordInSoldOut = soldOutRowNames.some(n => n.includes(keyword1) && (!keyword2 || n.includes(keyword2)));
+                        const keywordInSoldOut = soldOutRowNames.some(n => keywordArray.every(word => n.includes(word)));
                         return {{ success: false, strict_mode: true, attempted_keyword: keyword, keyword_in_sold_out: keywordInSoldOut }};
                     }}
                     if (!target) {{
                         const idx = getTargetIndex(validRows, autoSelectMode);
-                        target = validRows[idx];
+                        target = validRows.find(r => r.name === preferredName) || validRows[idx];
                     }}
 
                     if (target && target.plusBtn) {{
-                        console.log('Clicking plus button for:', target.name);
-                        for (let j = 0; j < ticketNumber; j++) {{
-                            target.plusBtn.click();
-                        }}
-                        return {{ success: true, type: 'count_button', selected: target.name, clicked: true }};
+                        console.log('Verifying quantity for:', target.name);
+                        return {{ success: true, type: 'count_button', selected: target.name, quantityPending: true }};
                     }}
                 }}
 
@@ -1092,65 +1345,10 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
         if isinstance(result, dict):
             is_selected = result.get('success', False) and result.get('clicked', False)
 
-            if result.get('needRetry', False):
-                debug.log(f"[RETRY] Panel expanded but plus button not found, retrying...")
-
-                await asyncio.sleep(0.3)
-
-                for retry in range(5):
-                    retry_result = await tab.evaluate(f'''
-                        (function() {{
-                            // Sold-out zones swap the plus button for sold-out text (#430)
-                            function isPanelSoldOut(panel) {{
-                                return /\\u5df2\\u552e\\u5b8c/.test(panel.textContent || '');
-                            }}
-                            const seatsAreas = document.querySelectorAll('.seats-area');
-                            for (let area of seatsAreas) {{
-                                const activeSubPanel = area.querySelector('.v-expansion-panel--active');
-                                if (activeSubPanel) {{
-                                    const plusBtn = activeSubPanel.querySelector('.mdi-plus') ||
-                                                   activeSubPanel.querySelector('.count-button .mdi-plus');
-                                    if (plusBtn) {{
-                                        console.log('Retry: Found plus button in nested sub-panel');
-                                        for (let j = 0; j < {ticket_number}; j++) {{
-                                            plusBtn.click();
-                                        }}
-                                        return {{ success: true, clicked: true }};
-                                    }}
-                                    if (isPanelSoldOut(activeSubPanel)) return {{ success: false, clicked: false, soldOut: true }};
-                                }}
-                            }}
-
-                            const panels = document.querySelectorAll('.v-expansion-panel');
-                            for (let panel of panels) {{
-                                if (panel.classList.contains('v-expansion-panel--active')) {{
-                                    const plusBtn = panel.querySelector('.mdi-plus') ||
-                                                   panel.querySelector('.count-button .mdi-plus');
-                                    if (plusBtn) {{
-                                        console.log('Retry: Found plus button in panel');
-                                        for (let j = 0; j < {ticket_number}; j++) {{
-                                            plusBtn.click();
-                                        }}
-                                        return {{ success: true, clicked: true }};
-                                    }}
-                                    if (isPanelSoldOut(panel)) return {{ success: false, clicked: false, soldOut: true }};
-                                }}
-                            }}
-                            return {{ success: false, clicked: false }};
-                        }})();
-                    ''')
-
-                    retry_parsed = util.parse_nodriver_result(retry_result)
-                    if isinstance(retry_parsed, dict):
-                        if retry_parsed.get('clicked', False):
-                            debug.log(f"[RETRY] Success on attempt {retry + 1}")
-                            is_selected = True
-                            break
-                        if retry_parsed.get('soldOut', False):
-                            debug.log("[RETRY] Expanded panel is sold out, stop retrying")
-                            break
-
-                    await asyncio.sleep(0.2)
+            if result.get('quantityPending'):
+                is_selected = await _ticketplus_adjust_quantity(tab, config_dict, result.get('selected', ''))
+                if not is_selected:
+                    result['message'] = 'Ticket quantity not verified; not submitting'
 
             if debug.enabled:
                 if is_selected:
@@ -1177,45 +1375,6 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
             debug.log(f"Traceback: {traceback.format_exc()}")
         is_selected = False
 
-    if not is_selected:
-        try:
-            debug.log("Checking page status to decide whether to continue...")
-
-            page_status = await tab.evaluate('''
-                (function() {
-                    const ticketCounts = document.querySelectorAll('.count-button div');
-                    let hasTickets = false;
-                    for (let count of ticketCounts) {
-                        const text = count.textContent.trim();
-                        if (text && !isNaN(text) && parseInt(text) > 0) {
-                            hasTickets = true;
-                            break;
-                        }
-                    }
-
-                    const nextBtn = document.querySelector('button.nextBtn');
-                    const buttonEnabled = nextBtn && !nextBtn.disabled && !nextBtn.classList.contains('v-btn--disabled') && !nextBtn.classList.contains('disabledBtn');
-
-                    return {
-                        hasTickets: hasTickets,
-                        buttonEnabled: buttonEnabled,
-                        buttonText: nextBtn ? nextBtn.textContent.trim() : '',
-                        canContinue: hasTickets && buttonEnabled
-                    };
-                })();
-            ''')
-
-            status = util.parse_nodriver_result(page_status)
-            if isinstance(status, dict):
-                debug.log(f"[STATUS] Page state: Has tickets={status.get('hasTickets', False)}, Button enabled={status.get('buttonEnabled', False)}")
-
-                if status.get('canContinue', False):
-                    debug.log("Page status is good, considered selection successful")
-                    is_selected = True
-
-        except Exception as backup_exc:
-            debug.log(f"Backup check failed: {backup_exc}")
-
     return is_selected
 
 
@@ -1226,9 +1385,6 @@ async def nodriver_ticketplus_click_next_button_unified(tab, config_dict):
     debug.log("Unified next button clicker started")
 
     try:
-        if await sleep_with_pause_check(tab, 0.6, config_dict):
-            return False
-
         # The button is polled from here rather than from a timer inside the
         # page: a page-side Promise needs evaluate(await_promise=True), and an
         # un-awaited one keeps running after this function has already reported
@@ -1236,11 +1392,20 @@ async def nodriver_ticketplus_click_next_button_unified(tab, config_dict):
         # on and the ticket counts had changed underneath it.
         waited = 0.0
         while True:
+            if await _ticketplus_actions_paused(config_dict):
+                return False
+            _state['submit_pending'] = await tab.evaluate("location.href + '|' + performance.timeOrigin")
+            _ticketplus_begin_queue_trace(config_dict)
             result = await tab.evaluate(CONST_TICKETPLUS_NEXT_BUTTON_JS)
 
             if isinstance(result, dict) and result.get('clicked'):
+                _ticketplus_queue_mark('選票下一步點擊已返回', config_dict)
+                _ticketplus_timing('已點選票下一步', config_dict)
                 debug.log(f"[SUCCESS] Next button clicked - Button text: {result.get('buttonText', '')}")
                 return True
+
+            if isinstance(result, dict):
+                _state.pop('submit_pending', None)
 
             found_disabled = isinstance(result, dict) and result.get('foundDisabled')
             if not found_disabled:
@@ -1251,7 +1416,7 @@ async def nodriver_ticketplus_click_next_button_unified(tab, config_dict):
                 debug.log(f"[ERROR] Next button still disabled after {waited:.1f}s")
                 return False
 
-            if await sleep_with_pause_check(tab, CONST_TICKETPLUS_NEXT_BUTTON_POLL, config_dict):
+            if await _ticketplus_sleep(tab, CONST_TICKETPLUS_NEXT_BUTTON_POLL, config_dict):
                 return False
             waited += CONST_TICKETPLUS_NEXT_BUTTON_POLL
 
@@ -1295,7 +1460,7 @@ def _is_terms_checkbox_label(label_text):
 
 async def nodriver_ticketplus_ticket_agree(tab, config_dict):
     """TicketPlus agreement checkbox."""
-    if await check_and_handle_pause(config_dict):
+    if await _ticketplus_actions_paused(config_dict):
         return False
 
     debug = util.create_debug_logger(config_dict)
@@ -1553,33 +1718,136 @@ async def nodriver_ticketplus_check_queue_status(tab, config_dict, force_show_de
         return False
 
 
-async def nodriver_ticketplus_confirm(tab, config_dict):
-    """Confirmation page handler."""
-    is_checkbox_checked = await nodriver_ticketplus_ticket_agree(tab, config_dict)
+def _ticketplus_confirmation_route(url):
+    path = urlsplit(url or "").path.rstrip('/').split('/')
+    if len(path) != 4 or not path[2] or not path[3]:
+        return None
+    kind = path[1].lower()
+    return kind if kind in ('confirmseat', 'confirm') else None
 
-    is_confirm_clicked = False
-    if is_checkbox_checked:
+
+async def nodriver_ticketplus_confirm(tab, config_dict, current=None):
+    """Only advance the seat-confirmation Next button; never submit buyer data."""
+    if await _ticketplus_actions_paused(config_dict):
+        return False
+    if current is None:
         try:
-            confirm_button = await tab.query_selector('button.v-btn.primary')
-            if not confirm_button:
-                confirm_button = await tab.query_selector('button[type="submit"]')
+            current = await tab.evaluate("({url:location.href,documentId:location.href+'|'+performance.timeOrigin})")
+        except Exception:
+            return False  # The page may be navigating; inspect it on the next pass.
+    if not isinstance(current, dict) or _ticketplus_confirmation_route(current.get('url')) != 'confirmseat':
+        return False
+    _ticketplus_queue_mark('座位頁資訊已讀取', config_dict)
+    document_id = current.get('documentId')
+    if not document_id or _state.get('seat_next_pending') == document_id:
+        return False
+    script = r"""((expected) => {
+        if (location.href !== expected || !/^\/confirmseat\/[^/]+\/[^/]+\/?$/i.test(location.pathname))
+            return {clicked:false};
+        const buttons = Array.from(document.querySelectorAll('button.nextBtn'));
+        const next = buttons.filter(button => {
+            const style = getComputedStyle(button);
+            return button.getClientRects().length && style.visibility !== 'hidden' &&
+                style.opacity !== '0' && !button.disabled &&
+                button.getAttribute('aria-disabled') !== 'true' &&
+                !button.matches('.v-btn--disabled, .disabledBtn') &&
+                /^(下一步|Next)$/i.test(button.textContent.trim());
+        });
+        if (next.length !== 1) return {clicked:false};
+        const button = next[0];
+        const seen = new Set();
+        let hasVue = false, seat = null;
+        for (let node = button; node; node = node.parentElement) {
+            for (let vm = node.__vue__; vm && !seen.has(vm); vm = vm.$parent) {
+                seen.add(vm); hasVue = true;
+                if (typeof vm.nextStep === 'function' && Array.isArray(vm.reserveTickets) &&
+                    Object.prototype.hasOwnProperty.call(vm, 'selectedDiscount')) seat = vm;
+            }
+        }
+        if (hasVue && (!seat || seat._isMounted === false || seat._isDestroyed ||
+            seat.$route?.name !== 'ConfirmSt' || !seat.reserveTickets.length || !seat.canNextStep))
+            return {clicked:false, reason:'initializing'};
+        let rect = button.getBoundingClientRect();
+        if (rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
+            button.scrollIntoView({block:'center', inline:'nearest', behavior:'instant'});
+            rect = button.getBoundingClientRect();
+        }
+        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+        if (!hit || (hit !== button && !button.contains(hit)))
+            return {clicked:false, reason:'covered'};
+        button.click();
+        return {clicked:true};
+    })(EXPECTED)""".replace('EXPECTED', json.dumps(current['url']))
+    if await _ticketplus_actions_paused(config_dict):
+        return False
+    _state['seat_next_pending'] = document_id
+    try:
+        result = await tab.evaluate(script)
+        if isinstance(result, dict) and result.get('clicked') is False:
+            _ticketplus_queue_mark('等待座位頁下一步可用', config_dict)
+            reason = {'initializing': '座位頁元件與票券資料尚未就緒',
+                      'covered': '按鈕仍被載入遮罩或其他元件覆蓋'}.get(result.get('reason'))
+            if reason and _state.get('seat_wait_notice') != (document_id, reason):
+                _state['seat_wait_notice'] = (document_id, reason)
+                util.create_debug_logger(enabled=True).log(f'[TICKETPLUS] {reason}，等待就緒後再自動點擊。')
+            _state.pop('seat_next_pending', None)
+            return False
+        if isinstance(result, dict) and result.get('clicked'):
+            _ticketplus_queue_mark('座位確認下一步點擊已返回', config_dict)
+            _ticketplus_queue_summary(config_dict)
+            _ticketplus_timing('已點座位確認下一步', config_dict)
+            util.create_debug_logger(enabled=True).log('[TICKETPLUS] 已點座位確認的下一步，等待購票資料確認頁。')
+            return True
+    except Exception:
+        # An uncertain result must not click the button a second time.
+        util.create_debug_logger(enabled=True).log('[TICKETPLUS] 座位確認下一步回應未明，請查看瀏覽器；不重複點擊。')
+    return False
 
-            if confirm_button:
-                # Element.apply, not tab.evaluate(script, element): the second
-                # positional argument is await_promise, not a script argument.
-                is_enabled = await confirm_button.apply('''
-                    (button) => {
-                        return button && !button.disabled && button.offsetParent !== null;
-                    }
-                ''')
 
-                if is_enabled:
-                    await confirm_button.click()
-                    is_confirm_clicked = True
-        except Exception as exc:
-            pass
+async def _ticketplus_process_confirmation(tab, url, config_dict):
+    route = _ticketplus_confirmation_route(url)
+    if not route or await _ticketplus_actions_paused(config_dict):
+        return
+    _ticketplus_queue_mark(f'開始處理確認頁：{route}', config_dict)
+    try:
+        current = await tab.evaluate("({url:location.href,documentId:location.href+'|'+performance.timeOrigin})")
+    except Exception:
+        return  # Navigation is still replacing the document; retry via main loop.
+    if not isinstance(current, dict) or current.get('url') != url:
+        return
+    _ticketplus_queue_mark(f'確認頁網址已核對：{route}', config_dict)
+    _state.pop('submit_pending', None)
+    _state['is_ticket_assigned'] = True
+    if route == 'confirmseat':
+        _ticketplus_timing('座位確認頁', config_dict)
+        if _state.get('stage') != 'seat_confirmation':
+            util.write_instance_status('running', '已進入座位確認頁，準備下一步；尚未完成訂單。')
+        _state['stage'] = 'seat_confirmation'
+        await nodriver_ticketplus_confirm(tab, config_dict, current=current)
+    else:
+        _ticketplus_queue_mark('交由使用者手動確認', config_dict)
+        _ticketplus_handoff(config_dict)
 
-    return is_confirm_clicked
+
+def _ticketplus_handoff(config_dict):
+    """Publish a manual handoff without claiming an order/payment succeeded."""
+    if _state.get('handoff_ready'):
+        return
+    _ticketplus_timing('等待手動處理', config_dict)
+    _state.update(handoff_ready=True, stage='manual_confirmation', is_ticket_assigned=True)
+    message = '[TicketPlus] 已進入購票資料確認頁，請檢查資料並手動完成後續流程；訂單與付款尚未確認完成。'
+    util.write_instance_status('waiting_manual', message)
+    util.create_debug_logger(enabled=True).log(message)
+    notification_config = dict(config_dict)
+    advanced = dict(config_dict.get('advanced', {}))
+    for key in ('discord_message', 'telegram_message'):
+        custom = advanced.get(key, '').strip()
+        advanced[key] = message + ('\n' + custom if custom else '')
+    notification_config['advanced'] = advanced
+    if advanced.get('play_sound', {}).get('order'):
+        play_sound_while_ordering(config_dict)
+    send_discord_notification(notification_config, 'order', 'TicketPlus')
+    send_telegram_notification(notification_config, 'order', 'TicketPlus')
 
 
 async def _ticketplus_wait_after_submit(tab, config_dict, debug):
@@ -1598,11 +1866,12 @@ async def _ticketplus_wait_after_submit(tab, config_dict, debug):
     deadline = time.time() + CONST_TICKETPLUS_SUBMIT_WAIT_MAX
 
     while time.time() < deadline:
-        if await check_and_handle_pause(config_dict):
+        if await _ticketplus_actions_paused(config_dict):
             return "timeout"
 
         current_url = (tab.url or "").lower()
         if '/confirm/' in current_url or '/confirmseat/' in current_url:
+            _ticketplus_queue_mark('送出監控偵測到確認頁', config_dict)
             debug.log("[SUBMIT WAIT] Confirmation page reached")
             return "confirmed"
 
@@ -1610,25 +1879,33 @@ async def _ticketplus_wait_after_submit(tab, config_dict, debug):
             return "order_fail"
 
         if await nodriver_ticketplus_check_queue_status(tab, config_dict):
+            _ticketplus_queue_mark('偵測到網站排隊畫面', config_dict)
+            _ticketplus_timing('網站排隊中', config_dict)
             debug.log("[SUBMIT WAIT] Platform queue detected")
             return "queue"
 
-        if await sleep_with_pause_check(tab, CONST_TICKETPLUS_SUBMIT_POLL_INTERVAL, config_dict):
+        if await _ticketplus_sleep(tab, CONST_TICKETPLUS_SUBMIT_POLL_INTERVAL, config_dict):
             return "timeout"
 
     debug.log("[SUBMIT WAIT] No outcome within wait budget")
     return "timeout"
 
 
+def _ticketplus_queue_poll_interval(config_dict):
+    value = config_dict.get('advanced', {}).get('ticketplus_queue_url_poll_interval',
+                                             CONST_TICKETPLUS_QUEUE_URL_POLL_INTERVAL)
+    try:
+        value = float(value) if not isinstance(value, bool) else 0
+    except (TypeError, ValueError):
+        value = 0
+    return value if 0.02 <= value <= 1.0 else CONST_TICKETPLUS_QUEUE_URL_POLL_INTERVAL
+
+
 async def _ticketplus_monitor_queue(tab, config_dict, debug):
     """Watch the in-page queue until it clears, moves on, or the order fails.
 
-    The queue re-check keeps its randomized 5-10s cadence (anti-detection), but
-    the URL *and* the failure popup are polled every
-    CONST_TICKETPLUS_QUEUE_URL_POLL_INTERVAL seconds. Reading the popup out of the
-    local DOM sends no request, so it must not be rate-limited with the queue
-    check: doing so left the modal on screen for the whole randomized window
-    (5-10s, ~7.5s average) while it blocked every click on the page.
+    Cached URL checks run independently of full queue DOM scans (5-10s) and
+    failure-dialog scans (0.5s). These checks do not refresh or send site requests.
 
     Gives up after CONST_TICKETPLUS_QUEUE_MONITOR_MAX: removing the scrim signal
     fixed the popup that caused #389, but an unbounded loop would strand the bot
@@ -1641,16 +1918,19 @@ async def _ticketplus_monitor_queue(tab, config_dict, debug):
         "timeout"    -- monitor fuse blew, or paused / errored out
     """
     last_url = ""
-    monitor_deadline = time.time() + CONST_TICKETPLUS_QUEUE_MONITOR_MAX
+    monitor_deadline = time.monotonic() + CONST_TICKETPLUS_QUEUE_MONITOR_MAX
+    poll_interval = _ticketplus_queue_poll_interval(config_dict)
+    _ticketplus_queue_mark('進入排隊監控迴圈', config_dict)
 
-    while time.time() < monitor_deadline:
-        if await check_and_handle_pause(config_dict):
+    while time.monotonic() < monitor_deadline:
+        if await _ticketplus_actions_paused(config_dict):
             return "timeout"
 
         try:
-            current_url = tab.url
+            current_url = tab.url or ''
 
-            if '/confirm/' in current_url.lower() or '/confirmseat/' in current_url.lower():
+            if _ticketplus_confirmation_route(current_url):
+                _ticketplus_queue_mark('排隊監控偵測到確認頁', config_dict)
                 debug.log("Detected entry to confirmation page, exiting queue monitoring")
                 return "confirmed"
 
@@ -1666,15 +1946,18 @@ async def _ticketplus_monitor_queue(tab, config_dict, debug):
                 debug.log("[QUEUE END] Queue ended, continuing page processing")
                 return "queue_end"
 
-            recheck_deadline = time.time() + random.uniform(5.0, 10.0)
-            while time.time() < recheck_deadline:
-                if await sleep_with_pause_check(tab, CONST_TICKETPLUS_QUEUE_URL_POLL_INTERVAL, config_dict):
+            recheck_deadline = min(monitor_deadline, time.monotonic() + random.uniform(5.0, 10.0))
+            next_failure_check = time.monotonic() + CONST_TICKETPLUS_QUEUE_FAILURE_POLL_INTERVAL
+            while time.monotonic() < recheck_deadline:
+                if await _ticketplus_sleep(tab, min(poll_interval, max(0, recheck_deadline - time.monotonic())), config_dict):
                     return "timeout"
                 if tab.url != current_url:
                     break
-                if await nodriver_ticketplus_accept_order_fail(tab, debug) is True:
-                    debug.log("[QUEUE END] Order failure popup dismissed mid-wait, exiting queue monitoring")
-                    return "order_fail"
+                if time.monotonic() >= next_failure_check:
+                    if await nodriver_ticketplus_accept_order_fail(tab, debug) is True:
+                        debug.log("[QUEUE END] Order failure popup dismissed mid-wait, exiting queue monitoring")
+                        return "order_fail"
+                    next_failure_check = time.monotonic() + CONST_TICKETPLUS_QUEUE_FAILURE_POLL_INTERVAL
 
         except Exception as exc:
             debug.log(f"Queue monitoring error: {exc}")
@@ -1691,38 +1974,32 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
     """
     debug = util.create_debug_logger(config_dict)
 
+    if await _ticketplus_actions_paused(config_dict):
+        return
+    await _ticketplus_subscribe_queue_timing(tab, config_dict)
+    document_id = await tab.evaluate("location.href + '|' + performance.timeOrigin")
+    _ticketplus_timing('開始選票', config_dict, document_id)
+    if _state.get('submit_pending') == document_id and document_id:
+        outcome = await _ticketplus_wait_after_submit(tab, config_dict, debug)
+        if outcome == 'queue':
+            outcome = await _ticketplus_monitor_queue(tab, config_dict, debug)
+        if outcome == 'confirmed':
+            _ticketplus_queue_mark('送出流程收到確認頁結果', config_dict)
+            await _ticketplus_process_confirmation(tab, tab.url or '', config_dict)
+        if outcome == 'order_fail':
+            _state.get('queue_trace', {})['closed'] = True
+            _state.pop('submit_pending', None)
+            _state['order_page_visited'] = False
+            await reload_page_if_enabled(tab)
+        return
+    _state.pop('submit_pending', None)
+
     if _state.get("is_ticket_assigned", False):
         debug.log("Ticket selection completed, skipping duplicate execution")
         return
 
-    debug.log("=== TicketPlus Auto Layout Detection Started ===")
-
-    if await sleep_with_pause_check(tab, 0.05, config_dict):
-        debug.log("Paused during page wait")
-        return
-
-    layout_info = await nodriver_ticketplus_detect_layout_style(tab, config_dict)
-
-    if layout_info and layout_info.get('paused'):
-        debug.log("Paused during layout detection")
-        return
-
-    current_layout_style = layout_info.get('style', 0) if isinstance(layout_info, dict) else 0
-
-    if debug.enabled:
-        layout_names = {1: "Expansion panel (Page4)", 2: "Seat selection (Page2)", 3: "Simplified (Page1/Page3)"}
-        button_status = "Enabled" if layout_info.get('button_enabled', False) else "Disabled"
-        debug.log(f"Detected layout style: {current_layout_style} - {layout_names.get(current_layout_style, 'Unknown')}")
-        debug.log(f"Layout detection details: Button found={layout_info.get('found', False)}, Button status={button_status}")
-        if layout_info.get('debug_info'):
-            debug.log(f"Layout detection debug: {layout_info.get('debug_info')}")
-
-    is_button_enabled = await nodriver_ticketplus_check_next_button(tab)
-
-    debug.log(f"Next button status: {'Enabled' if is_button_enabled else 'Disabled'}")
-
-    is_price_assign_by_bot = False
-
+    # The selector already checks real ticket controls; layout/button reads
+    # here were diagnostic only and duplicated browser round trips.
     area_keyword_raw = config_dict.get("area_auto_select", {}).get("area_keyword", "").strip()
 
     keyword_array = util.parse_keyword_string_to_array(area_keyword_raw)
@@ -1748,10 +2025,14 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
                 debug.log(f"[TicketPlus AREA KEYWORD] Keyword #{keyword_index + 1} matched: '{area_keyword_item}' [OK]")
                 break
 
+            if _ticketplus_hold_unresolved_quantity(document_id):
+                return
             debug.log(f"[TicketPlus AREA KEYWORD] Keyword #{keyword_index + 1} failed, trying next...")
 
         if not keyword_matched:
             debug.log(f"[TicketPlus AREA KEYWORD] All {len(keyword_array)} keywords failed to match")
+            if config_dict.get('area_auto_fallback', False):
+                is_price_assign_by_bot = await nodriver_ticketplus_unified_select(tab, config_dict, "")
     else:
         debug.log(f"[TicketPlus AREA KEYWORD] No keyword specified, using auto select mode")
         is_price_assign_by_bot = await nodriver_ticketplus_unified_select(tab, config_dict, "")
@@ -1759,17 +2040,19 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
     is_need_refresh = not is_price_assign_by_bot
 
     if is_price_assign_by_bot:
-        if await check_and_handle_pause(config_dict):
+        _ticketplus_timing('票數已確認', config_dict)
+        if await _ticketplus_actions_paused(config_dict):
             return
 
         debug.log("Ticket selection successful, processing discount code and submit")
 
         is_answer_sent, _state["fail_list"], is_question_popup = await nodriver_ticketplus_order_exclusive_code(tab, config_dict, _state["fail_list"])
+        _ticketplus_timing('資格欄位已處理', config_dict)
 
-        if await sleep_with_pause_check(tab, 0.3, config_dict):
-            debug.log("Paused before form submission")
+        if await _ticketplus_actions_paused(config_dict):
             return
         await nodriver_ticketplus_ticket_agree(tab, config_dict)
+        _ticketplus_timing('條款已處理', config_dict)
 
         is_form_submitted = await nodriver_ticketplus_click_next_button_unified(tab, config_dict)
 
@@ -1777,6 +2060,8 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
             outcome = await _ticketplus_wait_after_submit(tab, config_dict, debug)
 
             if outcome == "order_fail":
+                _state.get('queue_trace', {})['closed'] = True
+                _state.pop('submit_pending', None)
                 debug.log("[ORDER FAIL] Popup dismissed after submit, refreshing ticket availability")
                 _state["order_page_visited"] = False
                 try:
@@ -1786,13 +2071,18 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
                 return
 
             if outcome == "queue":
-                debug.log("Entered queue monitoring (recheck every 5-10 seconds, display only on status change)")
+                debug.log(f"進入排隊監控：頁面跳轉每 {_ticketplus_queue_poll_interval(config_dict):g} 秒檢查，失敗視窗每 0.5 秒檢查，完整排隊文字每 5～10 秒檢查。")
                 queue_outcome = await _ticketplus_monitor_queue(tab, config_dict, debug)
+                _ticketplus_queue_mark('排隊監控已返回送出流程', config_dict)
+                if queue_outcome == 'confirmed':
+                    await _ticketplus_process_confirmation(tab, tab.url or '', config_dict)
 
                 # Mirror the direct order_fail path above: the popup is gone but the
                 # ticket counts on screen are stale, so refresh before the next
                 # attempt instead of submitting against them.
                 if queue_outcome == "order_fail":
+                    _state.get('queue_trace', {})['closed'] = True
+                    _state.pop('submit_pending', None)
                     debug.log("[ORDER FAIL] Popup dismissed during queue monitoring, refreshing ticket availability")
                     _state["order_page_visited"] = False
                     try:
@@ -1801,9 +2091,14 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
                         debug.log(f"[ORDER FAIL] Reload failed: {reload_exc}")
                     return
 
-        debug.log(f"Form submission: {'Success' if is_form_submitted else 'Failed'}")
+            elif outcome == 'confirmed':
+                await _ticketplus_process_confirmation(tab, tab.url or '', config_dict)
+
+        debug.log('選票下一步點擊已執行，訂單結果仍以網站確認為準。' if is_form_submitted else '本輪未點擊選票下一步。')
     else:
         debug.log("Ticket selection failed, cannot continue")
+        if _ticketplus_hold_unresolved_quantity(document_id):
+            return
 
         auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
         if auto_reload_interval >= 0:
@@ -1819,7 +2114,7 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
             except Exception as reload_exc:
                 debug.log(f"[AUTO RELOAD] Reload failed: {reload_exc}")
 
-    debug.log("=== TicketPlus Simplified Booking Ended ===")
+    debug.log('TicketPlus 本輪選票送出處理結束；尚未確認訂單或付款完成。')
 
 
 async def nodriver_ticketplus_wait_for_vue_ready(tab, max_wait_ms=800):
@@ -1833,8 +2128,6 @@ async def nodriver_ticketplus_wait_for_vue_ready(tab, max_wait_ms=800):
         bool: True if Vue.js is ready, False if timed out
     """
     try:
-        await asyncio.sleep(0.15)
-
         result = await tab.evaluate(f'''
             (function() {{
                 return new Promise((resolve) => {{
@@ -1849,8 +2142,9 @@ async def nodriver_ticketplus_wait_for_vue_ready(tab, max_wait_ms=800):
                             '.ticket-list button'
                         ];
 
-                        let hasContent = false;
+                        let hasContent = !!document.querySelector('.count-button .mdi-plus');
                         for (const selector of selectors) {{
+                            if (hasContent) break;
                             const elements = document.querySelectorAll(selector);
                             if (elements.length > 0) {{
                                 hasContent = Array.from(elements).some(el => {{
@@ -1866,11 +2160,13 @@ async def nodriver_ticketplus_wait_for_vue_ready(tab, max_wait_ms=800):
                         }}
 
                         if (hasContent) {{
-                            resolve({{ ready: true, elapsed: Date.now() - startTime }});
+                            resolve({{ ready: true, elapsed: Date.now() - startTime,
+                                documentId: location.href + '|' + performance.timeOrigin }});
                         }} else if (Date.now() - startTime < maxWait) {{
                             setTimeout(check, 30);
                         }} else {{
-                            resolve({{ ready: false, elapsed: maxWait }});
+                            resolve({{ ready: false, elapsed: maxWait,
+                                documentId: location.href + '|' + performance.timeOrigin }});
                         }}
                     }};
 
@@ -1880,6 +2176,7 @@ async def nodriver_ticketplus_wait_for_vue_ready(tab, max_wait_ms=800):
         ''', await_promise=True)
 
         if isinstance(result, dict):
+            _state['readiness_document'] = result.get('documentId')
             return result.get('ready', False)
         return False
 
@@ -2060,7 +2357,7 @@ async def nodriver_ticketplus_order_exclusive_code(tab, config_dict, fail_list):
     """
     debug = util.create_debug_logger(config_dict)
 
-    if await check_and_handle_pause(config_dict):
+    if await _ticketplus_actions_paused(config_dict):
         return False, fail_list, False
 
     credit_card_prefix = config_dict.get("contact", {}).get("credit_card_prefix", "").strip()
@@ -2085,7 +2382,7 @@ async def nodriver_ticketplus_order_exclusive_code(tab, config_dict, fail_list):
                 break
             if waited >= CONST_TICKETPLUS_EXCLUSIVE_CODE_WAIT:
                 break
-            if await sleep_with_pause_check(tab, CONST_TICKETPLUS_EXCLUSIVE_CODE_POLL, config_dict):
+            if await _ticketplus_sleep(tab, CONST_TICKETPLUS_EXCLUSIVE_CODE_POLL, config_dict):
                 return False, fail_list, False
             waited += CONST_TICKETPLUS_EXCLUSIVE_CODE_POLL
 
@@ -2168,22 +2465,24 @@ async def nodriver_ticketplus_main(tab, url, config_dict, ocr, Captcha_Browser):
     """TicketPlus main entry point.
 
     Returns:
-        dict: {"purchase_completed": bool, "is_ticket_assigned": bool}
+        dict: selection stage and manual-handoff readiness; never claims payment success.
     """
-    if await check_and_handle_pause(config_dict):
+    if await _ticketplus_actions_paused(config_dict):
         return _get_status()
 
     debug = util.create_debug_logger(config_dict)
 
     if not _state:
-        _state["fail_list"] = []
-        _state["is_popup_confirm"] = False
-        _state["is_ticket_assigned"] = False
-        _state["start_time"] = None
-        _state["done_time"] = None
-        _state["elapsed_time"] = None
-        _state["signin_form_filled"] = False
-        _state["purchase_completed"] = False
+        _ticketplus_reset_runtime_state()
+
+    if _state.get('handoff_ready'):
+        return _get_status()
+    route = _ticketplus_confirmation_route(url)
+    if route:
+        await _ticketplus_process_confirmation(tab, url, config_dict)
+        return _get_status()
+    _state.pop('seat_next_pending', None)
+    _state['stage'] = 'selecting'
 
     home_url = 'https://ticketplus.com.tw/'
     is_user_signin = False
@@ -2230,32 +2529,36 @@ async def nodriver_ticketplus_main(tab, url, config_dict, ocr, Captcha_Browser):
             is_event_page = True
 
         if is_event_page:
+            cycle_started = time.monotonic()
             _state["start_time"] = time.time()
 
             is_first_visit = not _state.get("order_page_visited", False)
             if is_first_visit:
                 max_wait = 2000
-                fallback_delay = 0.5
                 _state["order_page_visited"] = True
             else:
                 max_wait = 1000
-                fallback_delay = 0.3
 
             if debug.enabled:
                 visit_type = "First visit" if is_first_visit else "Reload"
                 debug.log(f"[VUE INIT] {visit_type}, dynamic detection (max {max_wait}ms)...")
 
             is_ready = await nodriver_ticketplus_wait_for_vue_ready(tab, max_wait_ms=max_wait)
+            document_id = _state.pop('readiness_document', None)
+            if document_id and _state.get('cycle_document') != document_id:
+                _state.update(cycle_document=document_id, cycle_started_at=cycle_started)
 
             debug.log(f"[VUE INIT] Vue.js ready: {is_ready}")
 
             if not is_ready:
-                await asyncio.sleep(fallback_delay)
+                return _get_status()
+            _state['cycle_ready_at'] = time.monotonic()
 
             is_button_pressed = await nodriver_ticketplus_accept_realname_card(tab)
             is_order_fail_handled = await nodriver_ticketplus_accept_order_fail(tab, debug)
 
             if is_order_fail_handled is True:
+                _state.pop('submit_pending', None)
                 debug.log("[ORDER FAIL] Reloading page to refresh ticket availability")
                 try:
                     await reload_page_if_enabled(tab)
@@ -2274,42 +2577,5 @@ async def nodriver_ticketplus_main(tab, url, config_dict, ocr, Captcha_Browser):
         _state["fail_list"] = []
         _state["is_ticket_assigned"] = False
         _state["start_time"] = None
-
-    # https://ticketplus.com.tw/confirm/xx/oo
-    # https://ticketplus.com.tw/confirmseat/xx/oo
-    if '/confirm/' in url.lower() or '/confirmseat/' in url.lower():
-        is_event_page = False
-        if _ticketplus_path_segment_count(url)==6:
-            is_event_page = True
-
-        if is_event_page:
-            _state["is_ticket_assigned"] = True
-
-            if not _state["is_popup_confirm"]:
-                _state["is_popup_confirm"] = True
-
-                if _state["start_time"]:
-                    _state["done_time"] = time.time()
-                    _state["elapsed_time"] = _state["done_time"] - _state["start_time"]
-                    debug.log(f"[TICKETPLUS] NoDriver TicketPlus booking time: {_state['elapsed_time']:.3f} seconds")
-
-                debug.log("[TICKETPLUS] Entered confirmation page, booking successful")
-
-                if config_dict["advanced"]["play_sound"]["order"]:
-                    play_sound_while_ordering(config_dict)
-                send_discord_notification(config_dict, "order", "TicketPlus")
-                send_telegram_notification(config_dict, "order", "TicketPlus")
-
-                try:
-                    await nodriver_ticketplus_confirm(tab, config_dict)
-                    debug.log("[TICKETPLUS] Confirmation page processing completed")
-                except Exception as exc:
-                    debug.log(f"[TICKETPLUS] Confirmation page processing error: {exc}")
-
-            _state["purchase_completed"] = True
-        else:
-            _state["is_popup_confirm"] = False
-    else:
-        _state["is_popup_confirm"] = False
 
     return _get_status()
