@@ -307,7 +307,15 @@
             <input class="form-control" id="browser_port" type="number" min="1024" max="65535" value="19327" />
             <small class="form-text text-muted">預設 19327。自訂時執行 start-browser.cmd 19328，並在此填相同數字。變更後需結束再開始。每個執行中的搶票實例請使用不同 Port。</small>
           </div>
-        </div></div></details><h5 class="ticket-section-title">購票目標與選票方式</h5>
+        </div></div></details>
+        <div class="row mb-3">
+          <label class="col-sm-2 col-form-label" for="ticketplus_direct_flow">TicketPlus 實驗模式</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <div class="form-check"><input type="checkbox" class="form-check-input" id="ticketplus_direct_flow" /><label class="form-check-label" for="ticketplus_direct_flow">直接設定選票並呼叫網站送出函式</label></div>
+            <small class="form-text text-muted">保留區域關鍵字優先順序與網站驗證，進入購票資料確認頁後停下。預設關閉，切換後請斷開再重新開始。</small>
+          </div>
+        </div>
+        <h5 class="ticket-section-title">購票目標與選票方式</h5>
 
         <div class="row mb-3">
           <label for="homepage" class="col-sm-2 col-form-label">網址<span class="help-icon" data-help="homepage" title="售票網站說明" tabindex="0" role="button" aria-label="售票網站 說明"></span></label>

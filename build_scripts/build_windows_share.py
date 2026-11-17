@@ -66,22 +66,31 @@ def assemble(binary_root, stage):
         shutil.copytree(ROOT / 'src' / name, stage / name)
     write_config(stage, default_config())
     (stage / 'LICENSE.txt').write_text(license_text(), encoding='utf8')
+    for name in ('LEGAL_NOTICE.md', 'README.md'):
+        if (ROOT / name).is_file():
+            shutil.copy2(ROOT / name, stage / name)
     launcher = ('@echo off\r\nsetlocal\r\nset "PYTHONHOME="\r\n'
                 'set "PYTHONPATH="\r\nset "PYTHONUTF8=1"\r\n'
                 'cd /d "%~dp0"\r\n"%~dp0settings.exe"\r\n'
                 'if errorlevel 1 pause\r\nendlocal\r\n')
     (stage / 'Start_Tickets_Hunter.cmd').write_bytes(launcher.encode('ascii'))
+    shutil.copy2(ROOT / 'start-browser.cmd', stage / 'start-browser.cmd')
+    (stage / 'build_scripts').mkdir(exist_ok=True)
+    shutil.copy2(BUILD_SCRIPTS / 'start_browser.ps1', stage / 'build_scripts/start_browser.ps1')
     (stage / '使用說明.txt').write_text(
         'Tickets Hunter 本機打包版\n\n'
         '1. 將整個 ZIP 解壓縮到可寫入的資料夾，例如桌面。\n'
         '2. 雙擊 Start_Tickets_Hunter.cmd，或直接執行 settings.exe。\n'
-        '3. 瀏覽器會開啟設定介面，填入活動網址與選票條件，再按開始。\n'
-        '4. 實例的停止會關閉搶票瀏覽器；暫停可保留畫面手動操作。\n\n'
+        '3. 雙擊 start-browser.cmd，輸入連接 Port（預設 19327），在開啟的 Chrome 自行登入售票網站。\n'
+        '4. 設定介面選擇連接既有瀏覽器，Port 與上述一致；填入活動網址與選票條件，再按開始。\n'
+        '5. 暫停停止自動操作；斷開保留 Chrome。網站已收到的排隊請求不會因斷開而取消。\n'
+        '6. 結束程式會關閉設定服務；只關掉設定頁也會在寬限時間後結束服務。\n\n'
         '不需安裝 Python，也不需另外安裝程式套件。\n'
         '請保留所有檔案及 _internal 資料夾，不要只複製 EXE，也不要直接在 ZIP 內執行。\n'
-        '購票需要網路；建議已安裝 Chrome，程式亦會嘗試自動取得可用瀏覽器。\n'
+        '需要 Windows 64 位元、網路及已安裝的 Google Chrome（建議 145 以上）。\n'
         '設定頁預設：http://127.0.0.1:16888/settings.html\n'
-        '全域自動重整開關位於執行狀態頁，可關閉自動重整並保留票況偵測。\n\n'
+        '開始、暫停與自動重整控制位於基本設定。到購票資料確認頁後請手動完成後續。\n'
+        'EXE 版目前使用一般工作程序，不啟用開發版的常駐加速程序。\n\n'
         '此分享包使用乾淨預設設定，沒有打包原使用者的帳號、Cookie、設定檔或紀錄。\n'
         '使用後產生的 settings.json、profiles、instances 與瀏覽器資料可能含有個資，\n'
         '重新分享時請使用打包腳本重新產生乾淨版本。\n'
@@ -96,8 +105,9 @@ def source_archive(stage):
         files += [p for p in (ROOT / folder).rglob('*') if p.is_file()]
     files += [p for p in BUILD_SCRIPTS.rglob('*') if p.is_file() and
               p.suffix.lower() in ('.py', '.spec', '.ps1', '.bat', '.cmd', '.txt', '.md')]
-    files += list((ROOT / 'tests').glob('*.py'))
-    files += [ROOT / 'build-windows.cmd']
+    files += [ROOT / name for name in ('build-windows.cmd', 'start-browser.cmd',
+                                      'start-settings.cmd', 'requirement.txt',
+                                      'README.md', 'LEGAL_NOTICE.md') if (ROOT / name).is_file()]
     with zipfile.ZipFile(stage / 'Source.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(set(files)):
             archive.write(path, 'TicketsHunter_Source/' + path.relative_to(ROOT).as_posix())
@@ -163,6 +173,8 @@ def smoke(stage, config):
             process.wait(timeout=10)
         write_config(stage, config)
         (stage / 'MAXBOT_AUTO_REFRESH_DISABLED.txt').unlink(missing_ok=True)
+        for marker in stage.glob('MAXBOT_*.txt'):
+            marker.unlink()
     print('EXE startup, OCR, web UI and refresh API checks passed.', flush=True)
 
 

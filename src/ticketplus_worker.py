@@ -77,8 +77,7 @@ class Runtime:
             if active:
                 raise ValueError('此實例已有搶票任務。')
             path = message['config_path']
-            with open(path, encoding='utf-8') as source:
-                config = json.load(source)
+            config = self.util.load_json_file(path)
             if urlsplit(config.get('homepage', '')).hostname not in ('ticketplus.com.tw', 'www.ticketplus.com.tw'):
                 raise ValueError('此常駐程序目前只支援 TicketPlus。')
             if config.get('advanced', {}).get('browser_connection_mode', 'attach') != 'attach':

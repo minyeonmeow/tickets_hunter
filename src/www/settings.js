@@ -1283,6 +1283,7 @@ function load_settins_to_form(settings)
         reset_browser_interval.value = settings.advanced.reset_browser_interval;
         server_port.value = settings.advanced.server_port || 16888;
         browser_connection_mode.value = settings.advanced.browser_connection_mode || 'attach';
+        document.getElementById('ticketplus_direct_flow').checked = settings.advanced.ticketplus_direct_flow === true;
         browser_port.value = settings.advanced.browser_port ?? 19327;
         proxy_server_port.value  = settings.advanced.proxy_server_port;
         window_size.value  = settings.advanced.window_size;
@@ -1608,6 +1609,7 @@ function save_changes_to_dict(silent_flag)
             settings.advanced.reset_browser_interval = parseInt(reset_browser_interval.value);
             settings.advanced.server_port = parseInt(server_port.value) || 16888;
             settings.advanced.browser_connection_mode = browser_connection_mode.value;
+            settings.advanced.ticketplus_direct_flow = document.getElementById('ticketplus_direct_flow').checked;
             settings.advanced.browser_port = browserPortValue;
             settings.advanced.proxy_server_port = proxy_server_port.value;
             settings.advanced.window_size = window_size.value;

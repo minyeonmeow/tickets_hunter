@@ -250,6 +250,11 @@ def get_default_config():
     config_dict["advanced"]["warm_ticketplus_worker"] = True
     config_dict["advanced"]["ticketplus_queue_url_poll_interval"] = 0.05
     config_dict["advanced"]["ticketplus_queue_timing"] = True
+    config_dict["advanced"]["ticketplus_stock_api"] = True
+    config_dict["advanced"]["ticketplus_stock_api_timeout"] = 5
+    config_dict["advanced"]["ticketplus_direct_flow"] = False
+    config_dict["advanced"]["ticketplus_session_api"] = True
+    config_dict["advanced"]["ticketplus_session_api_cache_seconds"] = 60
     # remote_url will be dynamically generated based on server_port
     config_dict["advanced"]["remote_url"] = ""
 
@@ -415,8 +420,7 @@ def load_json(profile_name=""):
     config_dict = None
     if os.path.isfile(config_filepath):
         try:
-            with open(config_filepath, encoding='utf-8') as json_data:
-                config_dict = json.load(json_data)
+            config_dict = util.load_json_file(config_filepath)
         except Exception as e:
             print(f"[ERROR] Failed to load {config_filepath}: {e}")
             print("[ERROR] Settings file may be corrupted. Using default settings.")
@@ -958,7 +962,10 @@ class SaveJsonHandler(tornado.web.RequestHandler):
             if ".cityline.com" in config_dict["homepage"]:
                 config_dict["webdriver_type"] = CONST_WEBDRIVER_TYPE_NODRIVER
 
-            util.save_json(config_dict, config_filepath)
+            if util.save_json(config_dict, config_filepath) is False:
+                self.set_status(500)
+                self.write({"error": {"message": "設定儲存失敗，原設定已保留；請稍後重試。", "code": 1005}})
+                return
             if self.application.warm_enabled and supports_warm_worker(config_dict):
                 self.application.workers.prepare(profile_name)
 

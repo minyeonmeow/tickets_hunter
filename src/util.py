@@ -327,13 +327,44 @@ def is_text_match_keyword(keyword_string, text, config_dict=None):
                 break
     return is_match_keyword
 
+def load_json_file(filepath):
+    """Retry transient Windows replacement collisions and legacy partial writes."""
+    for attempt in range(6):
+        try:
+            with open(filepath, encoding='utf-8') as source:
+                return json.load(source)
+        except (PermissionError, FileNotFoundError, json.JSONDecodeError):
+            if attempt == 5:
+                raise
+            time.sleep(0.01)
+
+
 def save_json(config_dict, target_path):
     json_str = json.dumps(config_dict, indent=4)
+    target_path = os.fspath(target_path)
+    parent = os.path.dirname(os.path.abspath(target_path))
+    temporary = os.path.join(parent, '.' + os.path.basename(target_path) + '.' + uuid.uuid4().hex + '.tmp')
     try:
-        with open(target_path, 'w') as outfile:
+        os.makedirs(parent, exist_ok=True)
+        with open(temporary, 'x', encoding='utf-8') as outfile:
             outfile.write(json_str)
-    except Exception as e:
-        pass
+            outfile.flush()
+            os.fsync(outfile.fileno())
+        for attempt in range(6):
+            try:
+                os.replace(temporary, target_path)
+                return True
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.01)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
 def write_string_to_file(filename, data):
     outfile = None

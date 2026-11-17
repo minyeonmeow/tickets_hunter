@@ -672,36 +672,36 @@ async def reload_config(config_dict, last_mtime, config_filepath):
         current_mtime = os.path.getmtime(config_filepath)
         if current_mtime > last_mtime:
             await asyncio.sleep(0.1)
-            with open(config_filepath, 'r', encoding='utf-8') as json_data:
-                new_config = json.load(json_data)
+            new_config = await asyncio.to_thread(util.load_json_file, config_filepath)
 
-                # Update fields
-                fields = [
-                    "ticket_number", "date_auto_select", "area_auto_select", "keyword_exclude",
-                    "ocr_captcha", "tixcraft", "kktix", "cityline",
-                    "refresh_datetime", "contact", "date_auto_fallback", "area_auto_fallback"
+            # Update fields
+            fields = [
+                "ticket_number", "date_auto_select", "area_auto_select", "keyword_exclude",
+                "ocr_captcha", "tixcraft", "kktix", "cityline",
+                "refresh_datetime", "contact", "date_auto_fallback", "area_auto_fallback"
+            ]
+            for field in fields:
+                if field in new_config:
+                    config_dict[field] = new_config[field]
+
+            if "advanced" in new_config:
+                if "advanced" not in config_dict:
+                    config_dict["advanced"] = {}
+                adv_fields = [
+                    "play_sound", "disable_adjacent_seat", "hide_some_image",
+                    "auto_guess_options", "user_guess_string", "auto_reload_page_interval", "verbose",
+                    "tixcraft_soft_block_delay",
+                    "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
+                    "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
+                    "discount_code", "ticketplus_stock_api", "ticketplus_stock_api_timeout", "ticketplus_direct_flow",
+                    "ticketplus_session_api", "ticketplus_session_api_cache_seconds"
                 ]
-                for field in fields:
-                    if field in new_config:
-                        config_dict[field] = new_config[field]
+                for field in adv_fields:
+                    if field in new_config["advanced"]:
+                        config_dict["advanced"][field] = new_config["advanced"][field]
 
-                if "advanced" in new_config:
-                    if "advanced" not in config_dict:
-                        config_dict["advanced"] = {}
-                    adv_fields = [
-                        "play_sound", "disable_adjacent_seat", "hide_some_image",
-                        "auto_guess_options", "user_guess_string", "auto_reload_page_interval", "verbose",
-                        "tixcraft_soft_block_delay",
-                        "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
-                        "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
-                        "discount_code"
-                    ]
-                    for field in adv_fields:
-                        if field in new_config["advanced"]:
-                            config_dict["advanced"][field] = new_config["advanced"][field]
-
-                print("Configuration reloaded from " + os.path.basename(config_filepath))
-                return config_dict, current_mtime
+            print("Configuration reloaded from " + os.path.basename(config_filepath))
+            return config_dict, current_mtime
     except Exception as e:
         print(f"[WARNING] Failed to reload config: {e}")
 

@@ -20,6 +20,9 @@ function Read-StartupPort($taskLabel, [int]$taskDefault) {
     }
 }
 $taskSettingsFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\settings.json'
+if (-not (Test-Path -LiteralPath $taskSettingsFile)) {
+    $taskSettingsFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'settings.json'
+}
 if (Test-Path -LiteralPath $taskSettingsFile) {
     try {
         $taskSavedAdvanced = (Get-Content -LiteralPath $taskSettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json).advanced

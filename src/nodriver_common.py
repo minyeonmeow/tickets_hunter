@@ -236,9 +236,8 @@ def get_config_dict(args):
     config_dict = None
     if os.path.isfile(config_filepath):
         try:
-            with open(config_filepath, encoding='utf-8') as json_data:
-                config_dict = json.load(json_data)
-                config_dict = settings.migrate_config(config_dict)
+            config_dict = util.load_json_file(config_filepath)
+            config_dict = settings.migrate_config(config_dict)
         except Exception as e:
             print(f"[ERROR] Failed to load settings: {config_filepath}")
             print(f"[ERROR] {e}")

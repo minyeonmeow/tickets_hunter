@@ -5,8 +5,10 @@
 import asyncio
 import json
 import random
+import re
 import time
 import traceback
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit
 
 from zendriver import cdp
@@ -51,7 +53,7 @@ _state = {}
 
 def _ticketplus_runtime_guards():
     return {key: _state[key] for key in
-            ('submit_pending', 'seat_next_pending', 'quantity_pending', 'selected_ticket_row')
+            ('submit_pending', 'submit_blocked_document', 'seat_next_pending', 'quantity_pending', 'selected_ticket_row')
             if key in _state}
 
 
@@ -63,7 +65,7 @@ def _ticketplus_reset_runtime_state(pending=None):
                   signin_form_filled=False, purchase_completed=False)
     if pending:
         _state.update({key: pending[key] for key in
-                      ('submit_pending', 'seat_next_pending', 'quantity_pending', 'selected_ticket_row')
+                      ('submit_pending', 'submit_blocked_document', 'seat_next_pending', 'quantity_pending', 'selected_ticket_row')
                       if key in pending})
 
 # After the next button is clicked the site does one of three things: navigate to
@@ -495,7 +497,585 @@ async def _ticketplus_click_refresh_button(tab, debug):
     return False
 
 
+CONST_TICKETPLUS_STOCK_CONTEXT_JS = r'''(() => {
+    const parts=location.pathname.split('/').filter(Boolean);
+    if(parts.length!==3 || parts[0].toLowerCase()!=='order') return {state:'unsupported'};
+    const queue=[document.querySelector('#app')?.__vue__],seen=new Set(),views=[],orders=[];
+    while(queue.length){const vm=queue.shift();if(!vm||seen.has(vm))continue;seen.add(vm);
+        queue.push(...(vm.$children||[]));if(vm._isDestroyed||vm._inactive)continue;
+        if(Array.isArray(vm.selectedTickets)&&typeof vm.beforeNext==='function')orders.push(vm);
+        if(Array.isArray(vm.seatAreas)&&vm.seatAreas.length&&Array.isArray(vm.tickets)&&
+           typeof vm.setSeatArea==='function'&&typeof vm.getProductCount==='function')views.push(vm);
+    }
+    if(views.length!==1 || orders.length!==1) return {state:'unsupported'};
+    const view=views[0],order=orders[0];
+    if(window.isEnquene||order.isPending||view.loadingData||
+       order.selectedTickets.some(t=>Number(t.count)>0)||view.tickets.some(t=>Number(t.count)>0))
+       return {state:'busy'};
+    return {state:'ready',documentId:location.href+'|'+performance.timeOrigin,eventId:parts[1],sessionId:parts[2],
+        sessionAliases:[parts[2],view.session?.id,view.session?.sessionId].filter(Boolean),
+        areaIds:view.seatAreas.map(a=>a.ticketAreaId),productIds:view.tickets.map(t=>t.productId)};
+})()'''
+
+
+CONST_TICKETPLUS_DIRECT_CONTEXT_JS = r'''
+function context() {
+    if(!/^\/order\/[^/]+\/[^/]+\/?$/i.test(location.pathname))return null;
+    const queue=[document.querySelector('#app')?.__vue__],seen=new Set(),orders=[],views=[];
+    while(queue.length){const vm=queue.shift();if(!vm||seen.has(vm))continue;seen.add(vm);
+        queue.push(...(vm.$children||[]));if(vm._isDestroyed||vm._inactive)continue;
+        if(typeof vm.beforeNext==='function'&&typeof vm.enquene==='function'&&Array.isArray(vm.selectedTickets))orders.push(vm);
+        if(Array.isArray(vm.seatAreas)&&vm.seatAreas.length&&Array.isArray(vm.tickets)&&
+           ['addCount','minusCount','canAdd','updateTicket'].every(k=>typeof vm[k]==='function')&&
+           (vm.currentArea===null||typeof vm.currentArea==='object'))views.push(vm);
+    }
+    if(orders.length!==1||views.length!==1)return null;
+    const order=orders[0],view=views[0];
+    if(order.$route?.name!=='Order1')return null;
+    return {order,view,documentId:location.href+'|'+performance.timeOrigin};
+}
+'''
+
+
+CONST_TICKETPLUS_DIRECT_SELECT_JS = r'''(async (keyword, amount, mode, excludes, expected, allowChanges) => {
+    CONTEXT
+    const ctx=context();if(!ctx)return {state:'unsupported'};
+    const {order,view,documentId}=ctx;
+    if(documentId!==expected)return {state:'changed'};
+    if(!Number.isInteger(amount)||amount<=0)return {state:'invalid'};
+    if(Number(view.session?.orderLimit)>0&&amount>Number(view.session.orderLimit))return {state:'no_match'};
+    if(!order.isReady||order.isPending||window.isEnquene||view.loadingData)return {state:'busy'};
+    const label=a=>`${a.name||a.ticketAreaName||''} NT.${Number(a.price||0).toLocaleString('en-US')}`;
+    const words=keyword.trim().split(/\s+/).filter(Boolean);
+    const excluded=text=>excludes.some(k=>k&&text.includes(k));
+    const allowed=a=>a.status==='onsale'&&!a.hidden&&Number(a.count)>=amount&&
+        words.every(w=>label(a).includes(w))&&!excluded(label(a));
+    const chosen=view.tickets.filter(t=>Number(t.count)>0);
+    const areaFor=t=>view.seatAreas.find(a=>a.ticketAreaId===t.ticketAreaId);
+    const verified=t=>order.selectedTickets.length===1&&order.selectedTickets[0].productId===t.productId&&
+        Number(order.selectedTickets[0].count)===amount&&Number(order.totalTicket)===amount&&
+        Number(view.totalTicket)===amount;
+    if(chosen.length){
+        const ticket=chosen[0],area=areaFor(ticket);
+        if(chosen.length===1&&Number(ticket.count)===amount&&area&&words.every(w=>label(area).includes(w))&&
+           !excluded(label(area))&&verified(ticket))return {state:'selected',documentId,name:label(area)};
+        return {state:'partial'};
+    }
+    if(order.selectedTickets.length)return {state:'partial'};
+    if(!allowChanges)return {state:'partial'};
+    let candidates=[];
+    for(const area of view.seatAreas.filter(allowed)){
+        const index=view.tickets.findIndex(t=>t.ticketAreaId===area.ticketAreaId&&t.status==='onsale'&&!t.hidden&&
+            !excluded(t.name||'')&&Number.isInteger(Number(t.unit||1))&&Number(t.unit||1)>0&&
+            amount%Number(t.unit||1)===0&&(!t.purchaseLimit||amount<=Number(t.purchaseLimit))&&
+            (!t.productLimit||(amount<=Number(t.limit)&&amount<=Number(t.remain))));
+        if(index>=0)candidates.push({area,index});
+    }
+    if(!candidates.length)return {state:'no_match'};
+    let index=0;
+    if(mode==='from bottom to top')index=candidates.length-1;
+    else if(mode==='center')index=Math.floor((candidates.length-1)/2);
+    else if(mode==='random')index=Math.floor(Math.random()*candidates.length);
+    const target=candidates[index],ticket=view.tickets[target.index],unit=Number(ticket.unit||1);
+    const oldArea=view.currentArea,oldPanel=view.panelActive;
+    view.currentArea=target.area;view.panelActive=true;
+    let added=0;
+    function rollback(){
+        for(let n=0;n<added;n++){
+            const before=Number(ticket.count);view.minusCount(target.index);
+            if(Number(ticket.count)!==before-unit)return false;
+        }
+        view.currentArea=oldArea;view.panelActive=oldPanel;view.updateTicket();
+        return Number(ticket.count)===0&&order.selectedTickets.length===0;
+    }
+    for(let n=0;n<amount/unit;n++){
+        if(!view.canAdd(target.index))return {state:rollback()?'no_match':'partial'};
+        const before=Number(ticket.count);view.addCount(target.index);
+        if(Number(ticket.count)!==before+unit)return {state:'partial'};
+        added++;
+    }
+    await view.$nextTick();
+    if(location.href+'|'+performance.timeOrigin!==documentId||order.isPending||window.isEnquene)
+        return {state:'partial'};
+    if(!verified(ticket))return {state:'partial'};
+    return {state:'selected',documentId,name:label(target.area)};
+})(KEYWORD, AMOUNT, MODE, EXCLUDES, EXPECTED, ALLOW_CHANGES)'''
+
+
+CONST_TICKETPLUS_DIRECT_SUBMIT_JS = r'''((amount, expected) => {
+    CONTEXT
+    const ctx=context();if(!ctx)return {state:'unsupported'};
+    const {order,view,documentId}=ctx;
+    if(documentId!==expected)return {state:'changed'};
+    const key=Symbol.for('ticketsHunter.ticketplus.directSubmit');
+    const prior=window[key];
+    if(order.isPending||window.isEnquene)return {state:'already_pending'};
+    const ownerKey=Symbol.for('ticketsHunter.ticketplus.orderOwner');
+    const owner=order[ownerKey] ||= {};
+    if(prior?.documentId===documentId && !(prior.state==='handoff' && prior.owner!==owner))
+        return {state:'blocked_prior'};
+    const selected=view.tickets.filter(t=>Number(t.count)>0);
+    if(!order.isReady||!order.canNextStep||order.selectedTickets.length!==1||selected.length!==1||
+       selected[0].productId!==order.selectedTickets[0].productId||Number(selected[0].count)!==amount||
+       order.selectedTickets.some(t=>!t.productId||Number(t.count)!==amount)||
+       Number(order.totalTicket)!==amount||Number(view.totalTicket)!==amount)
+       return {state:'not_ready'};
+    const record={documentId,state:'invoked',owner};
+    window[key]=record;
+    try{
+        Promise.resolve(order.beforeNext({preventDefault(){}})).catch(()=>{record.state='error'});
+        return {state:'invoked'};
+    }catch(_){record.state='error';return {state:'unknown'}}
+})(AMOUNT, EXPECTED)'''
+
+
+async def _ticketplus_direct_select(tab, config_dict, keyword):
+    if await _ticketplus_actions_paused(config_dict):
+        return False
+    document_id = await tab.evaluate("location.href + '|' + performance.timeOrigin")
+    pending = _state.get('quantity_pending')
+    allow_changes = not pending or pending[0] != document_id
+    _state['quantity_pending'] = (document_id, 'direct', -1)
+    excludes = util.parse_keyword_string_to_array(config_dict.get('keyword_exclude', ''))
+    script = CONST_TICKETPLUS_DIRECT_SELECT_JS.replace('CONTEXT', CONST_TICKETPLUS_DIRECT_CONTEXT_JS).replace(
+        'KEYWORD', json.dumps(keyword)).replace('AMOUNT', json.dumps(config_dict['ticket_number'])).replace(
+        'MODE', json.dumps(config_dict.get('area_auto_select', {}).get('mode', 'from top to bottom'))).replace(
+        'EXCLUDES', json.dumps(excludes)).replace('EXPECTED', json.dumps(document_id)).replace(
+        'ALLOW_CHANGES', json.dumps(allow_changes))
+    try:
+        result = await tab.evaluate(script, await_promise=True)
+    except Exception:
+        return False  # Uncertain quantity changes must not be repeated or submitted.
+    state = result.get('state') if isinstance(result, dict) else 'unknown'
+    _state['direct_selection_state'] = state
+    if state in ('selected', 'no_match', 'unsupported', 'invalid', 'busy', 'changed'):
+        _state.pop('quantity_pending', None)
+    if state == 'selected':
+        _state['selected_ticket_row'] = {'documentId': document_id, 'name': result['name']}
+        util.create_debug_logger(config_dict).log(f'[TICKETPLUS 直接選票] {result["name"]}，已核對 {config_dict["ticket_number"]} 張。')
+        return True
+    if state == 'unsupported' and _state.get('direct_notice') != document_id:
+        _state['direct_notice'] = document_id
+        util.create_debug_logger(enabled=True).log('[TICKETPLUS 直接選票] 無法確認網站選票元件，請關閉實驗模式改用原流程。')
+    return False
+
+
+async def _ticketplus_direct_submit(tab, config_dict):
+    if await _ticketplus_actions_paused(config_dict):
+        return False
+    # Selection already captured this identity. The submit script revalidates
+    # it atomically before doing anything, including after navigation/reload.
+    document_id = _state.get('selected_ticket_row', {}).get('documentId')
+    if not document_id:
+        document_id = await tab.evaluate("location.href + '|' + performance.timeOrigin")
+    _state['submit_pending'] = document_id
+    _ticketplus_begin_queue_trace(config_dict)
+    script = CONST_TICKETPLUS_DIRECT_SUBMIT_JS.replace('CONTEXT', CONST_TICKETPLUS_DIRECT_CONTEXT_JS).replace(
+        'AMOUNT', json.dumps(config_dict['ticket_number'])).replace('EXPECTED', json.dumps(document_id))
+    try:
+        result = await tab.evaluate(script)
+    except Exception:
+        result = {'state': 'unknown'}
+    state = result.get('state') if isinstance(result, dict) else 'unknown'
+    if state == 'invoked':
+        _state.pop('submit_blocked_document', None)
+        _ticketplus_queue_mark('網站原本送出函式已呼叫', config_dict)
+        _ticketplus_timing('已呼叫選票送出函式', config_dict)
+        return True
+    if state == 'already_pending':
+        _state.pop('submit_blocked_document', None)
+        _ticketplus_queue_mark('網站已有排隊流程，接續監控', config_dict)
+        return True
+    if state in ('not_ready', 'unsupported', 'changed'):
+        _state.pop('submit_pending', None)
+    else:
+        _ticketplus_block_direct_submit(document_id, config_dict)
+        return False
+    if _state.get('direct_submit_notice') != (document_id, state):
+        _state['direct_submit_notice'] = (document_id, state)
+        util.create_debug_logger(enabled=True).log('[TICKETPLUS 直接送出] 網站驗證未通過或回應未明，請查看頁面；不切回按鈕重複送出。')
+    return False
+
+
+async def _ticketplus_reconnect_submission(tab, config_dict, document_id):
+    """Adopt browser-owned work before selecting; never retry an uncertain send."""
+    if not config_dict.get('advanced', {}).get('ticketplus_direct_flow', False):
+        return
+    if _state.get('submission_checked_document') == document_id:
+        return
+    script = r'''(() => {
+        CONTEXT
+        const ctx=context();if(!ctx)return {state:'unavailable'};
+        const {order,documentId}=ctx;
+        if(documentId!==EXPECTED)return {state:'changed'};
+        if(order.isPending||window.isEnquene)return {state:'pending'};
+        const prior=window[Symbol.for('ticketsHunter.ticketplus.directSubmit')];
+        if(!prior||prior.documentId!==documentId)return {state:'fresh'};
+        const owner=order[Symbol.for('ticketsHunter.ticketplus.orderOwner')];
+        if(prior.state==='handoff'&&prior.owner!==owner)return {state:'new_owner'};
+        return {state:'uncertain'};
+    })()'''.replace('CONTEXT', CONST_TICKETPLUS_DIRECT_CONTEXT_JS).replace(
+        'EXPECTED', json.dumps(document_id))
+    try:
+        result = await tab.evaluate(script)
+    except Exception:
+        result = None
+    state = result.get('state') if isinstance(result, dict) else 'unavailable'
+    if state in ('unavailable', 'changed'):
+        # Do not mark checked while the SPA component is still loading.
+        if _state.get('submit_pending') != document_id:
+            _state['reconnect_loading_document'] = document_id
+        _state['submit_pending'] = document_id
+        _state['submit_blocked_document'] = document_id
+        if _state.get('reconnect_loading_notice') != document_id:
+            _state['reconnect_loading_notice'] = document_id
+            util.create_debug_logger(enabled=True).log('[TICKETPLUS 準備中] 選票元件仍在載入，等待就緒後接手；尚未判定有舊的送出。')
+        return
+    _state['submission_checked_document'] = document_id
+    if state == 'new_owner' or (state == 'fresh' and _state.get('reconnect_loading_document') == document_id):
+        _state.pop('submit_pending', None)
+        _state.pop('submit_blocked_document', None)
+        _state.pop('submit_block_notice', None)
+    _state.pop('reconnect_loading_document', None)
+    if state == 'pending':
+        _state['submit_pending'] = document_id
+        _state.pop('submit_blocked_document', None)
+        util.create_debug_logger(enabled=True).log('[TICKETPLUS 重新接手] 網站仍在處理上一筆，接續監控，不重新選票或送出。')
+    elif state == 'uncertain':
+        _state['submit_pending'] = document_id
+        _ticketplus_block_direct_submit(document_id, config_dict)
+
+
+def _ticketplus_block_direct_submit(document_id, config_dict):
+    _state['submit_blocked_document'] = document_id
+    if _state.get('submit_block_notice') == document_id:
+        return
+    _state['submit_block_notice'] = document_id
+    message = '上一筆送出結果尚未確認，已停止再次選票與送出。請先查看網站的排隊或訂單結果；重新連線不會清除送出防護，也不會自動重整後重送。'
+    util.create_debug_logger(enabled=True).log('[TICKETPLUS 送出防護] ' + message)
+    util.write_instance_status('running', message)
+
+
+CONST_TICKETPLUS_APPLY_STOCK_JS = r'''(async (expected, areas, products) => {
+    if(location.href+'|'+performance.timeOrigin!==expected) return {state:'changed'};
+    const q=[document.querySelector('#app')?.__vue__],seen=new Set(),views=[],orders=[];
+    while(q.length){const vm=q.shift();if(!vm||seen.has(vm))continue;seen.add(vm);q.push(...(vm.$children||[]));
+        if(vm._isDestroyed||vm._inactive)continue;
+        if(Array.isArray(vm.selectedTickets)&&typeof vm.beforeNext==='function')orders.push(vm);
+        if(Array.isArray(vm.seatAreas)&&vm.seatAreas.length&&Array.isArray(vm.tickets)&&
+           typeof vm.setSeatArea==='function'&&typeof vm.getProductCount==='function')views.push(vm);
+    }
+    if(views.length!==1||orders.length!==1)return {state:'changed'};
+    const view=views[0],order=orders[0];
+    if(window.isEnquene||order.isPending||view.loadingData||order.selectedTickets.some(t=>Number(t.count)>0)||
+       view.tickets.some(t=>Number(t.count)>0))return {state:'busy'};
+    if(view.seatAreas.some(a=>!areas.some(r=>r.id===a.ticketAreaId))||
+       view.tickets.some(t=>!products.some(r=>r.id===t.productId)))return {state:'incomplete'};
+    await view.setSeatArea(areas);
+    await view.getProductCount(products);
+    await view.$nextTick();
+    return {state:'updated',areas:view.seatAreas.map(a=>({id:a.ticketAreaId,count:a.count}))};
+})(EXPECTED, AREAS, PRODUCTS)'''
+
+
+def _ticketplus_stock_http(query, timeout):
+    import requests
+    path = '/config/api/v1/getS3' if 'path' in query else '/config/api/v1/get'
+    with requests.Session() as client:
+        client.trust_env = False
+        response = client.get('https://apis.ticketplus.com.tw' + path,
+                              params=query, timeout=timeout, allow_redirects=False)
+        if response.status_code != 200:
+            raise ValueError('stock_api_http_error')
+        result = response.json()
+    if not isinstance(result, dict):
+        raise ValueError('stock_api_invalid_json')
+    return result
+
+
+async def _ticketplus_stock_request(query, config_dict, *, require_refresh=True):
+    advanced = config_dict.get('advanced', {})
+    try:
+        timeout = float(advanced.get('ticketplus_stock_api_timeout', 5))
+    except (TypeError, ValueError):
+        timeout = 5
+    if not 0.2 <= timeout <= 30:
+        timeout = 5
+    task = asyncio.create_task(asyncio.to_thread(_ticketplus_stock_http, query, timeout))
+    try:
+        while not task.done():
+            if (require_refresh and not util.is_auto_refresh_enabled()) or await _ticketplus_actions_paused(config_dict):
+                return None
+            await asyncio.wait({task}, timeout=0.05)
+        if (require_refresh and not util.is_auto_refresh_enabled()) or await _ticketplus_actions_paused(config_dict):
+            return None
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()  # A late read-only HTTP response must never update the page.
+
+
+async def _ticketplus_stock_area_mapping(context, config_dict):
+    key = (context['eventId'], context['sessionId'])
+    cache = _state.setdefault('stock_area_mapping', {})
+    if key not in cache:
+        data = await _ticketplus_stock_request({'path': f'event/{key[0]}/ticketAreas.json'}, config_dict)
+        if data is None:
+            return None
+        aliases = set(context['sessionAliases'])
+        areas = [a for a in data.get('ticketAreas', []) if isinstance(a, dict)
+                 and a.get('sessionId') in aliases and isinstance(a.get('ticketAreaId'), str)]
+        mapping = {a['ticketAreaId']: str(a.get('name') or a.get('ticketAreaName') or '') for a in areas}
+        if not mapping or not set(context['areaIds']).issubset(mapping):
+            raise ValueError('stock_api_session_mapping_missing')
+        cache[key] = mapping
+    return cache[key]
+
+
+async def _ticketplus_refresh_stock(tab, config_dict):
+    """Refresh only stock data; all ticket selection and submission stays unchanged."""
+    debug = util.create_debug_logger(config_dict)
+    if not util.is_auto_refresh_enabled() or await _ticketplus_actions_paused(config_dict):
+        return True
+    if not config_dict.get('advanced', {}).get('ticketplus_stock_api', True):
+        return await _ticketplus_click_refresh_button(tab, debug)
+    started = time.perf_counter()
+    try:
+        context = await tab.evaluate(CONST_TICKETPLUS_STOCK_CONTEXT_JS)
+        if not isinstance(context, dict) or context.get('state') == 'unsupported':
+            return await _ticketplus_click_refresh_button(tab, debug)
+        if context.get('state') != 'ready':
+            return True
+        mapping = await _ticketplus_stock_area_mapping(context, config_dict)
+        if mapping is None:
+            return True
+        query = {'ticketAreaId': ','.join(mapping), 'productId': ','.join(context['productIds']),
+                 '_': str(int(time.time() * 1000))}
+        response = await _ticketplus_stock_request(query, config_dict)
+        if response is None:
+            return True
+        if response.get('errCode') != '00' or not isinstance(response.get('result'), dict):
+            raise ValueError('stock_api_rejected')
+        result = response['result']
+        areas, products = result.get('ticketArea'), result.get('product')
+        if not isinstance(areas, list) or not isinstance(products, list):
+            raise ValueError('stock_api_incomplete_response')
+        if not util.is_auto_refresh_enabled() or await _ticketplus_actions_paused(config_dict):
+            return True
+        script = CONST_TICKETPLUS_APPLY_STOCK_JS.replace('EXPECTED', json.dumps(context['documentId'])).replace(
+            'AREAS', json.dumps(areas)).replace('PRODUCTS', json.dumps(products))
+        applied = await tab.evaluate(script, await_promise=True)
+        if not isinstance(applied, dict) or applied.get('state') != 'updated':
+            debug.log('[TICKETPLUS 票況 API] 頁面、選票或資料已變動，本輪不套用票況。')
+            return True
+        debug.log(f'[TICKETPLUS 票況 API] 更新 {len(applied["areas"])} 區完成，耗時 {time.perf_counter()-started:.3f} 秒。')
+        for area in applied['areas']:
+            stock = '熱賣中' if area.get('count') == 999999 else str(area.get('count'))
+            debug.log(f'[TICKETPLUS 票區] {mapping.get(area["id"], "未命名票區")} | {area["id"]} | 餘額 {stock}')
+        return True
+    except Exception as exc:
+        debug.log(f'[TICKETPLUS 票況 API] 讀取或更新失敗（{type(exc).__name__}），保留頁面等待下次更新。')
+        return True  # Do not reload or submit because a read-only API failed.
+
+
+CONST_TICKETPLUS_ID_FORMAT_KEY = b'ILOVEFETIXFETIX!'
+CONST_TICKETPLUS_ID_FORMAT_IV = b'!@#$FETIXEVENTiv'
+
+
+def _ticketplus_api_id(value, prefix):
+    """Use the public site's ID-format conversion; no login credentials involved."""
+    if not isinstance(value, str):
+        raise ValueError('invalid_public_id')
+    if re.fullmatch(prefix + r'\d{9}', value):
+        return value
+    if not re.fullmatch(r'[0-9a-fA-F]{32}', value):
+        raise ValueError('invalid_public_id')
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
+    # These are the public ID-format constants shipped in the website bundle.
+    decryptor = Cipher(algorithms.AES(CONST_TICKETPLUS_ID_FORMAT_KEY), modes.CBC(CONST_TICKETPLUS_ID_FORMAT_IV)).decryptor()
+    padded = decryptor.update(bytes.fromhex(value)) + decryptor.finalize()
+    unpadder = PKCS7(128).unpadder()
+    decoded = (unpadder.update(padded) + unpadder.finalize()).decode('ascii')
+    if not re.fullmatch(prefix + r'\d{9}', decoded):
+        raise ValueError('invalid_api_id')
+    return decoded
+
+
+def _ticketplus_session_time(value):
+    if value is None or value == '':
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e11 else value
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+        return parsed.timestamp()
+    except ValueError:
+        return None
+
+
+def _ticketplus_session_available(meta, live, config_dict, now):
+    if meta.get('hidden') or live.get('hidden') or live.get('lock'):
+        return False
+    for row in (meta, live):
+        start, end = (_ticketplus_session_time(row.get(key)) for key in ('exposeStart', 'exposeEnd'))
+        if start is not None and now < start or end is not None and now >= end:
+            return False
+    sale_end = _ticketplus_session_time(live.get('saleEnd'))
+    if sale_end is not None and now >= sale_end:
+        return False
+    status = str(live.get('status', '')).lower()
+    skip_soldout = config_dict.get('tixcraft', {}).get('pass_date_is_sold_out', True)
+    if status not in ('onsale', 'pending', 'soldout') or status == 'soldout' and skip_soldout:
+        return False
+    if status == 'onsale' and skip_soldout and live.get('sessionLimit') and live.get('count') == 0:
+        return False
+    return True
+
+
+def _ticketplus_session_matches(keyword, session):
+    text = ' '.join(str(session.get(key) or '') for key in
+                    ('date', 'time', 'name', 'location', 'sessionStart', 'sessionEnd')).casefold()
+    dates = [(int(y), int(m), int(d)) for y, m, d in
+             re.findall(r'(?<!\d)(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?!\d)', text)]
+    for word in keyword.casefold().split():
+        match = re.fullmatch(r'(?:(\d{4})[-/])?(\d{1,2})[-/](\d{1,2})', word)
+        if match:
+            year, month, day = match.groups()
+            if not any((not year or y == int(year)) and m == int(month) and d == int(day) for y, m, d in dates):
+                return False
+        elif word not in text:
+            return False
+    return True
+
+
+def _ticketplus_choose_session(sessions, config_dict):
+    def text_of(row):
+        return ' '.join(str(row.get(k) or '') for k in ('date', 'time', 'name', 'location'))
+    sessions = _ticketplus_filter_excluded(config_dict, sessions, text_of)
+    raw = config_dict.get('date_auto_select', {}).get('date_keyword', '').strip()
+    groups = util.parse_keyword_string_to_array(raw)
+    if raw and not groups:
+        groups = [word.strip().strip('"\'') for word in re.split('[;,]', raw) if word.strip()]
+    for group in groups or ['']:
+        if not isinstance(group, str):
+            continue
+        matched = [row for row in sessions if _ticketplus_session_matches(group, row)]
+        if matched:
+            return util.get_target_item_from_matched_list(matched, config_dict['date_auto_select']['mode'])
+    if config_dict.get('date_auto_fallback', False):
+        return util.get_target_item_from_matched_list(sessions, config_dict['date_auto_select']['mode'])
+    return None
+
+
+async def _ticketplus_session_catalog(event_id, config_dict, require_refresh):
+    cache = _state.setdefault('session_api_catalog', {})
+    try:
+        ttl = float(config_dict.get('advanced', {}).get('ticketplus_session_api_cache_seconds', 60))
+    except (TypeError, ValueError):
+        ttl = 60
+    if not 0 <= ttl <= 3600:
+        ttl = 60
+    if event_id in cache and time.monotonic() - cache[event_id][0] < ttl:
+        return cache[event_id][1]
+    data = await _ticketplus_stock_request({'path': f'event/{event_id}/sessions.json'},
+                                         config_dict, require_refresh=require_refresh)
+    if data is None:
+        return None
+    if not isinstance(data.get('sessions'), list):
+        raise ValueError('session_api_invalid_catalog')
+    catalog = []
+    event_aliases = (event_id, _ticketplus_api_id(event_id, 'e'))
+    for row in data['sessions']:
+        if not isinstance(row, dict):
+            continue
+        if row.get('eventId') and row['eventId'] not in event_aliases:
+            continue
+        try:
+            catalog.append({**row, '_api_id': _ticketplus_api_id(row.get('sessionId'), 's')})
+        except (ValueError, UnicodeError):
+            continue
+    cache[event_id] = (time.monotonic(), catalog)
+    return catalog
+
+
+async def _ticketplus_date_api_select(tab, config_dict):
+    debug = util.create_debug_logger(config_dict)
+    if await _ticketplus_actions_paused(config_dict):
+        return False
+    context = await tab.evaluate("({url:location.href,documentId:location.href+'|'+performance.timeOrigin})")
+    if not isinstance(context, dict):
+        return False
+    url = urlsplit(context.get('url', ''))
+    parts = url.path.strip('/').split('/')
+    if url.hostname not in ('ticketplus.com.tw', 'www.ticketplus.com.tw') or len(parts) != 2 or parts[0] != 'activity':
+        return False
+    event_id = parts[1]
+    try:
+        event_api_id = _ticketplus_api_id(event_id, 'e')
+    except ValueError:
+        return False
+    signature = (context['documentId'], json.dumps({key: config_dict.get(key) for key in
+                 ('date_auto_select', 'date_auto_fallback', 'keyword_exclude', 'tixcraft')}, sort_keys=True))
+    automatic = util.is_auto_refresh_enabled()
+    previous = _state.get('session_api_last_check')
+    try:
+        interval = float(config_dict.get('advanced', {}).get('auto_reload_page_interval', 5))
+    except (TypeError, ValueError):
+        interval = 5
+    if not 0.2 <= interval <= 3600:
+        interval = 0.2 if interval == 0 else 5
+    if previous and previous[0] == signature and (not automatic or time.monotonic() - previous[1] < interval):
+        return False
+    _state['session_api_last_check'] = (signature, time.monotonic())
+    started = time.perf_counter()
+    try:
+        catalog = await _ticketplus_session_catalog(event_id, config_dict, automatic)
+        if not catalog:
+            return False
+        response = await _ticketplus_stock_request({'eventId': event_api_id,
+                                                  'sessionId': ','.join(dict.fromkeys(row['_api_id'] for row in catalog))},
+                                                  config_dict, require_refresh=automatic)
+        if response is None:
+            return False
+        if response.get('errCode') != '00' or not isinstance(response.get('result', {}).get('session'), list):
+            raise ValueError('session_api_invalid_status')
+        events = response['result'].get('event', [])
+        event = next((row for row in events if isinstance(row, dict) and row.get('id') == event_api_id), None)
+        if event is None or not _ticketplus_session_available({}, event, config_dict, time.time()):
+            debug.log('[TICKETPLUS 場次 API] 活動目前不可選，等待下次檢查。')
+            return False
+        statuses = {row['id']: row for row in response['result']['session'] if isinstance(row, dict) and row.get('id')}
+        sessions = [{**row, **statuses[row['_api_id']], 'sessionId': row['sessionId']} for row in catalog if row['_api_id'] in statuses and
+                    _ticketplus_session_available(row, statuses[row['_api_id']], config_dict, time.time())]
+        sessions.sort(key=lambda row: row.get('sortedIndex', 0))
+        target = _ticketplus_choose_session(sessions, config_dict)
+        if not target:
+            debug.log('[TICKETPLUS 場次 API] 尚無符合日期關鍵字與可選狀態的場次，等待下次檢查。')
+            return False
+        if await _ticketplus_actions_paused(config_dict) or (automatic and not util.is_auto_refresh_enabled()):
+            return False
+        current = await tab.evaluate("location.href+'|'+performance.timeOrigin")
+        if current != context['documentId']:
+            return False
+        order_url = f'{url.scheme}://{url.netloc}/order/{event_id}/{target["sessionId"]}'
+        debug.log(f'[TICKETPLUS 場次 API] 選擇 {target.get("date", "")} {target.get("time", "")} {target.get("name", "")} | {target["sessionId"]}，耗時 {time.perf_counter()-started:.3f} 秒。')
+        await navigate_page_if_enabled(tab, order_url)
+        return True
+    except Exception as exc:
+        debug.log(f'[TICKETPLUS 場次 API] 讀取或選擇失敗（{type(exc).__name__}），保留活動頁等待下次檢查。')
+        return False
+
+
 async def nodriver_ticketplus_date_auto_select(tab, config_dict):
+    if config_dict.get('advanced', {}).get('ticketplus_session_api', True):
+        return await _ticketplus_date_api_select(tab, config_dict)
+    return await _ticketplus_date_dom_select(tab, config_dict)
+
+
+async def _ticketplus_date_dom_select(tab, config_dict):
     """TicketPlus date auto selection."""
     debug = util.create_debug_logger(config_dict)
 
@@ -1003,7 +1583,8 @@ def _ticketplus_begin_queue_trace(config_dict):
     now = time.perf_counter()
     _state['queue_trace'] = {'start': now, 'last': now, 'marks': {},
                              'document': _state.get('submit_pending'), 'requests': {}, 'sequence': 0}
-    _ticketplus_queue_mark('開始點擊選票下一步', config_dict)
+    stage = '開始呼叫網站送出函式' if config_dict.get('advanced', {}).get('ticketplus_direct_flow', False) else '開始點擊選票下一步'
+    _ticketplus_queue_mark(stage, config_dict)
 
 
 def _ticketplus_queue_summary(config_dict):
@@ -1095,6 +1676,8 @@ async def _ticketplus_subscribe_queue_timing(tab, config_dict):
 
 async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
     """TicketPlus unified selector - language-independent ticket type/area selection."""
+    if config_dict.get('advanced', {}).get('ticketplus_direct_flow', False):
+        return await _ticketplus_direct_select(tab, config_dict, area_keyword)
     debug = util.create_debug_logger(config_dict)
     auto_select_mode = config_dict["area_auto_select"]["mode"]
     # Fallback is applied only after all ordered keyword groups fail.
@@ -1380,6 +1963,8 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
 
 async def nodriver_ticketplus_click_next_button_unified(tab, config_dict):
     """TicketPlus unified next button clicker - layout_style independent."""
+    if config_dict.get('advanced', {}).get('ticketplus_direct_flow', False):
+        return await _ticketplus_direct_submit(tab, config_dict)
     debug = util.create_debug_logger(config_dict)
 
     debug.log("Unified next button clicker started")
@@ -1459,66 +2044,32 @@ def _is_terms_checkbox_label(label_text):
 
 
 async def nodriver_ticketplus_ticket_agree(tab, config_dict):
-    """TicketPlus agreement checkbox."""
+    """Read, click and verify terms together, without per-element CDP trips."""
     if await _ticketplus_actions_paused(config_dict):
         return False
-
-    debug = util.create_debug_logger(config_dict)
-    is_finish_checkbox_click = False
-
+    script = r'''(async () => {
+        if(!/^\/order\/[^/]+\/[^/]+\/?$/i.test(location.pathname))return false;
+        const labelOf=LABEL, include=INCLUDE, exclude=EXCLUDE;
+        const terms=Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(el=>{
+            const text=labelOf(el).toLowerCase();
+            return text&&!exclude.some(k=>text.includes(k))&&include.some(k=>text.includes(k));
+        });
+        if(!terms.length)return false;
+        for(const el of terms){
+            if(!el.checked&&!el.disabled)el.click();
+        }
+        // Let Vue's change handlers flush before native canNextStep is read.
+        const root=document.querySelector('#app')?.__vue__;
+        if(root&&typeof root.$nextTick==='function')await root.$nextTick();
+        return terms.every(el=>el.isConnected&&el.checked);
+    })()'''.replace('LABEL', CONST_TICKETPLUS_CHECKBOX_LABEL_JS.strip()).replace(
+        'INCLUDE', json.dumps(CONST_TICKETPLUS_AGREE_KEYWORDS)).replace(
+        'EXCLUDE', json.dumps(CONST_TICKETPLUS_AGREE_EXCLUDE_KEYWORDS))
     try:
-        agree_checkbox_list = await tab.query_selector_all('input[type="checkbox"]')
-
-        for checkbox in agree_checkbox_list:
-            try:
-                if not checkbox:
-                    continue
-
-                # Terms only: add-ons, donations and marketing opt-ins stay off.
-                label_text = await checkbox.apply(CONST_TICKETPLUS_CHECKBOX_LABEL_JS)
-                if not _is_terms_checkbox_label(label_text):
-                    debug.log(f"[AGREE] Skipping checkbox that is not the terms: {(label_text or '')[:40]!r}")
-                    continue
-
-                # Element.apply, not Element.evaluate: zendriver defines evaluate
-                # only on Tab, and Element.__getattr__ returns None for unknown
-                # names, so checkbox.evaluate(...) is a TypeError the except hides.
-                is_checked = await checkbox.apply('(el) => el.checked')
-
-                if not is_checked:
-                    await checkbox.click()
-
-                    is_checked_after = await checkbox.apply('(el) => el.checked')
-                    if is_checked_after:
-                        is_finish_checkbox_click = True
-                        debug.log("successfully checked agreement checkbox")
-                    else:
-                        if checkbox:
-                            # Element.apply: tab.evaluate's second positional
-                            # arg is await_promise, not a script parameter.
-                            await checkbox.apply('''
-                                (el) => {
-                                    el.checked = true;
-                                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                                }
-                            ''')
-
-                            final_check = await checkbox.apply('(el) => el.checked')
-                            if final_check:
-                                is_finish_checkbox_click = True
-                                debug.log("successfully checked agreement checkbox via JS")
-                else:
-                    is_finish_checkbox_click = True
-                    debug.log("agreement checkbox already checked")
-
-            except Exception as exc:
-                debug.log("process checkbox fail:", exc)
-                continue
-
-    except Exception as exc:
-        debug.log("find agreement checkbox fail:", exc)
-
-    return is_finish_checkbox_click
+        return bool(await tab.evaluate(script, await_promise=True))
+    except Exception:
+        # Never force checked state or start a second click after a lost reply.
+        return False
 
 
 async def nodriver_ticketplus_accept_realname_card(tab):
@@ -1825,6 +2376,14 @@ async def _ticketplus_process_confirmation(tab, url, config_dict):
         _state['stage'] = 'seat_confirmation'
         await nodriver_ticketplus_confirm(tab, config_dict, current=current)
     else:
+        try:
+            await tab.evaluate(r"""(() => {
+                if(!/^\/confirm\/[^/]+\/[^/]+\/?$/i.test(location.pathname))return;
+                const prior=window[Symbol.for('ticketsHunter.ticketplus.directSubmit')];
+                if(prior)prior.state='handoff';
+            })()""")
+        except Exception:
+            pass  # Never clear an uncertain submission if navigation interrupts this acknowledgement.
         _ticketplus_queue_mark('交由使用者手動確認', config_dict)
         _ticketplus_handoff(config_dict)
 
@@ -1979,7 +2538,11 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
     await _ticketplus_subscribe_queue_timing(tab, config_dict)
     document_id = await tab.evaluate("location.href + '|' + performance.timeOrigin")
     _ticketplus_timing('開始選票', config_dict, document_id)
+    await _ticketplus_reconnect_submission(tab, config_dict, document_id)
     if _state.get('submit_pending') == document_id and document_id:
+        if _state.get('submit_blocked_document') == document_id:
+            _ticketplus_block_direct_submit(document_id, config_dict)
+            return
         outcome = await _ticketplus_wait_after_submit(tab, config_dict, debug)
         if outcome == 'queue':
             outcome = await _ticketplus_monitor_queue(tab, config_dict, debug)
@@ -2094,9 +2657,13 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
             elif outcome == 'confirmed':
                 await _ticketplus_process_confirmation(tab, tab.url or '', config_dict)
 
-        debug.log('選票下一步點擊已執行，訂單結果仍以網站確認為準。' if is_form_submitted else '本輪未點擊選票下一步。')
+        debug.log('選票送出流程已交由網站處理，排隊及保留結果仍以網站回應為準。' if is_form_submitted else '本輪未啟動新的選票送出流程。')
     else:
         debug.log("Ticket selection failed, cannot continue")
+        if config_dict.get('advanced', {}).get('ticketplus_direct_flow', False) and _state.get('direct_selection_state') in ('busy', 'unsupported', 'changed'):
+            # Loading is not sold out. Let the main loop recheck without the
+            # user's sold-out refresh delay or an unnecessary stock update.
+            return
         if _ticketplus_hold_unresolved_quantity(document_id):
             return
 
@@ -2107,7 +2674,7 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
                 await sleep_before_auto_refresh(auto_reload_interval)
             debug.log("[AUTO RELOAD] Refreshing ticket count...")
             try:
-                clicked = await _ticketplus_click_refresh_button(tab, debug)
+                clicked = await _ticketplus_refresh_stock(tab, config_dict)
                 if not clicked:
                     await reload_page_if_enabled(tab)
                     debug.log("[AUTO RELOAD] Full page reload (button not found)")
