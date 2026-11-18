@@ -13,7 +13,6 @@ import random
 import re
 import time
 import traceback
-import webbrowser
 
 
 from zendriver import cdp
@@ -22,6 +21,7 @@ import util
 from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sleep_before_auto_refresh
 from nodriver_common import (
     check_and_handle_pause,
+    check_and_handle_quit,
     sleep_with_pause_check,
     convert_remote_object,
     nodriver_check_checkbox,
@@ -36,6 +36,7 @@ from nodriver_common import (
     CONST_MAXBOT_INT28_FILE,
     CONST_OCR_CAPTCH_IMAGE_SOURCE_CANVAS,
     CONST_OCR_CAPTCH_IMAGE_SOURCE_NON_BROWSER,
+    CONST_NATIVE_INPUT_SETTER_JS,
 )
 
 __all__ = [
@@ -1669,14 +1670,44 @@ async def nodriver_tixcraft_input_check_code(tab, config_dict, fail_list, questi
 
     return fail_list
 
+async def _tixcraft_action_allowed(tab, config_dict, document_id):
+    """副作用前確認未暫停、未結束且仍是原文件。"""
+    if await _tixcraft_actions_paused(config_dict) or not document_id:
+        return False
+    return await _tixcraft_document_id(tab) == document_id
+
+
+async def _tixcraft_reload_after_wait(tab, config_dict, document_id):
+    """等待期間可中止，手動 F5 或換頁後不再覆蓋新畫面。"""
+    if not util.is_auto_refresh_enabled() or await _tixcraft_actions_paused(config_dict):
+        return False
+    try:
+        interval = max(0.0, float(config_dict.get('advanced', {}).get('auto_reload_page_interval', 1)))
+        if not interval < float('inf'):
+            return False
+        if await _tixcraft_sleep(interval, config_dict):
+            return False
+        if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+            return False
+        if await _tixcraft_submission_pending(tab, config_dict):
+            return False
+        return await reload_page_if_enabled(tab)
+    except Exception:
+        return False
+
+
 async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name):
+    if await _tixcraft_actions_paused(config_dict):
+        return False
+    document_id = await _tixcraft_document_id(tab)
     debug = util.create_debug_logger(config_dict)
 
     # Issue #188: Check sold out cooldown before proceeding
     if _state and _state.get("sold_out_cooldown_until", 0) > time.time():
         remaining = _state["sold_out_cooldown_until"] - time.time()
         debug.log(f"[DATE SELECT] Sold out cooldown active, waiting {remaining:.1f}s...")
-        await asyncio.sleep(remaining)
+        if await _tixcraft_sleep(remaining, config_dict):
+            return False
         _state["sold_out_cooldown_until"] = 0  # Reset after waiting
 
     # T003: Check main switch (defensive programming)
@@ -1918,6 +1949,8 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
 
                 if data_href:
                     debug.log("[DATE SELECT] Navigating via button[data-href]...")
+                    if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+                        return False
                     await navigate_page_if_enabled(tab, data_href)
                     is_date_clicked = True
                     click_method_used = "button[data-href]"
@@ -1936,6 +1969,8 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
                 link = await target_area.query_selector('a[href]')
                 if link:
                     debug.log("[DATE SELECT] Link found in target_area, clicking...")
+                    if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+                        return False
                     await link.click()
                     is_date_clicked = True
                     click_method_used = "link <a[href]>"
@@ -1947,6 +1982,8 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
                     button = await target_area.query_selector('button')
                     if button:
                         debug.log("[DATE SELECT] Regular button found in target_area, clicking...")
+                        if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+                            return False
                         await button.click()
                         is_date_clicked = True
                         click_method_used = "regular button"
@@ -1970,24 +2007,15 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
 
     # Auto refresh if no date was selected (for strict mode or sold out scenarios)
     if not is_date_clicked and _is_page_reload_enabled(config_dict, debug, "DATE SELECT"):
-        # Simple wait mode (consistent with TicketPlus/iBon/FamiTicket)
-        interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
-        if interval > 0:
-            debug.log(f"[DATE SELECT] Waiting {interval}s before reload...")
-            await asyncio.sleep(interval)
-
-        debug.log(f"[DATE SELECT] No date selected, reloading page...")
-        try:
-            await reload_page_if_enabled(tab)
-        except Exception:
-            pass
+        await _tixcraft_reload_after_wait(tab, config_dict, document_id)
 
     return is_date_clicked
 
 async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
     # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
+    if await _tixcraft_actions_paused(config_dict):
         return False
+    document_id = await _tixcraft_document_id(tab)
 
     debug = util.create_debug_logger(config_dict)
 
@@ -2112,9 +2140,13 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
                 pass  # If text extraction fails, skip logging
 
         try:
+            if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+                return False
             await target_area.click()
         except:
             try:
+                if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+                    return False
                 # Element.apply, not Element.evaluate: zendriver defines
                 # evaluate on Tab only and Element.__getattr__ returns None for
                 # unknown names, so .evaluate(...) is a TypeError.
@@ -2124,16 +2156,7 @@ async def nodriver_tixcraft_area_auto_select(tab, url, config_dict):
 
     # Auto refresh if needed (simple wait mode, consistent with TicketPlus/iBon/FamiTicket)
     if is_need_refresh and _is_page_reload_enabled(config_dict, debug, "AREA SELECT"):
-        interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
-        if interval > 0:
-            debug.log(f"[AREA SELECT] Waiting {interval}s before reload...")
-            await asyncio.sleep(interval)
-
-        debug.log(f"[AREA SELECT] Page reloading...")
-        try:
-            await reload_page_if_enabled(tab)
-        except Exception:
-            pass
+        await _tixcraft_reload_after_wait(tab, config_dict, document_id)
 
 async def nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item,
                                             area_list_cache=None, area_text_cache=None):
@@ -2280,618 +2303,545 @@ async def nodriver_get_tixcraft_target_area(el, config_dict, area_keyword_item,
 
     return is_need_refresh, matched_blocks
 
-async def nodriver_ticket_number_select_fill(tab, select_obj, ticket_number, select_id=None, allow_less_tickets=False):
-    """簡化版本：參考 Chrome 邏輯設定票券數量，並檢查 option 是否可用
+def _tixcraft_ticket_config_signature(config_dict):
+    """只保存選票設定，不包含登入或驗證資料。"""
+    return json.dumps({
+        'target': config_dict.get('ticket_number', 1),
+        'allow_less': config_dict.get('tixcraft', {}).get('allow_less_tickets', False),
+        'area': config_dict.get('area_auto_select', {}),
+        'exclude': config_dict.get('keyword_exclude', ''),
+        'fallback': config_dict.get('area_auto_fallback', False),
+    }, sort_keys=True, ensure_ascii=False)
 
-    Args:
-        tab: NoDriver tab object
-        select_obj: The select element (for compatibility)
-        ticket_number: Target ticket count to select
-        select_id: The specific select element ID to use (fixes Issue #200/#201)
-        allow_less_tickets: Allow selecting the largest available count below ticket_number
-    """
-    is_ticket_number_assigned = False
 
-    if select_obj is None and select_id is None:
-        return is_ticket_number_assigned
-
-    # Build JavaScript selector - prefer specific ID over querySelector
-    if select_id:
-        js_selector = f"document.getElementById('{select_id}')"
-    else:
-        js_selector = "document.querySelector('.mobile-select') || document.querySelector('select[id*=\"TicketForm_ticketPrice_\"]')"
-
+async def _tixcraft_ticket_snapshot(tab):
+    """一次讀取票種欄位；不把其他表單選單算成票券。"""
     try:
-        # 嘗試透過 JavaScript 設定選擇器的值，並檢查 option 是否 disabled
-        result = await tab.evaluate(f'''
-            (function() {{
-                const select = {js_selector};
-                if (!select) return {{success: false, error: "Select not found"}};
+        result = await tab.evaluate(r'''(() => {
+            const sold=['選購一空','已售完','Sold out','No tickets available','空席なし','完売した'];
+            const rows=Array.from(document.querySelectorAll('select[id^="TicketForm_ticketPrice_"]')).map(s=>{
+                const row=s.closest('tr'),label=row?.querySelector('h4')||row?.querySelector('td.fcBlue');
+                const validValue=s.value===''||/^\d+$/.test(s.value);
+                return {id:s.id,name:(label?.textContent||'').trim(),value:validValue?Number(s.value):null,
+                    validValue,disabled:s.matches(':disabled'),options:Array.from(s.options).filter(o=>
+                        !o.disabled&&!o.closest('optgroup')?.disabled&&/^\d+$/.test(o.value)&&Number(o.value)>0&&
+                        !sold.includes((o.textContent||'').trim())).map(o=>Number(o.value))};
+            });
+            return {document_id:location.href+'|'+performance.timeOrigin,rows};
+        })()''')
+        return result if isinstance(result, dict) and isinstance(result.get('rows'), list) else None
+    except Exception:
+        return None
 
-                // 售完關鍵字列表
-                const soldOutKeywords = ["選購一空", "已售完", "Sold out", "No tickets available", "空席なし", "完売した"];
 
-                // 先嘗試設定目標數量（檢查是否 disabled 或售完）
-                const targetOption = Array.from(select.options).find(opt =>
-                    opt.value === "{ticket_number}" &&
-                    !opt.disabled &&
-                    !soldOutKeywords.includes(opt.value)
-                );
+def _tixcraft_ticket_count_ok(count, target, allow_less):
+    return (isinstance(count, (int, float)) and not isinstance(count, bool)
+            and 0 < count < float('inf') and count == int(count)
+            and (count == target or (allow_less and count < target)))
 
-                if (targetOption) {{
-                    select.value = "{ticket_number}";
-                    select.selectedIndex = targetOption.index;
-                    select.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return {{success: true, selected: "{ticket_number}"}};
-                }}
 
-                if (!{str(bool(allow_less_tickets)).lower()}) {{
-                    return {{success: false, error: "Target ticket count unavailable"}};
-                }}
+def _tixcraft_ticket_state_valid(snapshot, record):
+    if not snapshot or not record or snapshot.get('document_id') != record.get('document_id'):
+        return False
+    rows = snapshot['rows']
+    selected = [row for row in rows if row.get('id') == record.get('select_id')]
+    if len(selected) != 1 or len({row.get('id') for row in rows}) != len(rows):
+        return False
+    chosen = selected[0]
+    count = chosen.get('value')
+    if (chosen.get('disabled') or not _tixcraft_ticket_count_ok(count, record.get('target', 0), record.get('allow_less', False))
+            or count != record.get('count') or count not in chosen.get('options', [])):
+        return False
+    return all(row.get('validValue') and (row.get('value') == count if row is chosen else row.get('value') == 0)
+               for row in rows)
 
-                // Fallback: select max available option below target ticket count.
-                const validOptions = Array.from(select.options).filter(opt =>
-                    !opt.disabled &&
-                    !soldOutKeywords.includes(opt.value) &&
-                    parseInt(opt.value) > 0 &&
-                    parseInt(opt.value) < parseInt("{ticket_number}") &&
-                    !isNaN(parseInt(opt.value))
-                );
 
-                if (validOptions.length > 0) {{
-                    const maxOption = validOptions.reduce((max, opt) =>
-                        parseInt(opt.value) > parseInt(max.value) ? opt : max
-                    );
-                    select.value = maxOption.value;
-                    select.selectedIndex = maxOption.index;
-                    select.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return {{success: true, selected: maxOption.value, fallback: true}};
-                }}
+async def _tixcraft_ticket_selection_valid(tab, config_dict):
+    """唯讀核對文件、目標票種、目前設定及全表張數。"""
+    record = _state.get('tixcraft_ticket_selection')
+    if not record or record.get('config_signature') != _tixcraft_ticket_config_signature(config_dict):
+        return False
+    snapshot = await _tixcraft_ticket_snapshot(tab)
+    return _tixcraft_ticket_state_valid(snapshot, record)
 
-                return {{success: false, error: "No valid options (all disabled or sold out)"}};
-            }})();
-        ''')
 
-        # 解析結果
-        result = util.parse_nodriver_result(result)
-        if isinstance(result, dict):
-            is_ticket_number_assigned = result.get('success', False)
-
-    except Exception as exc:
-        pass
-
-    return is_ticket_number_assigned
-
-async def nodriver_tixcraft_assign_ticket_number(tab, config_dict):
-    """
-    Enhanced ticket type selection with keyword matching support
-    支援票種關鍵字選擇（indievox 類型 B 頁面：直接跳到 /ticket/ticket/）
-    """
-    # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
+async def _tixcraft_fill_generic_ticket_select(select_obj, target, allow_less):
+    """相容其他家族的單一已知選單，不掃描或變更其他表單欄位。"""
+    if select_obj is None:
+        return False
+    try:
+        result = await select_obj.apply(r'''async (select) => {
+            if(select.tagName!=='SELECT'||!select.isConnected||select.matches(':disabled'))return false;
+            const target=TARGET,allowLess=ALLOW_LESS;
+            const sold=['選購一空','已售完','Sold out','No tickets available','空席なし','完売した'];
+            const options=Array.from(select.options).filter(o=>!o.disabled&&!o.closest('optgroup')?.disabled&&
+                /^\d+$/.test(o.value)&&Number(o.value)>0&&!sold.includes((o.textContent||'').trim()));
+            let option=options.find(o=>Number(o.value)===target);
+            if(!option&&allowLess)option=options.filter(o=>Number(o.value)<target).sort((a,b)=>Number(b.value)-Number(a.value))[0];
+            if(!option)return false;
+            const wanted=option.value;
+            if(select.value!==wanted){select.value=wanted;select.dispatchEvent(new Event('change',{bubbles:true}));}
+            await Promise.resolve();
+            return select.isConnected&&!select.matches(':disabled')&&select.value===wanted&&
+                select.selectedOptions.length===1&&!select.selectedOptions[0].disabled&&
+                !select.selectedOptions[0].closest('optgroup')?.disabled;
+        }'''.replace('TARGET', json.dumps(target)).replace('ALLOW_LESS', json.dumps(bool(allow_less))), await_promise=True)
+        return result is True
+    except Exception:
         return False
 
+
+async def nodriver_ticket_number_select_fill(tab, select_obj, ticket_number, select_id=None, allow_less_tickets=False):
+    """僅設定指定票種，清除其他已選票種並讀回驗證，未知結果不算成功。"""
+    if await _tixcraft_actions_paused():
+        return False
+    try:
+        target = int(ticket_number)
+        if isinstance(ticket_number, bool) or target <= 0 or float(ticket_number) != target:
+            return False
+        if not select_id and select_obj is not None:
+            await select_obj.update()
+            select_id = (select_obj.attrs or {}).get('id')
+        if not isinstance(select_id, str) or not select_id.startswith('TicketForm_ticketPrice_'):
+            if select_obj is None and isinstance(select_id, str):
+                select_obj = await tab.query_selector('select[id=' + json.dumps(select_id) + ']')
+            return await _tixcraft_fill_generic_ticket_select(select_obj, target, allow_less_tickets)
+        record = _state.get('tixcraft_ticket_selection', {})
+        expected = record.get('document_id') if record.get('select_id') == select_id else None
+        result = await tab.evaluate(r'''(async (id,target,allowLess,expected) => {
+            const documentId=location.href+'|'+performance.timeOrigin;
+            if(expected&&expected!==documentId)return {success:false};
+            const selector='select[id^="TicketForm_ticketPrice_"]';
+            const fields=()=>Array.from(document.querySelectorAll(selector));
+            let rows=fields(),chosen=rows.filter(s=>s.id===id);
+            if(chosen.length!==1||new Set(rows.map(s=>s.id)).size!==rows.length)return {success:false};
+            const select=chosen[0],sold=['選購一空','已售完','Sold out','No tickets available','空席なし','完売した'];
+            if(select.matches(':disabled'))return {success:false};
+            const options=Array.from(select.options).filter(o=>!o.disabled&&!o.closest('optgroup')?.disabled&&
+                /^\d+$/.test(o.value)&&Number(o.value)>0&&!sold.includes((o.textContent||'').trim()));
+            let option=options.find(o=>Number(o.value)===target);
+            if(!option&&allowLess)option=options.filter(o=>Number(o.value)<target).sort((a,b)=>Number(b.value)-Number(a.value))[0];
+            if(!option)return {success:false};
+            for(const other of rows){
+                if(other===select||other.value==='0'||other.value==='')continue;
+                if(!/^\d+$/.test(other.value)||!Array.from(other.options).some(o=>o.value==='0'))return {success:false};
+                other.value='0';other.dispatchEvent(new Event('change',{bubbles:true}));
+                await Promise.resolve();
+                if(!other.isConnected||other.value!=='0')return {success:false};
+            }
+            if(!select.isConnected||select.matches(':disabled')||option.disabled||!option.isConnected)return {success:false};
+            const wanted=option.value;
+            if(select.value!==wanted){select.value=wanted;select.dispatchEvent(new Event('change',{bubbles:true}));}
+            await Promise.resolve();
+            rows=fields();
+            const selected=Array.from(select.selectedOptions);
+            const success=location.href+'|'+performance.timeOrigin===documentId&&select.isConnected&&
+                !select.matches(':disabled')&&rows.filter(s=>s.id===id).length===1&&rows.includes(select)&&
+                select.value===wanted&&selected.length===1&&!selected[0].disabled&&
+                !selected[0].closest('optgroup')?.disabled&&rows.every(s=>s===select||s.value==='0'||s.value==='');
+            return {success,document_id:documentId,count:Number(select.value)};
+        })(SELECT_ID, TARGET, ALLOW_LESS, EXPECTED)'''.replace('SELECT_ID', json.dumps(select_id)).replace(
+            'TARGET', json.dumps(target)).replace('ALLOW_LESS', json.dumps(bool(allow_less_tickets))).replace(
+            'EXPECTED', json.dumps(expected)), await_promise=True)
+        if not isinstance(result, dict) or result.get('success') is not True:
+            return False
+        if record.get('select_id') == select_id and record.get('document_id') == result.get('document_id'):
+            record['count'] = result['count']
+        else:
+            record = {'document_id': result['document_id'], 'select_id': select_id,
+                      'target': target, 'allow_less': bool(allow_less_tickets), 'count': result['count']}
+        return _tixcraft_ticket_state_valid(await _tixcraft_ticket_snapshot(tab), record)
+    except Exception:
+        return False
+
+
+def _tixcraft_ticket_candidates(snapshot, config_dict):
+    raw_target = config_dict.get('ticket_number', 1)
+    target = int(raw_target)
+    if isinstance(raw_target, bool) or target <= 0 or float(raw_target) != target:
+        return [], []
+    allow_less = config_dict.get('tixcraft', {}).get('allow_less_tickets', False)
+    eligible, candidates = [], []
+    for row in snapshot['rows']:
+        name = row.get('name', '')
+        if row.get('disabled') or not row.get('options'):
+            continue
+        if name and util.reset_row_text_if_match_keyword_exclude(config_dict, name):
+            continue
+        eligible.append(row)
+        counts = [count for count in row['options'] if _tixcraft_ticket_count_ok(count, target, allow_less)]
+        if counts:
+            candidates.append({**row, 'count': max(counts)})
+    return eligible, candidates
+
+
+def _tixcraft_pick_ticket_candidate(eligible, candidates, config_dict):
+    keywords = util.parse_keyword_string_to_array(config_dict['area_auto_select']['area_keyword'].strip())
+    for group in keywords:
+        if not isinstance(group, str):
+            continue
+        parts = [util.format_keyword_string(word) for word in group.split(' ')]
+        for candidate in candidates:
+            if all(word in util.format_keyword_string(candidate.get('name', '')) for word in parts):
+                return candidate
+    # 單票種頁的區域關鍵字常不等於票種名，沿用原本直接選取的行為。
+    if len(eligible) == 1 and len(candidates) == 1:
+        return candidates[0]
+    if keywords and not config_dict.get('area_auto_fallback', False):
+        return None
+    return util.get_target_item_from_matched_list(candidates, config_dict['area_auto_select']['mode'])
+
+
+async def nodriver_tixcraft_assign_ticket_number(tab, config_dict):
+    """先依可購張數篩選，再依原關鍵字優先順序選票種。"""
+    if await check_and_handle_pause(config_dict):
+        return False, None, None
     debug = util.create_debug_logger(config_dict)
-    is_ticket_number_assigned = False
-
-    # 等待票券選擇器出現（智慧等待，取代固定 0.5 秒延遲）
+    _state.pop('tixcraft_ticket_selection', None)
+    snapshot = await _tixcraft_ticket_snapshot(tab)
+    if not snapshot or not snapshot['rows']:
+        return False, None, None
     try:
-        await tab.wait_for('.mobile-select, select[id*="TicketForm_ticketPrice_"]', timeout=2)
-    except:
-        pass  # Continue even if timeout, will try to find selectors below
-
-    # 查找票券選擇器
-    form_select_list = []
-    try:
-        form_select_list = await tab.query_selector_all('.mobile-select')
-    except Exception as exc:
-        debug.log("Failed to find .mobile-select")
-
-    # 如果沒找到 .mobile-select，嘗試其他選擇器
-    if len(form_select_list) == 0:
-        try:
-            form_select_list = await tab.query_selector_all('select[id*="TicketForm_ticketPrice_"]')
-        except Exception as exc:
-            debug.log("Failed to find ticket selector")
-
-    form_select_count = len(form_select_list)
-
-    if form_select_count > 0:
-        debug.log(f"[TICKET SELECT] Found {form_select_count} select element(s)")
-
-    # Get area keyword configuration
-    import json
-    area_keyword = config_dict["area_auto_select"]["area_keyword"].strip()
-    area_auto_fallback = config_dict.get('area_auto_fallback', False)
-    auto_select_mode = config_dict["area_auto_select"]["mode"]
-
-    # Parse keywords using JSON
-    area_keyword_array = util.parse_keyword_string_to_array(area_keyword)
-    if area_keyword_array:
-        debug.log(f"[TICKET SELECT] Area keywords: {area_keyword_array}")
-
-    # 過濾並收集票種資訊（包含票種名稱）
-    valid_ticket_types = []
-    sold_out_keywords = ["選購一空", "已售完", "Sold out", "No tickets available", "空席なし", "完売した"]
-
-    # 使用 NoDriver Element API 檢查每個 select 元素
-    for idx, select_element in enumerate(form_select_list):
-        try:
-            # 更新元素以確保屬性載入
-            await select_element.update()
-
-            # 檢查 select 是否 disabled
-            select_attrs = select_element.attrs or {}
-            select_id = select_attrs.get('id', f'select_{idx}')
-            is_select_disabled = 'disabled' in select_attrs
-
-            if is_select_disabled:
-                debug.log(f"[TICKET SELECT] Skipping disabled select: {select_id}")
-                continue
-
-            # 檢查 option 元素
-            option_elements = await select_element.query_selector_all('option')
-            has_valid_option = False
-            option_values = []
-
-            for option_element in option_elements:
-                try:
-                    await option_element.update()
-                    option_attrs = option_element.attrs or {}
-                    option_value = option_attrs.get('value', '')
-                    option_text = option_element.text or ''
-                    option_disabled = 'disabled' in option_attrs
-
-                    option_values.append(option_value)
-
-                    # 檢查是否為有效選項
-                    if (option_value != "0" and
-                        not option_disabled and
-                        option_value not in sold_out_keywords and
-                        option_text not in sold_out_keywords):
-                        has_valid_option = True
-
-                except Exception as opt_exc:
-                    debug.log(f"[TICKET SELECT] Error checking option: {opt_exc}")
-                    continue
-
-            if not has_valid_option:
-                debug.log(f"[TICKET SELECT] Skipping select (all options sold out or disabled): {select_id}")
-                continue
-
-            # 嘗試獲取票種名稱（從父元素 <tr> 中的 <h4> 或 <td> 提取）
-            ticket_type_name = ""
-            try:
-                # 查找父元素 <tr>
-                parent_row = select_element
-                for _ in range(5):  # 最多向上查找 5 層
-                    parent_row = parent_row.parent
-                    if parent_row and parent_row.tag.lower() == 'tr':
-                        break
-
-                if parent_row and parent_row.tag.lower() == 'tr':
-                    # Read the whole cell, not Element.text: that property returns
-                    # only the first text node, so a name split across nested tags
-                    # (e.g. <a>full</a>+<a>voucher</a>) would lose everything after
-                    # the first fragment. Stay scoped to the name cell -- widening
-                    # this to the <tr> would pull in the remark column, whose text
-                    # can match keyword_exclude and wipe out every row.
-                    name_element = await parent_row.query_selector('h4')
-                    if not name_element:
-                        name_element = await parent_row.query_selector('td.fcBlue')
-
-                    if name_element:
-                        name_html = await name_element.get_html()
-                        ticket_type_name = util.remove_html_tags(name_html)
-
-            except Exception as name_exc:
-                debug.log(f"[TICKET SELECT] Failed to extract ticket type name: {name_exc}")
-
-            # Apply keyword_exclude here so keyword matching and fallback share one
-            # clean candidate list -- an excluded ticket type can never be picked
-            # by the fallback branch below (same invariant as cityline's
-            # _cityline_collect_available_areas).
-            #
-            # Guard the empty name: is_row_match_keyword reports a match for
-            # empty text, so a ticket type whose name could not be read would
-            # otherwise count as excluded and drop out of the fallback too.
-            if ticket_type_name and util.reset_row_text_if_match_keyword_exclude(config_dict, ticket_type_name):
-                debug.log(f"[TICKET SELECT] Excluded by keyword_exclude: '{ticket_type_name}'")
-                continue
-
-            # 加入 valid_ticket_types
-            valid_ticket_types.append({
-                'select': select_element,
-                'id': select_id,
-                'name': ticket_type_name,
-                'index': idx
-            })
-
-            debug.log(f"[TICKET SELECT] Valid ticket type: {select_id} - '{ticket_type_name}'")
-
-        except Exception as exc:
-            debug.log(f"[TICKET SELECT] Error checking select element: {exc}")
-
-    debug.log(f"[TICKET SELECT] Valid ticket types: {len(valid_ticket_types)}/{form_select_count}")
-
-    if len(valid_ticket_types) == 0:
-        debug.log("[TICKET SELECT] Warning: All ticket types are sold out or disabled")
+        eligible, candidates = _tixcraft_ticket_candidates(snapshot, config_dict)
+        chosen = _tixcraft_pick_ticket_candidate(eligible, candidates, config_dict)
+        if not chosen:
+            debug.log('[TICKET SELECT] 沒有可滿足票數與關鍵字的票種。')
+            return False, None, None
+        select_id = chosen['id']
+        select_obj = await tab.query_selector('select[id=' + json.dumps(select_id) + ']')
+        if not select_obj:
+            return False, None, None
+        target = int(config_dict.get('ticket_number', 1))
+        allow_less = config_dict.get('tixcraft', {}).get('allow_less_tickets', False)
+        count = chosen['value'] if _tixcraft_ticket_count_ok(chosen.get('value'), target, allow_less) else chosen['count']
+        record = {'document_id': snapshot['document_id'], 'select_id': select_id, 'target': target,
+                  'allow_less': bool(allow_less), 'count': count,
+                  'config_signature': _tixcraft_ticket_config_signature(config_dict)}
+        _state['tixcraft_ticket_selection'] = record
+        assigned = _tixcraft_ticket_state_valid(snapshot, record)
+        debug.log(f'[TICKET SELECT] 選定票種：{chosen.get("name", "")}，目標 {target} 張，已核對：{assigned}')
+        return assigned, select_obj, select_id
+    except Exception:
         return False, None, None
 
-    # Keyword matching logic (similar to area selection)
-    matched_ticket = None
-    is_keyword_matched = False
-
-    if area_keyword_array:
-        debug.log(f"[TICKET SELECT] Starting keyword matching with {len(area_keyword_array)} keyword(s)")
-
-        for keyword_index, keyword_item in enumerate(area_keyword_array):
-            debug.log(f"[TICKET SELECT] Checking keyword #{keyword_index + 1}: '{keyword_item}'")
-
-            # Check each valid ticket type
-            for ticket_info in valid_ticket_types:
-                ticket_name = ticket_info['name']
-
-                # Keyword matching (support space-separated AND logic)
-                keyword_parts = keyword_item.split(' ')
-                row_text = util.format_keyword_string(ticket_name)
-                is_match = True
-
-                for kw in keyword_parts:
-                    formatted_kw = util.format_keyword_string(kw)
-                    if formatted_kw not in row_text:
-                        is_match = False
-                        break
-
-                if is_match:
-                    matched_ticket = ticket_info
-                    is_keyword_matched = True
-                    debug.log(f"[TICKET SELECT]   [OK] Keyword matched: '{ticket_name}'")
-                    break
-
-            if matched_ticket:
-                break  # Early return: first match wins
-
-        if not matched_ticket:
-            debug.log(f"[TICKET SELECT] All keywords failed to match")
-
-    # Single option auto-select: when only one valid ticket type exists, select it
-    # directly. keyword_exclude was already applied while collecting candidates.
-    if not matched_ticket and len(valid_ticket_types) == 1:
-        matched_ticket = valid_ticket_types[0]
-        debug.log(f"[TICKET SELECT] Single option auto-select: '{matched_ticket['name']}'")
-
-    # Fallback logic (similar to area selection)
-    if not matched_ticket:
-        if area_keyword_array and not area_auto_fallback:
-            # Strict mode: no keyword match and fallback disabled
-            debug.log(f"[TICKET SELECT] area_auto_fallback=false, fallback is disabled")
-            debug.log(f"[TICKET SELECT] No ticket type selected")
-            return False, None, None
-        else:
-            # Fallback enabled or no keyword specified
-            if area_keyword_array:
-                debug.log(f"[TICKET SELECT] area_auto_fallback=true, using fallback selection")
-
-            # Select based on auto_select_mode
-            matched_ticket = util.get_target_item_from_matched_list(
-                [t['select'] for t in valid_ticket_types],
-                auto_select_mode
-            )
-            # Find the ticket_info for the matched select
-            for ticket_info in valid_ticket_types:
-                if ticket_info['select'] == matched_ticket:
-                    matched_ticket = ticket_info
-                    break
-
-            if matched_ticket:
-                selection_type = "fallback" if area_keyword_array else "mode-based"
-                debug.log(f"[TICKET SELECT] Selected ticket type ({selection_type}): '{matched_ticket['name']}'")
-
-    # Use the matched ticket select
-    select_obj = matched_ticket['select'] if matched_ticket else None
-    form_select_count = len(valid_ticket_types)
-
-    # Get select ID for JavaScript operations
-    select_id = matched_ticket['id'] if matched_ticket else None
-
-    # 檢查是否已經選擇了符合設定的票券數量
-    if select_id:
-        try:
-            # 使用 JavaScript 取得當前選中的值（使用正確的 select ID）
-            current_value = await tab.evaluate(f'''
-                (function() {{
-                    const select = document.getElementById('{select_id}');
-                    return select ? select.value : "0";
-                }})();
-            ''')
-
-            # 解析結果
-            current_value = util.parse_nodriver_result(current_value)
-
-            if current_value and current_value != "0" and str(current_value).isnumeric():
-                target_ticket_number = int(config_dict.get("ticket_number", 1))
-                current_ticket_number = int(current_value)
-                allow_less_tickets = config_dict.get("tixcraft", {}).get("allow_less_tickets", False)
-                is_expected_count = current_ticket_number == target_ticket_number
-                is_allowed_less_count = allow_less_tickets and 0 < current_ticket_number < target_ticket_number
-                if is_expected_count or is_allowed_less_count:
-                    is_ticket_number_assigned = True
-                    debug.log(f"Ticket number already set to: {current_value}")
-        except Exception as exc:
-            debug.log(f"Failed to check current selected value: {exc}")
-
-    # 回傳結果：select_obj 和 select_id 用於後續操作
-    return is_ticket_number_assigned, select_obj, select_id
 
 async def nodriver_tixcraft_ticket_main_agree(tab, config_dict):
     debug = util.create_debug_logger(config_dict)
-
-    debug.log("Starting to check agreement checkbox")
-
     for i in range(3):
-        is_finish_checkbox_click = await nodriver_check_checkbox_enhanced(tab, '#TicketForm_agree', config_dict)
-        if is_finish_checkbox_click:
-            debug.log("Agreement checkbox checked successfully")
-            break
-        else:
-            debug.log(f"Failed to check agreement, retry {i+1}/3")
-            # The page is often still rendering on the first pass; space the
-            # retries so they do not all read the same unfinished DOM.
-            await tab.sleep(0.3)
-
-    if not is_finish_checkbox_click:
-        debug.log("Warning: Failed to check agreement checkbox")
+        if await _tixcraft_actions_paused(config_dict):
+            return False
+        if await nodriver_check_checkbox_enhanced(tab, '#TicketForm_agree', config_dict):
+            return True
+        if await _tixcraft_sleep(0.3, config_dict):
+            return False
+    debug.log('[TIXCRAFT] 尚未確認購票條款已勾選，暫不送出。')
+    return False
 
 async def nodriver_tixcraft_ticket_main(tab, config_dict, ocr, Captcha_Browser, domain_name):
-    # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
+    """每輪以實際文件及全表張數確認狀態，不沿用同網址的完成旗標。"""
+    if await _tixcraft_actions_paused(config_dict):
+        return False
+    if await _tixcraft_submission_pending(tab, config_dict):
         return False
     debug = util.create_debug_logger(config_dict)
-
-    # 檢查是否已經設定過票券數量（方案 B：狀態標記）
-    current_url, _ = await nodriver_current_url(tab)
+    document_id = await _tixcraft_document_id(tab)
+    if not document_id:
+        return False
     ticket_number = str(config_dict["ticket_number"])
     allow_less_tickets = config_dict.get("tixcraft", {}).get("allow_less_tickets", False)
-    ticket_state_key = f"ticket_assigned_{current_url}_{ticket_number}_{int(allow_less_tickets)}"
-
-    # Skip this iteration while a captcha submit is in flight (awaiting navigation).
-    if _state.get("captcha_submit_until", 0) > time.time():
-        debug.log("[TIXCRAFT OCR] Submit in progress, waiting for navigation")
-        return
-
-    if ticket_state_key in _state and _state[ticket_state_key]:
-        debug.log(f"Ticket number already set ({ticket_number}), skipping")
-
-        # Ensure agreement checkbox is checked (even if ticket number already set)
-        await nodriver_tixcraft_ticket_main_agree(tab, config_dict)
-
-        # Reset OCR state if captcha alert detected (wrong answer submitted)
-        if _state.get("captcha_alert_detected", False):
-            _state["ocr_completed_url"] = ""
-            _state["captcha_alert_detected"] = False
-
-        # Skip OCR if already completed on this URL (non-force_submit mode only)
-        is_force_submit = config_dict["ocr_captcha"]["force_submit"]
-        if is_force_submit or _state.get("ocr_completed_url", "") != current_url:
-            await nodriver_tixcraft_ticket_main_ocr(tab, config_dict, ocr, Captcha_Browser, domain_name)
-        return
-
-    # Always check agreement checkbox in NoDriver mode
-    await nodriver_tixcraft_ticket_main_agree(tab, config_dict)
-
-    is_ticket_number_assigned = False
-
-    # PS: some events on tixcraft have multi <select>.
-    # Fix Issue #200/#201: Now returns select_id for correct element targeting
-    is_ticket_number_assigned, select_obj, select_id = await nodriver_tixcraft_assign_ticket_number(tab, config_dict)
-
-    if not is_ticket_number_assigned:
-        debug.log(f"Setting ticket number: {ticket_number}")
-        is_ticket_number_assigned = await nodriver_ticket_number_select_fill(
-            tab,
-            select_obj,
-            ticket_number,
-            select_id,
-            allow_less_tickets=allow_less_tickets,
-        )
-
-    # Record state after successful setting
-    if is_ticket_number_assigned:
-        _state[ticket_state_key] = True
-        debug.log("Ticket number set successfully, starting OCR captcha processing")
+    if not await _tixcraft_ticket_selection_valid(tab, config_dict):
+        assigned, select_obj, select_id = await nodriver_tixcraft_assign_ticket_number(tab, config_dict)
+        if not assigned and select_obj is not None:
+            await nodriver_ticket_number_select_fill(
+                tab, select_obj, ticket_number, select_id, allow_less_tickets=allow_less_tickets)
+        if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+            return False
+        if not await _tixcraft_ticket_selection_valid(tab, config_dict):
+            debug.log('[TIXCRAFT] 張數未通過全表核對，暫不送出。')
+            await _tixcraft_reload_after_wait(tab, config_dict, document_id)
+            return False
+    if not await _tixcraft_action_allowed(tab, config_dict, document_id):
+        return False
+    if not await nodriver_tixcraft_ticket_main_agree(tab, config_dict):
+        return False
+    if await _tixcraft_ticket_selection_valid(tab, config_dict):
         await nodriver_tixcraft_ticket_main_ocr(tab, config_dict, ocr, Captcha_Browser, domain_name)
+
+async def _tixcraft_actions_paused(config_dict=None):
+    """每個可變更瀏覽器狀態的步驟都重新查暫停及結束。"""
+    return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
+
+
+async def _tixcraft_sleep(seconds, config_dict=None):
+    deadline = time.monotonic() + max(0, float(seconds))
+    while time.monotonic() < deadline:
+        if await _tixcraft_actions_paused(config_dict):
+            return True
+        await asyncio.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    return await _tixcraft_actions_paused(config_dict)
+
+
+async def _tixcraft_document_id(tab):
+    try:
+        value = await tab.evaluate("location.href + '|' + performance.timeOrigin")
+        return value if isinstance(value, str) and value else None
+    except Exception:
+        return None
+
+
+CONST_TIXCRAFT_CAPTCHA_ID_JS = r'''
+function captchaId(){
+    const img=document.querySelector('#TicketForm_verifyCode-image');
+    if(!img||!img.complete||!img.naturalWidth)return '';
+    let hash=0;
+    if(typeof jQuery!=='undefined'){
+        const data=jQuery('body').data('yiiCaptcha/ticket/captcha');
+        if(data&&data[0])hash=data[0];
+    }
+    return (img.currentSrc||img.src||'')+'|'+hash;
+}
+'''
+
+
+async def _tixcraft_mark_submission_rejected(tab):
+    """只在明確驗證碼錯誤視窗已關閉後標記，換碼前仍保持鎖定。"""
+    try:
+        await tab.evaluate(r'''(() => {
+            const key='ticketsHunter.tixcraft.submit',r=window[Symbol.for(key)];
+            const doc=location.href+'|'+performance.timeOrigin;
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            if(!saved||saved.route!==location.href)return;
+            if(r&&(r.documentId!==doc||saved.nonce!==r.nonce))return;
+            if(r)r.state='rejected';saved.state='rejected';sessionStorage.setItem(key,JSON.stringify(saved));
+        })()''')
+    except Exception:
+        pass
+
+
+async def _tixcraft_submission_handoff(tab):
+    """已到實際結帳頁才交接；清除提交鎖不代表訂單付款完成。"""
+    try:
+        cleared = await tab.evaluate(r'''(() => {
+            if(!/^\/ticket\/checkout(?:\/|$)/i.test(location.pathname))return false;
+            const key='ticketsHunter.tixcraft.submit';
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];return true;
+        })()''')
+    except Exception:
+        return False
+    if cleared:
+        _state.pop('tixcraft_submit_pending', None)
+        _state.pop('tixcraft_pending_notice', None)
+    return bool(cleared)
+
+
+async def _tixcraft_mark_submission_failed(tab):
+    """明確售完且視窗已關閉後，僅解除同場次同分頁的上一筆鎖。"""
+    try:
+        cleared = await tab.evaluate(r'''(() => {
+            const key='ticketsHunter.tixcraft.submit',r=window[Symbol.for(key)];
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            if(!saved||r&&r.nonce!==saved.nonce)return false;
+            const previous=new URL(saved.route),parts=location.pathname.split('/').filter(Boolean);
+            const old=previous.pathname.split('/').filter(Boolean);
+            if(previous.origin!==location.origin||old[0]!=='ticket'||old[1]!=='ticket'||
+               parts[0]!=='ticket'||!['ticket','area'].includes(parts[1])||
+               parts[2]!==old[2]||parts[3]!==old[3])return false;
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];return true;
+        })()''')
+    except Exception:
+        return False
+    if cleared:
+        _state.pop('tixcraft_submit_pending', None)
+        _state.pop('tixcraft_pending_notice', None)
+        util.write_instance_status('running', '網站已明確回覆票券售完，重新偵測票況。')
+    return bool(cleared)
+
+
+def _tixcraft_pending_notice(config_dict, identity):
+    if _state.get('tixcraft_pending_notice') == identity:
+        return
+    _state['tixcraft_pending_notice'] = identity
+    message = '上一筆送出尚待網站確認，暫不重新送出；請查看瀏覽器排隊或訂單結果。'
+    util.create_debug_logger(config_dict).log('[TIXCRAFT] ' + message)
+    util.write_instance_status('running', message)
+
+
+async def _tixcraft_submission_pending(tab, config_dict=None):
+    """結果未知時跨重連與 F5 保留鎖定，不能只靠時間或 URL 猜測。"""
+    try:
+        result = await tab.evaluate(r'''(() => {
+            CAPTCHA_ID
+            const doc=location.href+'|'+performance.timeOrigin,key='ticketsHunter.tixcraft.submit';
+            const r=window[Symbol.for(key)],saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            const captcha=captchaId();
+            const rejected=!!saved&&saved.state==='rejected';
+            const changedCaptcha=r?.documentId===doc&&r.state==='rejected'&&r.captcha&&captcha&&r.captcha!==captcha;
+            const newRejectedDocument=rejected&&saved.documentId!==doc&&!!captcha;
+            if(rejected&&(changedCaptcha||newRejectedDocument)){
+                sessionStorage.removeItem(key);delete window[Symbol.for(key)];
+                return {documentId:doc,pending:false,released:true};
+            }
+            return {documentId:doc,pending:!!saved||!!r,rejected,nonce:saved?.nonce};
+        })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS))
+    except Exception:
+        _tixcraft_pending_notice(config_dict, _state.get('tixcraft_submit_pending', 'unknown'))
+        return True
+    if not isinstance(result, dict) or not result.get('documentId'):
+        _tixcraft_pending_notice(config_dict, _state.get('tixcraft_submit_pending', 'unknown'))
+        return True
+    doc = result['documentId']
+    if result.get('released'):
+        _state.pop('tixcraft_submit_pending', None)
+        _state['captcha_alert_detected'] = False
+        _state['ocr_completed_url'] = ''
+        util.write_instance_status('running', '網站已明確拒絕上一筆且驗證碼已更新，繼續偵測與選票。')
+    pending = result.get('pending') is True or bool(_state.get('tixcraft_submit_pending'))
+    if pending:
+        _state.setdefault('tixcraft_submit_pending', doc)
+        _tixcraft_pending_notice(config_dict, doc)
+        if result.get('rejected'):
+            await _tixcraft_refresh_rejected(tab, config_dict, doc, result.get('nonce'))
     else:
-        # T026: Fix Issue #174 - reload page when ticket number cannot be set
-        # This prevents infinite loop when desired ticket count is unavailable
-        debug.log("[TICKET SELECT] Ticket count unavailable, reloading page to retry...")
+        if _state.pop('tixcraft_pending_notice', None) and not result.get('released'):
+            util.write_instance_status('running', '網站狀態已確認，繼續偵測與選票。')
+    return pending
+
+
+async def _tixcraft_refresh_rejected(tab, config_dict, document_id, nonce):
+    """已明確拒絕的同一筆只換圖一次；未知結果不能走此路徑。"""
+    if await _tixcraft_actions_paused(config_dict):
+        return
+    ocr_settings = (config_dict or {}).get('ocr_captcha', {})
+    force = bool(ocr_settings.get('force_submit') and ocr_settings.get('enable'))
+    state = 'manual'
+    if force:
         try:
-            # Wait based on auto_reload_page_interval setting
-            interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
-            if interval > 0:
-                await asyncio.sleep(interval)
-            await reload_page_if_enabled(tab)
-        except Exception as reload_exc:
-            debug.log(f"[TICKET SELECT] Reload failed: {reload_exc}")
+            state = await tab.evaluate(r'''(() => {
+                CAPTCHA_ID
+                const key='ticketsHunter.tixcraft.submit',r=window[Symbol.for(key)];
+                const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+                if(location.href+'|'+performance.timeOrigin!==EXPECTED||!r||r.documentId!==EXPECTED||
+                   r.nonce!==NONCE||saved?.nonce!==NONCE||saved.state!=='rejected'||r.state!=='rejected')return 'stale';
+                if(r.refreshRequested)return 'waiting';
+                if(!captchaId()||captchaId()!==r.captcha)return 'waiting';
+                if(typeof jQuery==='undefined')return 'manual';
+                const img=jQuery('#TicketForm_verifyCode-image');
+                if(!img.length||typeof img.yiiCaptcha!=='function')return 'manual';
+                r.refreshRequested=true;img.yiiCaptcha('refresh');return 'started';
+            })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace(
+                'EXPECTED', json.dumps(document_id)).replace('NONCE', json.dumps(nonce)))
+        except Exception:
+            state = 'manual'
+    if state == 'manual' and _state.get('captcha_rejected_notice') != nonce:
+        _state['captcha_rejected_notice'] = nonce
+        message = '網站已拒絕驗證碼，請手動點擊驗證碼換圖；確認新圖後才會解除送出防護。'
+        util.create_debug_logger(config_dict).log('[TIXCRAFT] ' + message)
+        util.write_instance_status('running', message)
 
-async def nodriver_tixcraft_keyin_captcha_code(tab, answer="", auto_submit=False, config_dict=None):
-    """輸入驗證碼到表單"""
-    debug = util.create_debug_logger(config_dict) if config_dict else util.create_debug_logger(enabled=False)
-    is_verifyCode_editing = False
-    is_form_submitted = False
 
-    # 找到驗證碼輸入框
-    form_verifyCode = await tab.query_selector('#TicketForm_verifyCode')
+async def _tixcraft_submit_form(tab, config_dict, require_captcha=False, expected_captcha=None):
+    """瀏覽器端以同一動作核對欄位、取得鎖定與觸發原生送出。"""
+    if await _tixcraft_actions_paused(config_dict) or await _tixcraft_submission_pending(tab, config_dict):
+        return False
+    document_id = await _tixcraft_document_id(tab)
+    if not document_id:
+        return False
+    is_ticketmaster = 'ticketmaster.' in document_id.split('|', 1)[0]
+    if not is_ticketmaster and not await _tixcraft_ticket_selection_valid(tab, config_dict):
+        _forget_ticket_assigned(document_id.split('|', 1)[0])
+        return False
+    if await _tixcraft_actions_paused(config_dict):
+        return False
+    selection = _state.get('tixcraft_ticket_selection', {})
+    _state['tixcraft_submit_pending'] = document_id
+    script = r'''(() => {
+        CAPTCHA_ID
+        const doc=location.href+'|'+performance.timeOrigin,key=Symbol.for('ticketsHunter.tixcraft.submit');
+        if(doc!==EXPECTED)return {state:'changed'};
+        if(window[key]||sessionStorage.getItem('ticketsHunter.tixcraft.submit'))return {state:'pending'};
+        const verify=document.querySelector('#TicketForm_verifyCode'),agree=document.querySelector('#TicketForm_agree');
+        const form=document.querySelector('#form-ticket-ticket')||verify?.form;
+        const rows=Array.from(document.querySelectorAll('select[id^="TicketForm_ticketPrice_"]'));
+        const positive=rows.filter(s=>Number(s.value)>0);
+        const total=positive.reduce((n,s)=>n+Number(s.value),0);
+        const countOk=TICKETMASTER||(positive.length===1&&new Set(rows.map(s=>s.id)).size===rows.length&&
+            rows.every(s=>s.value===''||/^\d+$/.test(s.value))&&positive[0].id===SELECT_ID&&total===COUNT&&
+            positive.every(s=>!s.matches(':disabled')&&Array.from(s.options).some(o=>
+                o.value===s.value&&!o.disabled&&!o.closest('optgroup')?.disabled))&&
+            Number.isInteger(total)&&(ALLOW_LESS?(total>0&&total<=AMOUNT):total===AMOUNT));
+        if(!countOk||!agree?.checked||(CAPTCHA&&(!verify||verify.disabled||verify.value.length!==4)))
+            return {state:'not_ready'};
+        if(CHECK_CHALLENGE&&captchaId()!==CHECK_CHALLENGE)return {state:'not_ready'};
+        if(!form||!form.checkValidity())return {state:'not_ready'};
+        const button=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');
+        if(!button||button.matches(':disabled'))return {state:'not_ready'};
+        const nonce=globalThis.crypto?.randomUUID?.()||Date.now().toString(36)+'-'+Math.random().toString(36);
+        const record={documentId:doc,state:'invoked',captcha:captchaId(),nonce};
+        try{sessionStorage.setItem('ticketsHunter.tixcraft.submit',JSON.stringify({documentId:doc,route:location.href,nonce:record.nonce,state:record.state}));}
+        catch(_){return {state:'not_ready'};}
+        window[key]=record;
+        try{button.click();return {state:'invoked'};}catch(_){return {state:'unknown'};}
+    })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('EXPECTED', json.dumps(document_id)).replace(
+        'TICKETMASTER', json.dumps(is_ticketmaster)).replace('ALLOW_LESS', json.dumps(bool(
+            config_dict.get('tixcraft', {}).get('allow_less_tickets', False)))).replace(
+        'AMOUNT', json.dumps(config_dict.get('ticket_number', 2))).replace(
+        'CHECK_CHALLENGE', json.dumps(expected_captcha)).replace('CAPTCHA', json.dumps(require_captcha)).replace(
+        'SELECT_ID', json.dumps(selection.get('select_id'))).replace('COUNT', json.dumps(selection.get('count')))
+    try:
+        result = await tab.evaluate(script)
+    except Exception:
+        return False  # 回應遺失時保留 Python 鎖定，不猜測剛才沒有送出。
+    state = result.get('state') if isinstance(result, dict) else 'unknown'
+    if state in ('not_ready', 'changed'):
+        _state.pop('tixcraft_submit_pending', None)
+    return state in ('invoked', 'pending')
 
-    if form_verifyCode:
-        is_visible = False
-        try:
-            # 檢查元素是否可見和可用
-            is_visible = await tab.evaluate('''
-                (function() {
-                    const element = document.querySelector('#TicketForm_verifyCode');
-                    return element && !element.disabled && element.offsetParent !== null;
-                })();
-            ''')
-        except Exception as exc:
-            pass
 
-        if is_visible:
-            # 取得當前輸入值
-            inputed_value = ""
-            try:
-                inputed_value = await form_verifyCode.apply('function (element) { return element.value; }') or ""
-            except Exception as exc:
-                pass
-
-            is_text_clicked = False
-
-            if not inputed_value and not answer:
-                # 聚焦到輸入框等待手動輸入
-                try:
-                    await form_verifyCode.click()
-                    is_text_clicked = True
-                    is_verifyCode_editing = True
-                except Exception as exc:
-                    debug.log("[TIXCRAFT CAPTCHA] Failed to click captcha input, trying JavaScript")
-                    try:
-                        await tab.evaluate('''
-                            document.getElementById("TicketForm_verifyCode").focus();
-                        ''')
-                        is_verifyCode_editing = True
-                    except Exception as exc:
-                        pass
-
-            if answer:
-                debug.log("[TIXCRAFT CAPTCHA] Starting to fill in captcha...")
-                try:
-                    if not is_text_clicked:
-                        await form_verifyCode.click()
-
-                    # 清空並輸入答案
-                    await form_verifyCode.apply('function (element) { element.value = ""; }')
-                    await form_verifyCode.send_keys(answer)
-
-                    if auto_submit:
-                        # 提交前確認票券數量是否已設定
-                        ticket_number = str(config_dict.get("ticket_number", 2)) if config_dict else "2"
-                        allow_less_tickets = config_dict.get("tixcraft", {}).get("allow_less_tickets", False) if config_dict else False
-                        # Issue #200/#201: some tixcraft events render multiple ticket
-                        # quantity selects; inspect every visible select, not just the first.
-                        ticket_number_ok = await tab.evaluate(f'''
-                            (function() {{
-                                if (window.location.href.includes('ticketmaster')) return true;
-                                const target = parseInt("{ticket_number}");
-                                const allowLess = {str(bool(allow_less_tickets)).lower()};
-                                const selects = Array.from(document.querySelectorAll(
-                                    '.mobile-select, select[id*="TicketForm_ticketPrice_"]'
-                                )).filter(s => s && !s.disabled);
-                                return selects.some(s => {{
-                                    if (s.value === "0" || s.value === "") return false;
-                                    const current = parseInt(s.value);
-                                    if (isNaN(current) || isNaN(target)) return false;
-                                    return allowLess ? (current > 0 && current <= target) : (current === target);
-                                }});
-                            }})();
-                        ''')
-                        ticket_number_ok = util.parse_nodriver_result(ticket_number_ok)
-
-                        if not ticket_number_ok and config_dict:
-                            debug.log("[TIXCRAFT CAPTCHA] Warning: Ticket number not set, resetting...")
-                            # Reset ticket number across all selects. Honor allow_less_tickets:
-                            # when disabled only set the exact target option; otherwise fall back
-                            # to the largest option within (0, target] (leave untouched if none,
-                            # so Issue #174 reload retry can take over).
-                            ticket_number_js = json.dumps(ticket_number)
-                            await tab.evaluate(f'''
-                                (function() {{
-                                    const target = parseInt("{ticket_number}");
-                                    const allowLess = {str(bool(allow_less_tickets)).lower()};
-                                    const selects = Array.from(document.querySelectorAll(
-                                        '.mobile-select, select[id*="TicketForm_ticketPrice_"]'
-                                    )).filter(s => s && !s.disabled);
-                                    const pick = (s) => {{
-                                        let opt = Array.from(s.options).find(o =>
-                                            o.value === {ticket_number_js} && !o.disabled);
-                                        if (!opt && allowLess) {{
-                                            const cands = Array.from(s.options).filter(o =>
-                                                !o.disabled && parseInt(o.value) > 0 && parseInt(o.value) <= target);
-                                            opt = cands.sort((a, b) => parseInt(b.value) - parseInt(a.value))[0];
-                                        }}
-                                        return opt;
-                                    }};
-                                    for (const s of selects) {{
-                                        const opt = pick(s);
-                                        if (opt) {{
-                                            s.value = opt.value;
-                                            s.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                            break;
-                                        }}
-                                    }}
-                                }})();
-                            ''')
-
-                        # 勾選同意條款
-                        await nodriver_check_checkbox_enhanced(tab, '#TicketForm_agree')
-
-                        # 最終確認所有欄位都已填寫
-                        form_ready = await tab.evaluate(f'''
-                            (function() {{
-                                const verify = document.querySelector('#TicketForm_verifyCode');
-                                const agree = document.querySelector('#TicketForm_agree');
-
-                                // Ticketmaster check-captcha page has no ticket selector
-                                // Ticket number is already set on previous page
-                                const isTicketmaster = window.location.href.includes('ticketmaster');
-                                const target = parseInt("{ticket_number}");
-                                const allowLess = {str(bool(allow_less_tickets)).lower()};
-                                const selects = Array.from(document.querySelectorAll(
-                                    '.mobile-select, select[id*="TicketForm_ticketPrice_"]'
-                                )).filter(s => s && !s.disabled);
-                                const matched = selects.find(s => {{
-                                    if (s.value === "0" || s.value === "") return false;
-                                    const current = parseInt(s.value);
-                                    if (isNaN(current) || isNaN(target)) return false;
-                                    return allowLess ? (current > 0 && current <= target) : (current === target);
-                                }});
-                                const ticketOk = isTicketmaster ? true : !!matched;
-
-                                return {{
-                                    ticket: ticketOk,
-                                    ticket_select: matched ? (matched.id || matched.name || matched.className || "") : "",
-                                    verify: verify && verify.value.length === 4,
-                                    agree: agree && agree.checked,
-                                    ready: ticketOk &&
-                                           (verify && verify.value.length === 4) &&
-                                           (agree && agree.checked)
-                                }};
-                            }})();
-                        ''')
-                        form_ready = util.parse_nodriver_result(form_ready)
-
-                        if form_ready.get('ready', False):
-                            # 提交表單 (按 Enter) - 使用完整的鍵盤事件
-                            await tab.send(cdp.input_.dispatch_key_event("keyDown", code="Enter", key="Enter", text="\r", windows_virtual_key_code=13))
-                            await tab.send(cdp.input_.dispatch_key_event("keyUp", code="Enter", key="Enter", text="\r", windows_virtual_key_code=13))
-                            is_verifyCode_editing = False
-                            is_form_submitted = True
-                            # Short submit-in-progress guard: stop the main loop from
-                            # re-clicking the captcha input while navigation is pending.
-                            _state["captcha_submit_until"] = time.time() + 1.5
-                        else:
-                            debug.log(f"[TIXCRAFT CAPTCHA] Form not ready - Ticket:{form_ready.get('ticket')} Select:{form_ready.get('ticket_select')} Captcha:{form_ready.get('verify')} Agreement:{form_ready.get('agree')}")
-                    else:
-                        # 選取輸入框內容並顯示提示
-                        await tab.evaluate('''
-                            document.getElementById("TicketForm_verifyCode").select();
-                        ''')
-                        # 顯示提示訊息
-                        await nodriver_tixcraft_toast(tab, f"※ 按 Enter 如果答案是: {answer}")
-
-                except Exception as exc:
-                    debug.log(f"[TIXCRAFT CAPTCHA] Failed to input captcha: {exc}")
-
-    return is_verifyCode_editing, is_form_submitted
+async def nodriver_tixcraft_keyin_captcha_code(tab, answer="", auto_submit=False, config_dict=None, captcha_snapshot=None):
+    """輸入前與送出前均核對暫停，保留原生欄位事件及網站驗證。"""
+    if await _tixcraft_actions_paused(config_dict) or await _tixcraft_submission_pending(tab, config_dict):
+        return False, False
+    config_dict = config_dict or {}
+    try:
+        form_verifyCode = await tab.query_selector('#TicketForm_verifyCode')
+        visible = await tab.evaluate("(() => {const e=document.querySelector('#TicketForm_verifyCode');return !!e&&!e.disabled&&e.offsetParent!==null})()")
+        if not form_verifyCode or not visible:
+            return False, False
+        current = await _tixcraft_captcha_snapshot(tab)
+        if not current or (captcha_snapshot is not None and current != captcha_snapshot):
+            return False, False
+        manual_key = (current['documentId'], current.get('captcha'),
+                      bool(config_dict.get('ocr_captcha', {}).get('enable')))
+        if not auto_submit and _state.get('tixcraft_manual_captcha') == manual_key:
+            return True, False
+        if not answer:
+            if await _tixcraft_actions_paused(config_dict):
+                return False, False
+            await form_verifyCode.click()
+            _state['tixcraft_manual_captcha'] = manual_key
+            return True, False
+        captcha_before = current
+        if await _tixcraft_actions_paused(config_dict):
+            return False, False
+        filled = await form_verifyCode.apply('''(el) => {
+            NATIVE_SETTER
+            return setNativeInputValue(el, ANSWER);
+        }'''.replace('NATIVE_SETTER', CONST_NATIVE_INPUT_SETTER_JS).replace('ANSWER', json.dumps(str(answer))))
+        if filled and not auto_submit:
+            _state['tixcraft_manual_captcha'] = manual_key
+        if not filled or await _tixcraft_actions_paused(config_dict):
+            return False, False
+        if auto_submit:
+            await nodriver_check_checkbox_enhanced(tab, '#TicketForm_agree', config_dict)
+            return False, await _tixcraft_submit_form(
+                tab, config_dict, require_captcha=True,
+                expected_captcha=captcha_before.get('captcha') if captcha_before else None)
+        await tab.evaluate("document.querySelector('#TicketForm_verifyCode')?.select()")
+        await nodriver_tixcraft_toast(tab, '驗證碼已填入，請檢查後手動送出。')
+        _state['tixcraft_manual_captcha'] = manual_key
+        return True, False
+    except Exception:
+        return False, False
 
 async def nodriver_tixcraft_toast(tab, message):
     """顯示提示訊息"""
@@ -2924,174 +2874,131 @@ async def nodriver_get_yii_captcha_hash(tab):
 
 
 async def nodriver_tixcraft_reload_captcha(tab, domain_name, config_dict=None):
-    """重新載入驗證碼（Yii2 jQuery refresh）並等待圖片更新。
-    Yii2 refresh 後自動將 hash 存入 body data，供 nodriver_get_yii_captcha_hash 讀取。"""
+    """由原生 Yii 換圖，等待可被暫停／結束中斷。"""
+    if await _tixcraft_actions_paused(config_dict) or await _tixcraft_submission_pending(tab, config_dict):
+        return False
     try:
-        result = await tab.evaluate('''
-            (async function() {
-                if (typeof jQuery === "undefined") return false;
-                var $img = jQuery("#TicketForm_verifyCode-image");
-                if (!$img.length || typeof $img.yiiCaptcha !== "function") return false;
-                var oldSrc = $img.attr("src") || "";
-                $img.yiiCaptcha("refresh");
-                // Wait up to 2s for src to change
-                for (var i = 0; i < 20; i++) {
-                    await new Promise(function(r) { setTimeout(r, 100); });
-                    if (($img.attr("src") || "") !== oldSrc) break;
-                }
-                return true;
-            })()
-        ''', await_promise=True)
-        return bool(result)
-    except Exception as exc:
-        debug = util.create_debug_logger(config_dict)
-        debug.log(f"[TIXCRAFT OCR] reload_captcha failed: {exc}")
+        before = await _tixcraft_captcha_snapshot(tab)
+        if await _tixcraft_actions_paused(config_dict):
+            return False
+        started = await tab.evaluate('''(() => {
+            if(typeof jQuery==='undefined')return false;
+            const img=jQuery('#TicketForm_verifyCode-image');
+            if(!img.length||typeof img.yiiCaptcha!=='function')return false;
+            img.yiiCaptcha('refresh');return true;
+        })()''')
+        if not started:
+            return False
+        for _ in range(20):
+            if await _tixcraft_sleep(0.1, config_dict):
+                return False
+            after = await _tixcraft_captcha_snapshot(tab)
+            if not after or not before or after['documentId'] != before['documentId']:
+                return False
+            if after.get('captcha') and after['captcha'] != before.get('captcha'):
+                return True
+    except Exception:
+        pass
     return False
 
-async def nodriver_tixcraft_get_ocr_answer(tab, ocr, ocr_captcha_image_source, Captcha_Browser, domain_name):
-    """取得驗證碼圖片並進行 OCR 識別"""
-    debug = util.create_debug_logger(enabled=False)  # OCR: intentionally silent
+async def _tixcraft_captcha_snapshot(tab):
+    try:
+        result = await tab.evaluate(r'''(() => {
+            CAPTCHA_ID
+            return {documentId:location.href+'|'+performance.timeOrigin,captcha:captchaId()};
+        })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS))
+        return result if isinstance(result, dict) and result.get('documentId') else None
+    except Exception:
+        return None
 
-    ocr_answer = None
-    if not ocr is None:
-        img_base64 = None
 
-        if ocr_captcha_image_source == CONST_OCR_CAPTCH_IMAGE_SOURCE_NON_BROWSER:
-            if not Captcha_Browser is None:
-                img_base64 = base64.b64decode(Captcha_Browser.request_captcha())
-
-        if ocr_captcha_image_source == CONST_OCR_CAPTCH_IMAGE_SOURCE_CANVAS:
-            image_id = 'TicketForm_verifyCode-image'
-            if 'indievox.com' in domain_name:
-                image_id = 'TicketForm_verifyCode-image'
-
+async def nodriver_tixcraft_get_ocr_answer(tab, ocr, ocr_captcha_image_source, Captcha_Browser, domain_name, config_dict=None):
+    """讀圖等待可中斷；暫停後不再啟動備援驗證碼請求。"""
+    if ocr is None or await _tixcraft_actions_paused(config_dict):
+        return None
+    img_base64 = None
+    document_id = await _tixcraft_document_id(tab)
+    if not document_id:
+        return None
+    if ocr_captcha_image_source == CONST_OCR_CAPTCH_IMAGE_SOURCE_CANVAS:
+        for _ in range(30):
+            if await _tixcraft_actions_paused(config_dict):
+                return None
             try:
-                # Stage 7: get captcha image via canvas
-                # async IIFE waits for image load to avoid reading stale image after reload
-                form_verifyCode_base64 = await tab.evaluate(f'''
-                    (async function() {{
-                        var img = document.getElementById('{image_id}');
-                        if(!img || !img.src) return null;
-
-                        if(img.naturalWidth === 0 || !img.complete) {{
-                            await new Promise(function(resolve) {{
-                                var timer = setTimeout(resolve, 3000);
-                                img.onload = function() {{ clearTimeout(timer); resolve(); }};
-                                img.onerror = function() {{ clearTimeout(timer); resolve(); }};
-                            }});
-                        }}
-
-                        if(img.naturalWidth === 0 || img.naturalHeight === 0) return null;
-
-                        var canvas = document.createElement('canvas');
-                        var context = canvas.getContext('2d');
-                        canvas.height = img.naturalHeight;
-                        canvas.width = img.naturalWidth;
-                        context.drawImage(img, 0, 0);
-                        return canvas.toDataURL();
-                    }})();
-                ''', await_promise=True)
-
-                if form_verifyCode_base64:
-                    img_base64 = base64.b64decode(form_verifyCode_base64.split(',')[1])
-
-                if img_base64 is None:
-                    if not Captcha_Browser is None:
-                        debug.log("[TIXCRAFT OCR] Failed to get image from canvas, using fallback: NonBrowser")
-                        img_base64 = base64.b64decode(Captcha_Browser.request_captcha())
-
-            except Exception as exc:
-                debug.log("[TIXCRAFT OCR] Canvas error:", str(exc))
-
-        # OCR 識別
-        if not img_base64 is None:
-            try:
-                ocr_answer = ocr.classification(img_base64)
-            except Exception as exc:
-                debug.log("[TIXCRAFT OCR] Classification error:", str(exc))
-
-    return ocr_answer
+                result = await tab.evaluate(r'''(() => {
+                    if(location.href+'|'+performance.timeOrigin!==EXPECTED)return null;
+                    const img=document.querySelector('#TicketForm_verifyCode-image');
+                    if(!img?.complete||!img.naturalWidth||!img.naturalHeight)return null;
+                    const canvas=document.createElement('canvas');
+                    canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;
+                    canvas.getContext('2d').drawImage(img,0,0);return canvas.toDataURL();
+                })()'''.replace('EXPECTED', json.dumps(document_id)))
+                if isinstance(result, str) and ',' in result:
+                    img_base64 = base64.b64decode(result.split(',', 1)[1])
+                    break
+            except Exception:
+                break
+            if await _tixcraft_sleep(0.1, config_dict):
+                return None
+    if img_base64 is None and Captcha_Browser is not None:
+        if await _tixcraft_actions_paused(config_dict) or await _tixcraft_document_id(tab) != document_id:
+            return None
+        try:
+            img_base64 = base64.b64decode(await asyncio.to_thread(Captcha_Browser.request_captcha))
+        except Exception:
+            return None
+    if img_base64 is None or await _tixcraft_actions_paused(config_dict):
+        return None
+    try:
+        return await asyncio.to_thread(ocr.classification, img_base64)
+    except Exception:
+        return None
 
 async def nodriver_tixcraft_auto_ocr(tab, config_dict, ocr, away_from_keyboard_enable,
                                      previous_answer, Captcha_Browser,
                                      ocr_captcha_image_source, domain_name):
-    """OCR 自動識別主邏輯"""
+    """每輪讀圖、填寫及換圖之前確認本輪仍可執行。"""
+    if await _tixcraft_actions_paused(config_dict) or await _tixcraft_submission_pending(tab, config_dict):
+        return False, previous_answer, False
     debug = util.create_debug_logger(config_dict)
-
-    is_need_redo_ocr = False
-    is_form_submitted = False
-
-    is_input_box_exist = False
-    if not ocr is None:
-        try:
-            # query_selector returns None when absent rather than raising, so
-            # the flag must test the result: events with no image captcha
-            # would otherwise burn the whole retry budget.
-            form_verifyCode = await tab.query_selector('#TicketForm_verifyCode')
-            is_input_box_exist = form_verifyCode is not None
-        except Exception as exc:
-            pass
-    else:
-        debug.log("[TIXCRAFT OCR] ddddocr component unavailable, you may be running on ARM")
-
-    if is_input_box_exist:
-        debug.log("[TIXCRAFT OCR] away_from_keyboard_enable:", away_from_keyboard_enable)
-        debug.log("[TIXCRAFT OCR] previous_answer:", previous_answer)
-        debug.log("[TIXCRAFT OCR] ocr_captcha_image_source:", ocr_captcha_image_source)
-
-        ocr_start_time = time.time()
-        ocr_answer = await nodriver_tixcraft_get_ocr_answer(tab, ocr, ocr_captcha_image_source, Captcha_Browser, domain_name)
-        ocr_done_time = time.time()
-        ocr_elapsed_time = ocr_done_time - ocr_start_time
-        debug.log("[TIXCRAFT OCR] Processing time:", "{:.3f}".format(ocr_elapsed_time))
-
-        if ocr_answer is None:
-            if away_from_keyboard_enable:
-                # 頁面尚未準備好，重試
-                # PS: 通常發生在非同步腳本取得驗證碼圖片時
-                is_need_redo_ocr = True
-                await asyncio.sleep(0.1)
-            else:
-                await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
-        else:
-            ocr_answer = ocr_answer.strip()
-            debug.log("[TIXCRAFT OCR] Result:", ocr_answer)
-            if len(ocr_answer) == 4:
-                # Yii2 hash pre-validation (hash available after first reload, 0 on first load)
-                if away_from_keyboard_enable:
-                    hash1 = await nodriver_get_yii_captcha_hash(tab)
-                    if hash1 > 0:
-                        if not util.yii_captcha_verify(ocr_answer, hash1):
-                            candidates = util.yii_captcha_edit1(ocr_answer, hash1)
-                            if candidates:
-                                ocr_answer = candidates[0]
-                                debug.log(f"[TIXCRAFT OCR] Hash edit1 corrected to: {ocr_answer}")
-                            else:
-                                debug.log(f"[TIXCRAFT OCR] Hash mismatch, no edit1 solution, reloading")
-                                is_need_redo_ocr = True
-                                await nodriver_tixcraft_reload_captcha(tab, domain_name)
-                                ocr_answer = None
-                        else:
-                            debug.log(f"[TIXCRAFT OCR] Hash verified ok: {ocr_answer}")
-                if ocr_answer is not None:
-                    who_care_var, is_form_submitted = await nodriver_tixcraft_keyin_captcha_code(tab, answer=ocr_answer, auto_submit=away_from_keyboard_enable, config_dict=config_dict)
-            else:
-                if not away_from_keyboard_enable:
-                    await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
-                else:
-                    is_need_redo_ocr = True
-                    if previous_answer != ocr_answer:
-                        previous_answer = ocr_answer
-                        debug.log("[TIXCRAFT OCR] Reloading captcha")
-
-                        await nodriver_tixcraft_reload_captcha(tab, domain_name)
-
-                        if ocr_captcha_image_source == CONST_OCR_CAPTCH_IMAGE_SOURCE_CANVAS:
-                            await asyncio.sleep(0.3)
-    else:
-        debug.log("[TIXCRAFT OCR] Input box not found, exiting OCR...")
-
-    return is_need_redo_ocr, previous_answer, is_form_submitted
+    if ocr is None or await tab.query_selector('#TicketForm_verifyCode') is None:
+        return False, previous_answer, False
+    before = await _tixcraft_captcha_snapshot(tab)
+    answer = await nodriver_tixcraft_get_ocr_answer(tab, ocr, ocr_captcha_image_source,
+                                                  Captcha_Browser, domain_name, config_dict=config_dict)
+    if await _tixcraft_actions_paused(config_dict):
+        return False, previous_answer, False
+    after = await _tixcraft_captcha_snapshot(tab)
+    if not before or not after or before != after:
+        return True, previous_answer, False
+    if answer is None:
+        if away_from_keyboard_enable:
+            await _tixcraft_sleep(0.1, config_dict)
+            return True, previous_answer, False
+        await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
+        return False, previous_answer, False
+    answer = str(answer).strip()
+    if len(answer) != 4:
+        if not away_from_keyboard_enable:
+            await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
+            return False, previous_answer, False
+        if answer != previous_answer:
+            await nodriver_tixcraft_reload_captcha(tab, domain_name, config_dict)
+        return True, answer, False
+    if away_from_keyboard_enable:
+        hash1 = await nodriver_get_yii_captcha_hash(tab)
+        if hash1 > 0 and not util.yii_captcha_verify(answer, hash1):
+            candidates = util.yii_captcha_edit1(answer, hash1)
+            if not candidates:
+                await nodriver_tixcraft_reload_captcha(tab, domain_name, config_dict)
+                return True, previous_answer, False
+            answer = candidates[0]
+    if await _tixcraft_actions_paused(config_dict):
+        return False, previous_answer, False
+    _, submitted = await nodriver_tixcraft_keyin_captcha_code(
+        tab, answer=answer, auto_submit=away_from_keyboard_enable, config_dict=config_dict,
+        captcha_snapshot=before)
+    return False, answer, submitted
 
 async def nodriver_tixcraft_has_captcha(tab):
     """True when this ticket page actually shows an image captcha.
@@ -3121,167 +3028,56 @@ def _forget_ticket_assigned(current_url):
 
 
 async def nodriver_tixcraft_submit_without_captcha(tab, config_dict):
-    """Agree, confirm the ticket count, and submit a ticket page with no captcha.
-
-    The captcha flow cannot submit here: it is gated on the input existing and
-    its readiness check requires verify.value.length === 4.
-    """
-    debug = util.create_debug_logger(config_dict)
-
+    """無圖片驗證碼仍遵守網站按鈕驗證、全表張數與持續送出鎖。"""
+    if await _tixcraft_actions_paused(config_dict) or await _tixcraft_submission_pending(tab, config_dict):
+        return False
     await nodriver_check_checkbox_enhanced(tab, '#TicketForm_agree', config_dict)
-
-    # nodriver_tixcraft_ticket_main has already assigned the count, so only
-    # confirm it here rather than duplicate keyin_captcha_code's reset.
-    ticket_number_js = json.dumps(str(config_dict.get("ticket_number", 2)))
-    allow_less_js = json.dumps(bool(
-        config_dict.get("tixcraft", {}).get("allow_less_tickets", False)))
-    ready = await tab.evaluate(f'''
-        (function() {{
-            const target = parseInt({ticket_number_js});
-            const allowLess = {allow_less_js};
-            const agree = document.querySelector('#TicketForm_agree');
-            const selects = Array.from(document.querySelectorAll(
-                '.mobile-select, select[id*="TicketForm_ticketPrice_"]'
-            )).filter(s => s && !s.disabled);
-            const matched = selects.find(s => {{
-                if (s.value === "0" || s.value === "") return false;
-                const current = parseInt(s.value);
-                if (isNaN(current) || isNaN(target)) return false;
-                return allowLess ? (current > 0 && current <= target) : (current === target);
-            }});
-            return {{
-                ticket: !!matched,
-                agree: !!(agree && agree.checked),
-                ready: !!matched && !!(agree && agree.checked)
-            }};
-        }})();
-    ''')
-
-    if not isinstance(ready, dict) or not ready.get('ready'):
-        got = ready if isinstance(ready, dict) else {}
-        debug.log("[TIXCRAFT] No captcha on this page, but the form is not ready "
-                  f"- Ticket:{got.get('ticket')} Agreement:{got.get('agree')}")
-        if got.get('ticket') is False:
-            # The count went back to 0 (refused submit or back navigation on
-            # the same URL); nodriver_tixcraft_ticket_main skips assignment
-            # while the URL is marked done, so clear the mark.
-            current_url, _ = await nodriver_current_url(tab)
-            _forget_ticket_assigned(current_url)
-            debug.log("[TIXCRAFT] Ticket count was reset, re-assigning next round")
+    if await _tixcraft_actions_paused(config_dict) or not config_dict.get('ocr_captcha', {}).get('force_submit', False):
         return False
-
-    if not config_dict["ocr_captcha"]["force_submit"]:
-        debug.log("[TIXCRAFT] No captcha on this page; agreement and ticket count "
-                  "are set. Auto-submit is off, so the order is left for you.")
-        return False
-
-    # Click the button: Enter needs focus in the (absent) captcha input, and
-    # form.submit() skips the page's handler that enforces agreement and quota.
-    clicked = await tab.evaluate('''
-        (function() {
-            const form = document.querySelector('#form-ticket-ticket');
-            if (!form) return false;
-            const btn = form.querySelector('button[type="submit"], input[type="submit"]');
-            if (!btn || btn.disabled) return false;
-            btn.click();
-            return true;
-        })();
-    ''')
-
-    if clicked:
-        debug.log("[TIXCRAFT] Submitted a page with no captcha")
-        # Same guard the captcha path sets: keep the main loop from re-entering
-        # this page while the POST is still navigating.
-        _state["captcha_submit_until"] = time.time() + 1.5
-    else:
-        debug.log("[TIXCRAFT] No captcha on this page and no submit button found")
-    return bool(clicked)
+    return await _tixcraft_submit_form(tab, config_dict)
 
 
 async def nodriver_tixcraft_ticket_main_ocr(tab, config_dict, ocr, Captcha_Browser, domain_name):
-    """票券頁面 OCR 處理主函數"""
-    # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
-        return False, "", False
-
-    debug = util.create_debug_logger(config_dict)
-
-    # Handle the no-captcha case before the ocr_captcha.enable split: with OCR
-    # off the manual branch below only focuses the captcha input, so an event
-    # without one reaches the same dead end by a different route.
-    if not await nodriver_tixcraft_has_captcha(tab):
+    """本輪重試有上限，所有等待與送出都保留暫停／結束檢查。"""
+    if await _tixcraft_actions_paused(config_dict) or await _tixcraft_submission_pending(tab, config_dict):
+        return
+    document_id = await _tixcraft_document_id(tab)
+    if not document_id:
+        return
+    has_captcha = await nodriver_tixcraft_has_captcha(tab)
+    if await _tixcraft_actions_paused(config_dict):
+        return
+    if not has_captcha:
         await nodriver_tixcraft_submit_without_captcha(tab, config_dict)
         return
-
-    away_from_keyboard_enable = config_dict["ocr_captcha"]["force_submit"]
-    if not config_dict["ocr_captcha"]["enable"]:
-        away_from_keyboard_enable = False
-    ocr_captcha_image_source = config_dict["ocr_captcha"]["image_source"]
-
-    if not config_dict["ocr_captcha"]["enable"]:
-        # 手動模式
+    if not config_dict['ocr_captcha']['enable'] or not config_dict['ocr_captcha']['force_submit']:
+        current = await _tixcraft_captcha_snapshot(tab)
+        manual_key = (current['documentId'], current.get('captcha'),
+                      bool(config_dict['ocr_captcha']['enable'])) if current else None
+        if manual_key and _state.get('tixcraft_manual_captcha') == manual_key:
+            return
+    if not config_dict['ocr_captcha']['enable']:
         await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
-    else:
-        # 自動 OCR 模式
-        previous_answer = None
-        current_url, _ = await nodriver_current_url(tab)
-        fail_count = 0  # Track consecutive failures
-        total_fail_count = 0  # Track total failures
-        is_form_submitted = False
-
-        for redo_ocr in range(5):
-            is_need_redo_ocr, previous_answer, is_form_submitted = await nodriver_tixcraft_auto_ocr(
-                tab, config_dict, ocr, away_from_keyboard_enable,
-                previous_answer, Captcha_Browser, ocr_captcha_image_source, domain_name
-            )
-
-            if is_form_submitted:
-                debug.log("[TIXCRAFT OCR] Form submitted")
-                break
-
-            if not away_from_keyboard_enable:
-                break
-
-            if not is_need_redo_ocr:
-                break
-
-            # Track failures and refresh captcha after 3 consecutive failures
-            if is_need_redo_ocr:
-                fail_count += 1
-                total_fail_count += 1
-                debug.log(f"[TIXCRAFT OCR] Fail count: {fail_count}, Total fails: {total_fail_count}")
-
-                # Check if total failures reached 5, switch to manual input mode
-                if total_fail_count >= 5:
-                    print("[TIXCRAFT OCR] OCR failed 5 times. Please enter captcha manually.")
-                    away_from_keyboard_enable = False
-                    await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
-                    break
-
-                if fail_count >= 3:
-                    debug.log("[TIXCRAFT OCR] 3 consecutive failures reached")
-
-                    # Try to dismiss any existing alert before continuing
-                    try:
-                        await tab.send(cdp.page.handle_java_script_dialog(accept=True))
-                        debug.log("[TIXCRAFT OCR] Dismissed existing alert")
-                    except:
-                        pass
-
-                    # Wait for potential auto-refresh
-                    await asyncio.sleep(2.5)
-                    fail_count = 0  # Reset consecutive counter after handling
-
-            # 檢查是否還在同一頁面
-            new_url, _ = await nodriver_current_url(tab)
-            if new_url != current_url:
-                break
-
-            debug.log(f"[TIXCRAFT OCR] Retry {redo_ocr + 1}/5")
-
-        # Mark OCR completed for this URL only when form was actually submitted
-        if is_form_submitted:
-            _state["ocr_completed_url"] = current_url
+        return
+    force_submit = config_dict['ocr_captcha']['force_submit']
+    previous_answer = None
+    for attempt in range(5):
+        if await _tixcraft_actions_paused(config_dict) or await _tixcraft_document_id(tab) != document_id:
+            return
+        redo, previous_answer, submitted = await nodriver_tixcraft_auto_ocr(
+            tab, config_dict, ocr, force_submit, previous_answer, Captcha_Browser,
+            config_dict['ocr_captcha']['image_source'], domain_name)
+        if submitted:
+            _state['ocr_completed_document'] = document_id
+            return
+        if not force_submit or not redo:
+            return
+        if attempt == 4:
+            util.create_debug_logger(config_dict).log('[TIXCRAFT] 本輪辨識未成功，請手動輸入驗證碼。')
+            await nodriver_tixcraft_keyin_captcha_code(tab, config_dict=config_dict)
+            return
+        if attempt == 2 and await _tixcraft_sleep(2.5, config_dict):
+            return
 
 async def nodriver_ticketmaster_check_ip_block(tab, config_dict, current_url=""):
     """Detect PerimeterX EPS block page on tixcraft/ticketmaster domains.
@@ -3364,10 +3160,37 @@ async def nodriver_ticketmaster_check_ip_block(tab, config_dict, current_url="")
         return False
 
 
+async def _tixcraft_checkout_handoff(tab, config_dict):
+    """到結帳頁只交接，不操作付款方式、結帳表單或訂單取消。"""
+    if not await _tixcraft_submission_handoff(tab):
+        return False
+    if _state.get('handoff_ready'):
+        return True
+    _state['handoff_ready'] = True
+    message = '[TIXCRAFT] 已進入結帳頁，請手動確認資料與付款；尚未確認訂單或付款完成。'
+    util.write_instance_status('waiting_manual', message)
+    util.create_debug_logger(enabled=True).log(message)
+    advanced = dict(config_dict.get('advanced', {}))
+    notification_config = dict(config_dict, advanced=advanced)
+    for key in ('discord_message', 'telegram_message'):
+        custom = advanced.get(key, '').strip()
+        advanced[key] = message + ('\n' + custom if custom else '')
+    if advanced.get('play_sound', {}).get('order'):
+        play_sound_while_ordering(config_dict)
+    send_discord_notification(notification_config, 'order', 'TixCraft')
+    send_telegram_notification(notification_config, 'order', 'TixCraft')
+    return True
+
+
 async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
     # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
+    if await _tixcraft_actions_paused(config_dict):
         return False
+
+    if _state.get('handoff_ready'):
+        return True
+    if url.split('?', 1)[0].rstrip('/').endswith('/ticket/checkout'):
+        return await _tixcraft_checkout_handoff(tab, config_dict)
 
     debug = util.create_debug_logger(config_dict)
 
@@ -3376,7 +3199,7 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
     # Reference: KHAM platform implementation (Line 10681-10697)
     async def handle_global_alert(event):
         # Skip alert handling when bot is paused (let user handle manually)
-        if os.path.exists(util.get_instance_state_path(CONST_MAXBOT_INT28_FILE)):
+        if _state.get('alert_handler_tab') is not tab or await _tixcraft_actions_paused(config_dict):
             return
         # IMPORTANT: Use tab.target.url (cached) instead of nodriver_current_url (js_dumps)
         # When alert dialog is open, JavaScript execution is blocked, causing js_dumps to hang
@@ -3390,13 +3213,10 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
 
         # Track captcha error alerts for retry logic
         is_captcha_error = False
-        captcha_error_keywords = [
-            'verification code',
-            'incorrect',
-            'try again',
-            'captcha',
-            'wrong code'
-        ]
+        captcha_error_keywords = ['驗證碼錯誤', '驗證碼不正確', '驗證碼輸入錯誤',
+                                  'incorrect verification code', 'invalid verification code',
+                                  'wrong verification code', 'incorrect captcha', 'invalid captcha',
+                                  'captcha is incorrect', 'verification code is incorrect']
         alert_message_lower = event.message.lower()
         for keyword in captcha_error_keywords:
             if keyword in alert_message_lower:
@@ -3405,9 +3225,7 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
 
         if is_captcha_error:
             _state["captcha_alert_detected"] = True
-            # Wrong answer submitted: clear the submit guard so retry is immediate.
-            _state["captcha_submit_until"] = 0
-            debug.log(f"[GLOBAL ALERT] Captcha error detected, flagging for retry")
+            debug.log('[TIXCRAFT] 網站回報驗證碼錯誤，待確認新驗證碼後才允許重試。')
 
         # Issue #188: Detect sold out alerts to add cooldown delay
         sold_out_keywords = ['售完', '已售完', '選購一空', 'sold out', 'no tickets']
@@ -3417,6 +3235,8 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
         dismiss_success = False
         for attempt in range(3):
             try:
+                if await _tixcraft_actions_paused(config_dict):
+                    return
                 await tab.send(cdp.page.handle_java_script_dialog(accept=True))
                 dismiss_success = True
                 debug.log(f"[GLOBAL ALERT] Alert dismissed (attempt {attempt + 1})")
@@ -3433,6 +3253,11 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
                 else:
                     debug.log(f"[GLOBAL ALERT] Failed to dismiss alert: {dismiss_exc}")
 
+        if is_captcha_error and dismiss_success:
+            await _tixcraft_mark_submission_rejected(tab)
+        elif is_sold_out_alert and dismiss_success:
+            await _tixcraft_mark_submission_failed(tab)
+
         # Issue #188: Set cooldown timestamp instead of async sleep (event handler doesn't block main loop)
         if is_sold_out_alert and dismiss_success:
             interval = config_dict["advanced"].get("auto_reload_page_interval", 0)
@@ -3441,8 +3266,8 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
                 _state["sold_out_cooldown_until"] = cooldown_until
                 debug.log(f"[GLOBAL ALERT] Sold out detected, setting cooldown for {interval}s")
 
-    if not _state:
-        _state.update({
+    if not _state.get('initialized'):
+        defaults = {
             "fail_list": [],
             "fail_promo_list": [],
             "start_time": None,
@@ -3463,14 +3288,18 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
             "ticketmaster_captcha_processed_url": "",
             "ip_block_until": 0,
             "queue_it_enter_time": None,
-        })
+        }
+        for key, value in defaults.items():
+            _state.setdefault(key, value)
+        _state['initialized'] = True
 
     # Register global alert handler (remains active throughout session)
     # Only register once to prevent infinite loop
-    if not _state.get("alert_handler_registered", False):
+    if _state.get('alert_handler_tab') is not tab:
         try:
             tab.add_handler(cdp.page.JavascriptDialogOpening, handle_global_alert)
             _state["alert_handler_registered"] = True
+            _state['alert_handler_tab'] = tab
             debug.log(f"[GLOBAL ALERT] Global alert handler registered")
         except Exception as handler_exc:
             debug.log(f"[GLOBAL ALERT] Failed to register alert handler: {handler_exc}")
@@ -3658,44 +3487,5 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
     if '/ticket/order' in url:
         _state["done_time"] = time.time()
 
-    is_quit_bot = False
-    if '/ticket/checkout' in url:
-        if not _state["start_time"] is None:
-            if not _state["done_time"] is None:
-                bot_elapsed_time = _state["done_time"] - _state["start_time"]
-                if _state["elapsed_time"] != bot_elapsed_time:
-                    print("bot elapsed time:", "{:.3f}".format(bot_elapsed_time))
-                _state["elapsed_time"] = bot_elapsed_time
-
-        # Always set is_quit_bot when checkout page is detected (not just in headless mode)
-        if not _state["is_popup_checkout"]:
-            is_quit_bot = True
-            _state["is_popup_checkout"] = True
-
-            # Issue #193: Move inside the block to execute only once on first checkout detection
-            # Headless-specific behavior: open checkout URL in new browser window
-            if config_dict["advanced"]["headless"]:
-                domain_name = url.split('/')[2]
-                checkout_url = "https://%s/ticket/checkout" % (domain_name)
-                print("Ticket purchase successful, please check order at: %s" % (checkout_url))
-                webbrowser.open_new(checkout_url)
-
-        if not _state["played_sound_order"]:
-            if config_dict["advanced"]["play_sound"]["order"]:
-                play_sound_while_ordering(config_dict)
-            send_discord_notification(config_dict, "order", "TixCraft")
-            send_telegram_notification(config_dict, "order", "TixCraft")
-        _state["played_sound_order"] = True
-    else:
-        _state["is_popup_checkout"] = False
-        _state["played_sound_order"] = False
-        _state["printed_completed"] = False
-
-    # Approach B: handle printed_completed internally
-    if is_quit_bot:
-        if not _state.get("printed_completed", False):
-            print("TixCraft ticket purchase completed")
-            _state["printed_completed"] = True
-
-    return is_quit_bot
+    return False
 

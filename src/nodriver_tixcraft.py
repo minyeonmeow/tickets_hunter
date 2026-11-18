@@ -889,6 +889,7 @@ async def _run_bot(args, session):
         "last_countdown_print": 0,
     }
     ticketplus_handoff_done = False  # Leave buyer data and payment to the user.
+    tixcraft_handoff_done = False
 
     # Initialize config mtime (hot-reload watches the file actually loaded)
     app_root = util.get_app_root()
@@ -946,6 +947,8 @@ async def _run_bot(args, session):
                     external_disconnected = False
                     if ticketplus_handoff_done:
                         util.write_instance_status("waiting_manual", "已進入購票資料確認頁，請手動處理；尚未確認訂單與付款完成。")
+                    elif tixcraft_handoff_done:
+                        util.write_instance_status("waiting_manual", "已進入拓元結帳頁，請手動確認資料與付款；尚未確認訂單或付款完成。")
                     else:
                         util.write_instance_status("running")
                     logger.info(f'[繼續耗時] 已重新接手瀏覽器：{time.monotonic() - resume_started:.3f} 秒')
@@ -1021,6 +1024,9 @@ async def _run_bot(args, session):
             continue
 
         # Gate: block platform dispatching until refresh_datetime target time
+        if tixcraft_handoff_done:
+            await asyncio.sleep(0.1)
+            continue
         if await check_refresh_datetime_gate(tab, config_dict, refresh_datetime_state):
             await asyncio.sleep(0.1)
             continue
@@ -1076,8 +1082,7 @@ async def _run_bot(args, session):
         if tixcraft_family:
             is_quit_bot = await nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser)
             if is_quit_bot:
-                # 不自動暫停：讓多開實例可獨立運作
-                # 保留 is_quit_bot = False 以防止程式結束，但不建立暫停檔案
+                tixcraft_handoff_done = True
                 is_quit_bot = False
 
         if 'famiticket.com' in url:
