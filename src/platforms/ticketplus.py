@@ -46,6 +46,7 @@ __all__ = [
     "nodriver_ticketplus_check_next_button",
     "nodriver_ticketplus_order_exclusive_code",
     "nodriver_ticketplus_main",
+    "nodriver_ticketplus_retry_reset",
 ]
 
 _state = {}
@@ -602,6 +603,123 @@ CONST_TICKETPLUS_DIRECT_SELECT_JS = r'''(async (keyword, amount, mode, excludes,
 })(KEYWORD, AMOUNT, MODE, EXCLUDES, EXPECTED, ALLOW_CHANGES)'''
 
 
+CONST_TICKETPLUS_RETRY_LEASE_SECONDS = 5
+CONST_TICKETPLUS_RETRY_INSTALL_JS = r'''((interval, runId) => {
+    CONTEXT
+    const key=Symbol.for('ticketsHunter.ticketplus.enqueueRetry');
+    const ctx=context();if(!ctx)return {state:'loading'};
+    const {order,documentId}=ctx;
+    const owner=order[Symbol.for('ticketsHunter.ticketplus.orderOwner')] ||= {};
+    const previous=window[key];
+    if(previous?.active&&previous.documentId===documentId&&previous.owner===owner&&previous.runId===runId)
+        return {state:'active'};
+    if(previous){previous.active=false;previous.manager.eject(previous.id);}
+    const manager=window.axios?.interceptors?.response;
+    if(!manager||typeof manager.use!=='function'||typeof manager.eject!=='function')
+        return {state:'unsupported'};
+    // Never change a chain that may already own an earlier retry timer.
+    const submitted=window[Symbol.for('ticketsHunter.ticketplus.directSubmit')];
+    if(order.isPending||window.isEnquene||
+       (submitted?.documentId===documentId&&!(submitted.state==='handoff'&&submitted.owner!==owner)))
+        return {state:'pending'};
+    const control={active:true,documentId,owner,runId,interval,manager,adjusted:0,last:null,expires:Date.now()+LEASE_MS};
+    control.id=manager.use(response=>{
+        if(!control.active||Date.now()>control.expires||order._isDestroyed||order._inactive||
+           location.href+'|'+performance.timeOrigin!==documentId)return response;
+        try{
+            const url=new URL(response.config?.url,location.href);
+            const data=response.data;
+            if(url.protocol!=='https:'||url.hostname!=='queue.ticketplus.com.tw'||
+               url.pathname!=='/queue/api/v1/enqueue'||
+               String(response.config?.method).toLowerCase()!=='post'||
+               !data||Array.isArray(data)||String(data.errCode)!=='137'||
+               typeof data.waitSecond!=='number'||!Number.isFinite(data.waitSecond)||data.waitSecond<=0)
+                return response;
+            control.adjusted++;
+            control.last={original:data.waitSecond,configured:interval,localCheck:data.localCheck===true};
+            // Keep one native scheduler: only change the value its existing
+            // branch reads. Do not send requests, create timers or call enquene.
+            return {...response,data:{...data,waitSecond:interval}};
+        }catch(_){return response;}
+    });
+    window[key]=control;
+    return {state:'installed'};
+})(INTERVAL, RUN_ID)'''
+
+
+def _ticketplus_retry_interval(config_dict):
+    advanced = config_dict.get('advanced', {})
+    if advanced.get('ticketplus_enqueue_retry_experiment') is not True:
+        return None
+    value = advanced.get('ticketplus_enqueue_retry_interval', 1.0)
+    try:
+        value = float(value) if not isinstance(value, bool) else 0
+    except (TypeError, ValueError):
+        return None
+    return value if 0 < value < float('inf') else None
+
+
+async def _ticketplus_retry_prepare(tab, config_dict):
+    interval = _ticketplus_retry_interval(config_dict)
+    if interval is None:
+        return
+    if await _ticketplus_actions_paused(config_dict):
+        return
+    run_id = _state.setdefault('retry_run_id', str(time.monotonic_ns()))
+    script = CONST_TICKETPLUS_RETRY_INSTALL_JS.replace(
+        'CONTEXT', CONST_TICKETPLUS_DIRECT_CONTEXT_JS).replace('INTERVAL', json.dumps(interval)).replace(
+        'LEASE_MS', str(CONST_TICKETPLUS_RETRY_LEASE_SECONDS * 1000)).replace('RUN_ID', json.dumps(run_id))
+    try:
+        result = await tab.evaluate(script)
+        state = result.get('state', 'unknown') if isinstance(result, dict) else 'unknown'
+    except Exception:
+        state = 'unknown'
+    if state in ('installed', 'active'):
+        _state['retry_tab'] = tab
+        _state['retry_touch_at'] = time.monotonic()
+    if _state.get('retry_notice') == (id(tab), state):
+        return
+    _state['retry_notice'] = (id(tab), state)
+    message = (f'啟用原生排隊重試間隔 {interval:g} 秒；僅調整 Pending 回覆，不另外送出請求。'
+               if state in ('installed', 'active') else
+               '本輪未啟用自訂間隔（元件未就緒、不支援或已在排隊），沿用網站原流程。')
+    util.create_debug_logger(enabled=True).log('[TICKETPLUS 重試實驗] ' + message)
+
+
+async def nodriver_ticketplus_retry_reset():
+    """Eject only this experiment's interceptor; keep native site work intact."""
+    tab = _state.pop('retry_tab', None)
+    _state.pop('retry_notice', None)
+    if tab is None:
+        return
+    try:
+        await asyncio.wait_for(tab.evaluate('''(() => {
+            const key=Symbol.for('ticketsHunter.ticketplus.enqueueRetry'),control=window[key];
+            if(control){control.active=false;control.manager.eject(control.id);delete window[key];}
+        })()'''), timeout=0.5)
+    except Exception:
+        pass
+
+
+async def _ticketplus_retry_touch(config_dict):
+    tab = _state.get('retry_tab')
+    if tab is None or time.monotonic() - _state.get('retry_touch_at', 0) < 1:
+        return
+    _state['retry_touch_at'] = time.monotonic()
+    try:
+        count = await tab.evaluate('''(() => {
+            const c=window[Symbol.for('ticketsHunter.ticketplus.enqueueRetry')];
+            if(!c||!c.active)return null;
+            c.expires=Date.now()+LEASE_MS;
+            return c.adjusted;
+        })()'''.replace('LEASE_MS', str(CONST_TICKETPLUS_RETRY_LEASE_SECONDS * 1000)))
+        if isinstance(count, (int, float)) and count != _state.get('retry_adjusted_count', 0):
+            _state['retry_adjusted_count'] = count
+            util.create_debug_logger(config_dict).log(f'[TICKETPLUS 重試實驗] 已調整 {int(count)} 次 Pending 等待，仍由網站單一流程重試。')
+    except Exception:
+        pass
+
+
 CONST_TICKETPLUS_DIRECT_SUBMIT_JS = r'''((amount, expected) => {
     CONTEXT
     const ctx=context();if(!ctx)return {state:'unsupported'};
@@ -614,12 +732,18 @@ CONST_TICKETPLUS_DIRECT_SUBMIT_JS = r'''((amount, expected) => {
     const owner=order[ownerKey] ||= {};
     if(prior?.documentId===documentId && !(prior.state==='handoff' && prior.owner!==owner))
         return {state:'blocked_prior'};
+    // Native beforeNext returns without enqueue when this exact gate fails.
+    // Do not create an "invoked" record for a known non-submission.
+    if(order.hasSerial&&order.transactionValidType&&order.serialNumber==='')
+        return {state:'not_ready',reason:'qualification'};
+    if(!order.isReady||view.loadingData)return {state:'not_ready',reason:'loading'};
+    if(!order.canNextStep)return {state:'not_ready',reason:'site_validation'};
     const selected=view.tickets.filter(t=>Number(t.count)>0);
-    if(!order.isReady||!order.canNextStep||order.selectedTickets.length!==1||selected.length!==1||
+    if(order.selectedTickets.length!==1||selected.length!==1||
        selected[0].productId!==order.selectedTickets[0].productId||Number(selected[0].count)!==amount||
        order.selectedTickets.some(t=>!t.productId||Number(t.count)!==amount)||
        Number(order.totalTicket)!==amount||Number(view.totalTicket)!==amount)
-       return {state:'not_ready'};
+       return {state:'not_ready',reason:'quantity'};
     const record={documentId,state:'invoked',owner};
     window[key]=record;
     try{
@@ -677,6 +801,8 @@ async def _ticketplus_direct_submit(tab, config_dict):
     except Exception:
         result = {'state': 'unknown'}
     state = result.get('state') if isinstance(result, dict) else 'unknown'
+    if state in ('invoked', 'already_pending') and _state.pop('direct_submit_notice', None):
+        util.write_instance_status('running', '網站已接續處理送出流程，等待排隊或保留結果。')
     if state == 'invoked':
         _state.pop('submit_blocked_document', None)
         _ticketplus_queue_mark('網站原本送出函式已呼叫', config_dict)
@@ -691,9 +817,16 @@ async def _ticketplus_direct_submit(tab, config_dict):
     else:
         _ticketplus_block_direct_submit(document_id, config_dict)
         return False
-    if _state.get('direct_submit_notice') != (document_id, state):
-        _state['direct_submit_notice'] = (document_id, state)
-        util.create_debug_logger(enabled=True).log('[TICKETPLUS 直接送出] 網站驗證未通過或回應未明，請查看頁面；不切回按鈕重複送出。')
+    reason = result.get('reason') if isinstance(result, dict) else None
+    if _state.get('direct_submit_notice') != (document_id, state, reason):
+        _state['direct_submit_notice'] = (document_id, state, reason)
+        reasons = {'qualification': '資格序號尚未填妥，尚未呼叫送出；請檢查資格欄位。',
+                   'loading': '網站選票元件尚未就緒，保留選票並等待；尚未呼叫送出。',
+                   'site_validation': '網站尚未允許下一步，請檢查頁面提示與條款；尚未呼叫送出。',
+                   'quantity': '畫面與網站選票資料的張數尚未一致，尚未呼叫送出。'}
+        message = reasons.get(reason, '頁面已改變或無法辨識送出元件，尚未呼叫送出；請查看瀏覽器。')
+        util.create_debug_logger(enabled=True).log('[TICKETPLUS 直接送出] ' + message)
+        util.write_instance_status('running', message)
     return False
 
 
@@ -1022,11 +1155,11 @@ async def _ticketplus_date_api_select(tab, config_dict):
     automatic = util.is_auto_refresh_enabled()
     previous = _state.get('session_api_last_check')
     try:
-        interval = float(config_dict.get('advanced', {}).get('auto_reload_page_interval', 5))
+        interval = float(config_dict.get('advanced', {}).get('auto_reload_page_interval', 1))
     except (TypeError, ValueError):
-        interval = 5
-    if not 0.2 <= interval <= 3600:
-        interval = 0.2 if interval == 0 else 5
+        interval = 1
+    if not 0 < interval < float('inf'):
+        interval = 0.2 if interval == 0 else 1  # Keep legacy zero handling.
     if previous and previous[0] == signature and (not automatic or time.monotonic() - previous[1] < interval):
         return False
     _state['session_api_last_check'] = (signature, time.monotonic())
@@ -1440,7 +1573,13 @@ async def _ticketplus_date_dom_select(tab, config_dict):
 
 
 async def _ticketplus_actions_paused(config_dict):
-    return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
+    paused = await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
+    if paused and _state.get('retry_tab') is not None:
+        try:
+            await asyncio.wait_for(nodriver_ticketplus_retry_reset(), timeout=0.7)
+        except Exception:
+            pass
+    return paused
 
 
 async def _ticketplus_sleep(tab, seconds, config_dict):
@@ -1448,6 +1587,7 @@ async def _ticketplus_sleep(tab, seconds, config_dict):
     while time.monotonic() < deadline:
         if await _ticketplus_actions_paused(config_dict):
             return True
+        await _ticketplus_retry_touch(config_dict)
         await asyncio.sleep(min(0.1, max(0, deadline - time.monotonic())))
     return await _ticketplus_actions_paused(config_dict)
 
@@ -1704,7 +1844,7 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
                     exclude_keywords = [keyword_exclude.strip()] if keyword_exclude.strip() else []
 
         # Wait for Vue.js elements to render
-        auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 5)
+        auto_reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 1)
         max_vue_wait = max(6.0, min(15.0, auto_reload_interval * 2))
         vue_check_interval = 0.15
         vue_wait_start = time.time()
@@ -1963,6 +2103,7 @@ async def nodriver_ticketplus_unified_select(tab, config_dict, area_keyword):
 
 async def nodriver_ticketplus_click_next_button_unified(tab, config_dict):
     """TicketPlus unified next button clicker - layout_style independent."""
+    await _ticketplus_retry_prepare(tab, config_dict)
     if config_dict.get('advanced', {}).get('ticketplus_direct_flow', False):
         return await _ticketplus_direct_submit(tab, config_dict)
     debug = util.create_debug_logger(config_dict)
@@ -2367,6 +2508,7 @@ async def _ticketplus_process_confirmation(tab, url, config_dict):
     if not isinstance(current, dict) or current.get('url') != url:
         return
     _ticketplus_queue_mark(f'確認頁網址已核對：{route}', config_dict)
+    await nodriver_ticketplus_retry_reset()
     _state.pop('submit_pending', None)
     _state['is_ticket_assigned'] = True
     if route == 'confirmseat':
@@ -2614,8 +2756,8 @@ async def nodriver_ticketplus_order(tab, config_dict, ocr, Captcha_Browser):
 
         if await _ticketplus_actions_paused(config_dict):
             return
-        await nodriver_ticketplus_ticket_agree(tab, config_dict)
-        _ticketplus_timing('條款已處理', config_dict)
+        terms_confirmed = await nodriver_ticketplus_ticket_agree(tab, config_dict)
+        _ticketplus_timing('條款已確認' if terms_confirmed else '條款勾選未確認（以網站驗證為準）', config_dict)
 
         is_form_submitted = await nodriver_ticketplus_click_next_button_unified(tab, config_dict)
 

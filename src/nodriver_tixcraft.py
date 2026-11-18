@@ -716,6 +716,10 @@ async def main(args):
         raise
     finally:
         try:
+            await asyncio.wait_for(nodriver_ticketplus_retry_reset(), timeout=0.7)
+        except (Exception, asyncio.CancelledError):
+            pass
+        try:
             await asyncio.wait_for(nodriver_disconnect_browser(session.get("browser")), timeout=3)
         except (Exception, asyncio.CancelledError):
             pass
@@ -924,6 +928,7 @@ async def _run_bot(args, session):
         if external_browser and not is_quit_bot:
             if await check_and_handle_pause(config_dict):
                 if not external_disconnected:
+                    await nodriver_ticketplus_retry_reset()
                     await nodriver_disconnect_browser(driver)
                     session["browser"] = None
                     external_disconnected = True
@@ -958,6 +963,7 @@ async def _run_bot(args, session):
             try:
                 disconnect_requested = os.path.isfile(util.get_instance_state_path(util.CONST_BROWSER_DISCONNECT_FILE))
                 if external_browser or disconnect_requested:
+                    await nodriver_ticketplus_retry_reset()
                     await nodriver_disconnect_browser(driver, preserve_process=disconnect_requested)
                 else:
                     await driver.stop()

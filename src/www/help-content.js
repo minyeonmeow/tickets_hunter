@@ -358,13 +358,15 @@ const HELP_CONTENT = {
 
   auto_reload_page_interval: {
     title: '自動刷新頁面間隔',
-    short: '活動頁面的自動重新整理間隔秒數（0 = 停用）',
+    short: '活動頁面的自動重新整理間隔，預設 1 秒，可填大於 0 的小數',
     detail: `
       <p>設定程式在目標頁面等待時自動刷新的間隔時間（單位：秒）。</p>
+      <p>預設 1 秒，可輸入任意大於 0 的秒數，例如 0.01 或 0.001。停用請使用自動重整開關；舊版設定的 0 保留原有行為。</p>
       <table class="table table-sm table-bordered">
         <thead><tr><th>值</th><th>行為</th></tr></thead>
         <tbody>
           <tr><td><code>0</code></td><td>停用自動刷新</td></tr>
+          <tr><td><code>1</code>（預設）</td><td>每次更新後等待 1 秒再嘗試</td></tr>
           <tr><td><code>3</code></td><td>每 3 秒重新整理一次</td></tr>
           <tr><td><code>5</code>（建議）</td><td>每 5 秒重新整理，平衡速度與負載</td></tr>
         </tbody>
@@ -1227,13 +1229,15 @@ const HELP_CONTENT_EN_META = {
   },
   auto_reload_page_interval: {
     title: 'Auto reload interval',
-    short: 'Automatic page reload interval in seconds. Set to 0 to disable.',
+    short: 'Automatic page reload interval. Defaults to 1 second; positive decimals are allowed.',
     detailHtml: `
       <p>Set how often the bot reloads the target page while waiting, in seconds.</p>
+      <p>Defaults to 1 second. Any positive number, such as 0.01 or 0.001, is accepted. Use the auto-refresh switch to disable refresh; legacy zero values retain their original behavior.</p>
       <table class="table table-sm table-bordered">
         <thead><tr><th>Value</th><th>Behavior</th></tr></thead>
         <tbody>
           <tr><td><code>0</code></td><td>Disable auto reload</td></tr>
+          <tr><td><code>1</code> (default)</td><td>Wait 1 second between updates</td></tr>
           <tr><td><code>3</code></td><td>Reload every 3 seconds</td></tr>
           <tr><td><code>5</code> (recommended)</td><td>Reload every 5 seconds for a balance between speed and load</td></tr>
         </tbody>

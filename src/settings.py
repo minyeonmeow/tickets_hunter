@@ -253,12 +253,14 @@ def get_default_config():
     config_dict["advanced"]["ticketplus_stock_api"] = True
     config_dict["advanced"]["ticketplus_stock_api_timeout"] = 5
     config_dict["advanced"]["ticketplus_direct_flow"] = False
+    config_dict["advanced"]["ticketplus_enqueue_retry_experiment"] = False
+    config_dict["advanced"]["ticketplus_enqueue_retry_interval"] = 1.0
     config_dict["advanced"]["ticketplus_session_api"] = True
     config_dict["advanced"]["ticketplus_session_api_cache_seconds"] = 60
     # remote_url will be dynamically generated based on server_port
     config_dict["advanced"]["remote_url"] = ""
 
-    config_dict["advanced"]["auto_reload_page_interval"] = 5
+    config_dict["advanced"]["auto_reload_page_interval"] = 1
     config_dict["advanced"]["tixcraft_soft_block_delay"] = ""
     config_dict["advanced"]["reset_browser_interval"] = 0
     config_dict["advanced"]["proxy_server_port"] = ""

@@ -1182,8 +1182,8 @@ function updateTixcraftSoftBlockDelayVisibility(url) {
 }
 
 // Toggle the notice shown when Tixcraft polling reloads are disabled (issue #396).
-// Uses the same conversion as the save handler (Number()): an empty field saves as 0,
-// and NaN or Infinity save as null, which the bot also treats as reload disabled.
+// Uses the same conversion as the save handler (Number()). Legacy/nonpositive
+// values can still be displayed, but new saves require a finite positive value.
 function updateTixcraftReloadDisabledNotice() {
     const noticeElement = document.getElementById('tixcraft-reload-disabled-warning');
     if (!noticeElement) return;
@@ -1284,6 +1284,8 @@ function load_settins_to_form(settings)
         server_port.value = settings.advanced.server_port || 16888;
         browser_connection_mode.value = settings.advanced.browser_connection_mode || 'attach';
         document.getElementById('ticketplus_direct_flow').checked = settings.advanced.ticketplus_direct_flow === true;
+        document.getElementById('ticketplus_enqueue_retry_experiment').checked = settings.advanced.ticketplus_enqueue_retry_experiment === true;
+        document.getElementById('ticketplus_enqueue_retry_interval').value = settings.advanced.ticketplus_enqueue_retry_interval ?? 1;
         browser_port.value = settings.advanced.browser_port ?? 19327;
         proxy_server_port.value  = settings.advanced.proxy_server_port;
         window_size.value  = settings.advanced.window_size;
@@ -1543,6 +1545,18 @@ function maxbot_shutdown_api()
 
 function save_changes_to_dict(silent_flag)
 {
+    const retryEnabled = document.getElementById('ticketplus_enqueue_retry_experiment').checked;
+    const retryInterval = Number(document.getElementById('ticketplus_enqueue_retry_interval').value);
+    const validRetryInterval = Number.isFinite(retryInterval) && retryInterval > 0;
+    if (retryEnabled && !validRetryInterval) {
+        message('TicketPlus 重試間隔請填寫大於 0 的秒數。');
+        return false;
+    }
+    const reloadInterval = Number(auto_reload_page_interval.value);
+    if (!Number.isFinite(reloadInterval) || reloadInterval <= 0) {
+        message('自動重整間隔請填寫大於 0 的秒數；停用重整請使用自動重整開關。');
+        return false;
+    }
     const browserPortValue = Number(browser_port.value);
     if (!Number.isInteger(browserPortValue) || browserPortValue < 1024 || browserPortValue > 65535) {
         browser_port.classList.add('is-invalid');
@@ -1603,13 +1617,15 @@ function save_changes_to_dict(silent_flag)
             settings.kktix.max_dwell_time = parseInt(max_dwell_time.value);
             if (!settings.tixcraft) settings.tixcraft = {};
 
-            settings.advanced.auto_reload_page_interval = Number(auto_reload_page_interval.value);
+            settings.advanced.auto_reload_page_interval = reloadInterval;
             settings.advanced.tixcraft_soft_block_delay = tixcraft_soft_block_delay_value;
             settings.tixcraft.allow_less_tickets = tixcraft_allow_less_tickets.checked;
             settings.advanced.reset_browser_interval = parseInt(reset_browser_interval.value);
             settings.advanced.server_port = parseInt(server_port.value) || 16888;
             settings.advanced.browser_connection_mode = browser_connection_mode.value;
             settings.advanced.ticketplus_direct_flow = document.getElementById('ticketplus_direct_flow').checked;
+            settings.advanced.ticketplus_enqueue_retry_experiment = retryEnabled;
+            settings.advanced.ticketplus_enqueue_retry_interval = validRetryInterval ? retryInterval : 1;
             settings.advanced.browser_port = browserPortValue;
             settings.advanced.proxy_server_port = proxy_server_port.value;
             settings.advanced.window_size = window_size.value;

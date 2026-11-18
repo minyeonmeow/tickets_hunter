@@ -1500,11 +1500,13 @@ async def _funone_refresh_stock(tab, config_dict):
         return False
 
     document_id = _state.get("flow_document_id")
-    interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 5)
+    interval = config_dict.get("advanced", {}).get("auto_reload_page_interval", 1)
     try:
-        interval = max(0.5, float(interval))
+        interval = float(interval)
+        if not 0 < interval < float('inf'):
+            interval = 0.5 if interval <= 0 else 1  # Keep legacy zero handling.
     except (ValueError, TypeError):
-        interval = 5
+        interval = 1
     if not await sleep_before_auto_refresh(interval) or await _funone_actions_paused(config_dict):
         return
     live_url = await nodriver_current_url_safe(tab)
