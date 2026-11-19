@@ -311,10 +311,10 @@ const HELP_CONTENT = {
   },
 
   idle_keyword: {
-    title: '系統時間 - 暫停關鍵字',
+    title: '排程時間 - 暫停關鍵字',
     short: '指定時刻自動暫停搶票（格式 HH:MM:SS，分號分隔多個）',
     detail: `
-      <p>當系統時間符合此欄位設定時，程式自動暫停搶票動作。</p>
+      <p>當排程時間符合此欄位設定時，程式自動暫停搶票動作。預設使用國家標準時間（UTC+8）；未校準成功或資料過期時會等候校時，不以本機時間擅自觸發。時間來源可在基本設定切換，儲存後生效。</p>
       <p><strong>格式：</strong><code>HH:MM:SS</code>（時:分:秒），多個時間用分號分隔</p>
       <p><strong>範例：</strong><code>12:00:00;18:00:00</code>（每天中午和傍晚暫停）</p>
       <p class="text-muted small mb-0">搭配「繼續關鍵字」使用，可實現自動排程搶票。詳細說明請展開下方「時間控制功能說明」。</p>`,
@@ -322,10 +322,10 @@ const HELP_CONTENT = {
   },
 
   resume_keyword: {
-    title: '系統時間 - 繼續關鍵字',
+    title: '排程時間 - 繼續關鍵字',
     short: '指定時刻自動恢復搶票（格式 HH:MM:SS，分號分隔多個）',
     detail: `
-      <p>當系統時間符合此欄位設定時，程式自動恢復搶票動作。</p>
+      <p>當排程時間符合此欄位設定時，程式自動恢復搶票動作。預設使用國家標準時間（UTC+8）；未校準成功或資料過期時會等候校時，不以本機時間擅自觸發。時間來源可在基本設定切換，儲存後生效。</p>
       <p><strong>格式：</strong><code>HH:MM:SS</code>（時:分:秒），多個時間用分號分隔</p>
       <p><strong>範例：</strong><code>10:00:00;14:00:00</code>（每天 10 點和下午 2 點開始搶票）</p>
       <p class="text-muted small mb-0">搭配「暫停關鍵字」使用，可實現自動排程搶票。詳細說明請展開下方「時間控制功能說明」。</p>`,
@@ -336,7 +336,7 @@ const HELP_CONTENT = {
     title: '秒數 - 暫停關鍵字',
     short: '每分鐘的指定秒數自動暫停（格式 SS，分號分隔多個）',
     detail: `
-      <p>當系統時間的<strong>秒數</strong>符合設定值時，程式自動暫停。每分鐘都會觸發一次。</p>
+      <p>當排程時間的<strong>秒數</strong>符合設定值時，程式自動暫停。預設依國家標準時間（UTC+8）的秒數判斷；未校準成功或資料過期時會等候校時，不會改以本機秒數觸發。有效時每分鐘都會觸發一次。</p>
       <p><strong>格式：</strong>僅填秒數 <code>SS</code>（00-59），多個用分號分隔</p>
       <p><strong>範例：</strong><code>00;30</code>（每分鐘的 0 秒和 30 秒暫停）</p>
       <p class="text-muted small mb-0">適合需要精確按秒控制的情境。詳細說明請展開下方「時間控制功能說明」。</p>`,
@@ -347,7 +347,7 @@ const HELP_CONTENT = {
     title: '秒數 - 繼續關鍵字',
     short: '每分鐘的指定秒數自動繼續（格式 SS，分號分隔多個）',
     detail: `
-      <p>當系統時間的<strong>秒數</strong>符合設定值時，程式自動恢復搶票。每分鐘都會觸發一次。</p>
+      <p>當排程時間的<strong>秒數</strong>符合設定值時，程式自動恢復搶票。預設依國家標準時間（UTC+8）的秒數判斷；未校準成功或資料過期時會等候校時，不會改以本機秒數觸發。有效時每分鐘都會觸發一次。</p>
       <p><strong>格式：</strong>僅填秒數 <code>SS</code>（00-59），多個用分號分隔</p>
       <p><strong>範例：</strong><code>05;35</code>（每分鐘的 5 秒和 35 秒恢復搶票）</p>
       <p class="text-muted small mb-0">適合需要精確按秒控制的情境。詳細說明請展開下方「時間控制功能說明」。</p>`,
@@ -613,7 +613,8 @@ const HELP_CONTENT = {
       <p>設定程式在指定的日期時間才開始嘗試搶票。用於場次在特定時間才開放售票的情境。</p>
       <p><strong>格式：</strong><code>YYYY/MM/DD HH:MM:SS</code></p>
       <p>範例：<code>2025/12/25 10:00:00</code></p>
-      <p>在指定時間到達前，程式會持續等待並每秒確認時間。時間到達後立即開始刷新搶票。FunOne 請先手動進入票區，可提前準備張數與條款；指定時間以本機時間判斷，請先同步電腦時間；網站時間僅供參考，不阻擋操作，保留預選、不重整整頁。到點後購買仍不可用時，若自動重整已開啟，才嘗試網站的「更新頁面」，並遵守冷卻。</p>
+      <p>在指定時間到達前，程式會持續等待。預設以國家標準時間（UTC+8）判斷指定開始、定時暫停與繼續；尚未校準或校時資料過期時會等候校時，不會默默切回本機時間。畫面可按「立即校時」查看狀態與標準時間減本機時間的差距；毫秒顯示不代表毫秒精度，仍有網路與處理誤差。官方 NTP 無法連線時可使用官方網站備援，畫面會標示為估算。取消「使用國家標準時間」並儲存、重新開始後才改用本機時間。</p>
+      <p>FunOne 請先手動進入票區，可提前準備張數與條款。保留預選、不重整整頁；到點後購買仍不可用時，若自動重整已開啟，才嘗試網站的「更新頁面」，並遵守冷卻。</p>
       <p class="text-muted small mb-0">提示：建議設定比開售時間早 1-2 秒，補償網路與處理延遲。</p>`,
     faq: [
       {
@@ -1192,19 +1193,19 @@ const HELP_CONTENT_EN_META = {
       <p class="text-muted small mb-0">If both account credentials and a cookie are filled in, the bot uses the cookie first.</p>`,
   },
   idle_keyword: {
-    title: 'System time pause keywords',
+    title: 'Schedule clock pause keywords',
     short: 'Pause ticketing automatically at specific times. Format: HH:MM:SS, separated by semicolons.',
     detailHtml: `
-      <p>When the system time matches any value in this field, the bot pauses automatically.</p>
+      <p>When the schedule clock matches this field, the bot pauses automatically. National standard time (UTC+8) is the default. Unsynchronized or expired time waits for synchronization and does not trigger from local time. Change the source in Basic settings and save to apply it.</p>
       <p><strong>Format:</strong> <code>HH:MM:SS</code> (hour:minute:second). Separate multiple values with semicolons.</p>
       <p><strong>Example:</strong> <code>12:00:00;18:00:00</code> (pause every day at noon and 6 PM)</p>
       <p class="text-muted small mb-0">Use together with "resume keywords" for automatic ticketing schedules. For more details, open the "Time control" help section below.</p>`,
   },
   resume_keyword: {
-    title: 'System time resume keywords',
+    title: 'Schedule clock resume keywords',
     short: 'Resume ticketing automatically at specific times. Format: HH:MM:SS, separated by semicolons.',
     detailHtml: `
-      <p>When the system time matches any value in this field, the bot resumes automatically.</p>
+      <p>When the schedule clock matches this field, the bot resumes automatically. National standard time (UTC+8) is the default. Unsynchronized or expired time waits for synchronization and does not trigger from local time. Change the source in Basic settings and save to apply it.</p>
       <p><strong>Format:</strong> <code>HH:MM:SS</code> (hour:minute:second). Separate multiple values with semicolons.</p>
       <p><strong>Example:</strong> <code>10:00:00;14:00:00</code> (resume every day at 10 AM and 2 PM)</p>
       <p class="text-muted small mb-0">Use together with "pause keywords" for automatic ticketing schedules. For more details, open the "Time control" help section below.</p>`,
@@ -1213,7 +1214,7 @@ const HELP_CONTENT_EN_META = {
     title: 'Second-based pause keywords',
     short: 'Pause ticketing automatically at specific seconds each minute. Format: SS, separated by semicolons.',
     detailHtml: `
-      <p>When the <strong>seconds</strong> part of the system time matches a configured value, the bot pauses automatically. This triggers once every minute.</p>
+      <p>When the <strong>seconds</strong> part of the schedule clock matches, the bot pauses automatically. National standard time (UTC+8) is the default; unavailable or expired synchronization waits instead of using local seconds. With a valid clock, this triggers each minute.</p>
       <p><strong>Format:</strong> second values only, <code>SS</code> (00-59). Separate multiple values with semicolons.</p>
       <p><strong>Example:</strong> <code>00;30</code> (pause at 0 and 30 seconds every minute)</p>
       <p class="text-muted small mb-0">Useful when you need precise second-level control. For more details, open the "Time control" help section below.</p>`,
@@ -1222,7 +1223,7 @@ const HELP_CONTENT_EN_META = {
     title: 'Second-based resume keywords',
     short: 'Resume ticketing automatically at specific seconds each minute. Format: SS, separated by semicolons.',
     detailHtml: `
-      <p>When the <strong>seconds</strong> part of the system time matches a configured value, the bot resumes automatically. This triggers once every minute.</p>
+      <p>When the <strong>seconds</strong> part of the schedule clock matches, the bot resumes automatically. National standard time (UTC+8) is the default; unavailable or expired synchronization waits instead of using local seconds. With a valid clock, this triggers each minute.</p>
       <p><strong>Format:</strong> second values only, <code>SS</code> (00-59). Separate multiple values with semicolons.</p>
       <p><strong>Example:</strong> <code>05;35</code> (resume at 5 and 35 seconds every minute)</p>
       <p class="text-muted small mb-0">Useful when you need precise second-level control. For more details, open the "Time control" help section below.</p>`,
@@ -1456,7 +1457,8 @@ const HELP_CONTENT_EN_META = {
       <p>Set the exact date and time when the bot should start trying to get tickets. This is useful when sales open at a specific moment.</p>
       <p><strong>Format:</strong> <code>YYYY/MM/DD HH:MM:SS</code></p>
       <p>Example: <code>2025/12/25 10:00:00</code></p>
-      <p>Before the target time, the bot waits and checks the time once per second. As soon as the target time is reached, it starts refreshing and ticketing immediately. For FunOne, enter the ticket page manually and prepare selection and terms early. The target uses local computer time; synchronize the computer clock first. Website time is informational and never blocks scheduled actions. The bot preserves the page; if Purchase is still unavailable after the target, it tries the site's Update Page button when auto refresh is enabled, respecting the cooldown.</p>
+      <p>Scheduled start, pause and resume use national standard time (UTC+8) by default. Actions wait when synchronization is unavailable or expired instead of silently switching to local time. Use Sync now to view status and the estimated standard-minus-local offset. Millisecond display is not a precision guarantee. If official NTP is unavailable, the official website fallback is labelled as an estimate. Disable the national-time option, save and restart the instance to use local time explicitly.</p>
+      <p>For FunOne, enter the ticket page manually and prepare selection and terms early. The bot preserves the page; if Purchase is still unavailable after the target, it tries the site's Update Page button when auto refresh is enabled, respecting the cooldown.</p>
       <p class="text-muted small mb-0">Tip: set this 1-2 seconds before the official sale time to compensate for network and processing delay.</p>`,
     faq: [
       {

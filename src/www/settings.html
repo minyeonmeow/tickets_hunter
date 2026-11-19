@@ -434,6 +434,10 @@
           </label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <input class="form-control" id="refresh_datetime" value="" placeholder="YYYY/MM/DD HH:MM:SS" />
+            <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="standard_time_enabled" checked /><label class="form-check-label" for="standard_time_enabled">指定時間使用國家標準時間（UTC+8）</label></div>
+            <div class="d-flex align-items-center gap-2 mt-2"><button class="btn btn-sm btn-outline-secondary" type="button" id="standard_time_sync">立即校時</button><span id="standard_time_value" class="font-monospace">—</span></div>
+            <div class="form-text" id="standard_time_status" role="status">正在讀取校時狀態；未完成校時前，指定時間操作會等待。</div>
+            <small class="form-text text-muted" id="standard_time_help">預設以國家標準時間判斷指定開始、定時暫停與繼續。顯示含毫秒不代表毫秒精度，仍有網路與處理誤差。未校準或資料過期時會等候校時，不會自動改用本機時間；變更來源請儲存後重新開始。</small>
           </div>
         </div>
 
@@ -1177,21 +1181,21 @@
 
 
         <div class="row mb-3">
-          <label for="system_time" class="col-sm-2 col-form-label">系統時間</label>
+          <label for="system_time" class="col-sm-2 col-form-label">排程判斷時間（UTC+8）</label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <span id="system_time"></span>
           </div>
         </div>
 
         <details class="ticket-settings-group"><summary>自動暫停與繼續排程（選用）</summary><div class="pt-3"><div class="row mb-3">
-          <label for="idle_keyword" class="col-sm-2 col-form-label">系統時間 - <span class="text-danger">暫停</span>關鍵字<span class="help-icon" data-help="idle_keyword" title="系統時間暫停關鍵字說明" tabindex="0" role="button" aria-label="系統時間暫停關鍵字 說明"></span></label>
+          <label for="idle_keyword" class="col-sm-2 col-form-label">排程時間 - <span class="text-danger">暫停</span>關鍵字<span class="help-icon" data-help="idle_keyword" title="系統時間暫停關鍵字說明" tabindex="0" role="button" aria-label="系統時間暫停關鍵字 說明"></span></label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <input type="text" class="form-control" id="idle_keyword" placeholder="例如：09:30:00;14:15:30">
           </div>
         </div>
 
         <div class="row mb-3">
-          <label for="resume_keyword" class="col-sm-2 col-form-label">系統時間 - <span class="text-success">繼續</span>關鍵字<span class="help-icon" data-help="resume_keyword" title="系統時間繼續關鍵字說明" tabindex="0" role="button" aria-label="系統時間繼續關鍵字 說明"></span></label>
+          <label for="resume_keyword" class="col-sm-2 col-form-label">排程時間 - <span class="text-success">繼續</span>關鍵字<span class="help-icon" data-help="resume_keyword" title="系統時間繼續關鍵字說明" tabindex="0" role="button" aria-label="系統時間繼續關鍵字 說明"></span></label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
             <input type="text" class="form-control" id="resume_keyword" placeholder="例如：09:35:00;14:20:30">
           </div>
@@ -1225,17 +1229,17 @@
                   <div class="accordion-body">
                     <strong>功能說明：</strong>
                     <ul class="mb-3">
-                      <li><strong>系統時間關鍵字：</strong>使用 <code>HH:MM:SS</code> 格式（時:分:秒）</li>
+                      <li><strong>排程時間關鍵字：</strong>使用 <code>HH:MM:SS</code> 格式（時:分:秒）；預設依國家標準時間（UTC+8），校時未成功或過期時等待校時。</li>
                       <li><strong>秒數關鍵字：</strong>只使用秒數 <code>SS</code> 格式（每分鐘的指定秒數觸發）</li>
-                      <li><strong>暫停功能：</strong>當系統時間符合暫停關鍵字時，自動暫停搶票動作</li>
-                      <li><strong>繼續功能：</strong>當系統時間符合繼續關鍵字時，自動恢復搶票動作</li>
+                      <li><strong>暫停功能：</strong>當排程時間符合暫停關鍵字時，自動暫停搶票動作</li>
+                      <li><strong>繼續功能：</strong>當排程時間符合繼續關鍵字時，自動恢復搶票動作</li>
                     </ul>
 
                     <div class="alert alert-success mb-3">
                       <strong>📝 輸入格式範例：</strong>
                       <div class="row">
                         <div class="col-md-6">
-                          <strong>系統時間：</strong>
+                          <strong>排程時間：</strong>
                           <ul class="mb-1">
                             <li><code>09:30:00;15:55:00</code></li>
                             <li><code>"09:30:00";"15:55:00"</code></li>
@@ -1257,7 +1261,7 @@
                       <strong>注意事項：</strong>
                       <ul class="mb-0">
                         <li>時間格式必須精確，格式錯誤會導致功能失效</li>
-                        <li>程式會持續檢查系統時間，匹配到設定時間會立即執行對應動作</li>
+                        <li>程式會持續檢查所選時間來源，未完成校時時不擅自使用本機時間觸發；匹配到設定時間才執行對應動作</li>
                         <li>建議搭配暫停與繼續關鍵字使用，避免程式一直處於暫停狀態</li>
                         <li>秒數關鍵字會在每分鐘的指定秒數觸發，適合做週期性控制</li>
                       </ul>

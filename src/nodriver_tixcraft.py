@@ -34,6 +34,7 @@ import urllib.parse
 
 import util
 import settings
+import standard_time
 from NonBrowser import NonBrowser
 
 
@@ -545,7 +546,7 @@ async def _inject_clarity_stub_for_ticketplus(tab):
 
 
 
-def parse_refresh_datetime(target_str):
+def parse_refresh_datetime(target_str, now=None):
     # Parse refresh_datetime setting to a datetime object.
     # Supports: "YYYY/MM/DD HH:MM:SS" | "HH:MM:SS" (today) | "" (disabled)
     # Returns: datetime or None
@@ -557,7 +558,7 @@ def parse_refresh_datetime(target_str):
             return datetime.strptime(target_str, '%Y/%m/%d %H:%M:%S')
         else:
             # Stage 0: legacy HH:MM:SS format, treat as today
-            today = datetime.now().date()
+            today = (now or datetime.now()).date()
             t = datetime.strptime(target_str, '%H:%M:%S').time()
             return datetime.combine(today, t)
     except ValueError:
@@ -566,13 +567,43 @@ def parse_refresh_datetime(target_str):
 
 async def _release_scheduled_start(tab, target_dt, config_dict):
     if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
-        return
+        return False
     url = await nodriver_current_url_safe(tab)
+    if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
+        return False
+    now = standard_time.get_datetime(config_dict)
+    if now is None or now < target_dt:
+        return False
     parsed = urllib.parse.urlsplit(url or "")
     if parsed.hostname == 'tickets.funone.io':
         util.create_debug_logger(config_dict).log("[FUNONE] 保留目前購票頁與預選狀態，不重整整頁。")
-        return
+        return True
     await reload_page_if_enabled(tab)
+    return True
+
+
+async def _wait_for_scheduled_target(target_dt, config_dict):
+    """最後兩秒仍重讀校時來源，校時失效或暫停時不能提前放行。"""
+    while True:
+        if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
+            return False
+        now = standard_time.get_datetime(config_dict)
+        if now is None:
+            return False
+        remaining = (target_dt - now).total_seconds()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(remaining, 0.05))
+
+
+def _scheduled_clock_notice(config_dict, state, waiting):
+    if state.get('clock_waiting') == waiting:
+        return
+    state['clock_waiting'] = waiting
+    message = ('國家標準時間尚未校時成功或資料已過期，指定時間操作等待校時；不使用未校準的本機時間觸發。'
+               if waiting else '國家標準時間已可用，依設定時間繼續等待或開始。')
+    util.create_debug_logger(enabled=True).log('[時間來源] ' + message)
+    util.write_instance_status('running', message)
 
 
 async def check_refresh_datetime_gate(tab, config_dict, state):
@@ -595,24 +626,38 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
         state["target_str"] = current_str
         state["reached"] = False
         state["last_countdown_print"] = 0
+        state.pop('target_dt', None)
 
     # If already reached, no gating
     if state["reached"]:
         return False
 
-    target_dt = parse_refresh_datetime(current_str)
+    if not str(current_str or '').strip():
+        state['reached'] = True
+        return False
+    now = standard_time.get_datetime(config_dict)
+    if now is None:
+        _scheduled_clock_notice(config_dict, state, True)
+        return True
+    if state.get('clock_waiting'):
+        _scheduled_clock_notice(config_dict, state, False)
+    # Pin a time-only target to its first valid date, including across a sync outage.
+    target_dt = state.get('target_dt')
+    if target_dt is None:
+        target_dt = parse_refresh_datetime(current_str, now=now)
+        state['target_dt'] = target_dt
     if target_dt is None:
         # Empty or invalid = no waiting
         state["reached"] = True
         return False
 
-    now = datetime.now()
-
     # Already past target time (covers "bot starts after target" case)
     if now >= target_dt:
         state["reached"] = True
         try:
-            await _release_scheduled_start(tab, target_dt, config_dict)
+            if await _release_scheduled_start(tab, target_dt, config_dict) is False:
+                state['reached'] = False
+                return True
             print("[REFRESH] Target time reached, starting:", target_dt.strftime('%Y/%m/%d %H:%M:%S'))
         except Exception:
             pass
@@ -622,7 +667,7 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
     remaining = (target_dt - now).total_seconds()
 
     # Countdown display
-    now_mono = time.time()
+    now_mono = time.perf_counter()
     should_print = False
     if remaining <= 60:
         if now_mono - state["last_countdown_print"] >= 1.0:
@@ -644,17 +689,15 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
             print(f"[WAIT] Target: {current_str} | Remaining: {remaining:.1f}s")
         state["last_countdown_print"] = now_mono
 
-    # Final 2-second approach: yield to event loop instead of busy-waiting
-    # asyncio.sleep precision (~1ms on Windows) is sufficient; help text already
-    # instructs users to set refresh_datetime 1-2 seconds before the target.
+    # 最後兩秒可中斷等待，醒來後仍依有效的標準時間判定，不能直接假設已到時。
     if remaining <= 2.0:
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        if await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict):
+        if not await _wait_for_scheduled_target(target_dt, config_dict):
             return True
         state["reached"] = True
         try:
-            await _release_scheduled_start(tab, target_dt, config_dict)
+            if await _release_scheduled_start(tab, target_dt, config_dict) is False:
+                state['reached'] = False
+                return True
             print("[REFRESH] Target time reached, starting:", target_dt.strftime('%Y/%m/%d %H:%M:%S'))
         except Exception:
             pass
@@ -694,7 +737,10 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                     "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
                     "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
                     "discount_code", "ticketplus_stock_api", "ticketplus_stock_api_timeout", "ticketplus_direct_flow",
-                    "ticketplus_session_api", "ticketplus_session_api_cache_seconds"
+                    "ticketplus_session_api", "ticketplus_session_api_cache_seconds",
+                    "standard_time_enabled", "standard_time_servers", "standard_time_timeout",
+                    "standard_time_sync_interval", "standard_time_max_age", "standard_time_retry_interval",
+                    "standard_time_https_fallback"
                 ]
                 for field in adv_fields:
                     if field in new_config["advanced"]:
@@ -760,6 +806,8 @@ async def _run_bot(args, session):
     util.write_instance_status("starting", "正在連接 Chrome。")
     logger.info(f'[啟動耗時] Python 模組就緒：{time.monotonic() - _BOOT_STARTED:.3f} 秒')
     config_dict = get_config_dict(args)
+    if config_dict:
+        standard_time.request_sync(config_dict)
 
     # Global log prefix: override builtins.print to prepend an optional
     # [HH:MM:SS] timestamp and an always-on [instance] tag. Multi-instance runs
@@ -773,7 +821,10 @@ async def _run_bot(args, session):
     def _prefixed_print(*args_p, **kwargs_p):
         prefix_parts = []
         if _show_timestamp:
-            prefix_parts.append(datetime.now().strftime("[%H:%M:%S]"))
+            clock_now = standard_time.get_datetime(config_dict)
+            prefix_parts.append((clock_now or datetime.now()).strftime("[%H:%M:%S]"))
+            if clock_now is None:
+                prefix_parts.append('[本機顯示／尚未校時]')
         prefix_parts.append(_instance_tag)
         _original_print(*prefix_parts, *args_p, **kwargs_p)
     builtins.print = _prefixed_print

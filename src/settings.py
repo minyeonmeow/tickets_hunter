@@ -21,6 +21,7 @@ from tornado.web import StaticFileHandler
 
 import requests
 import util
+import standard_time
 from runtime_manager import WorkerManager, supports_warm_worker
 
 from typing import (
@@ -245,6 +246,13 @@ def get_default_config():
 
     # Server port for settings web interface (Issue #156)
     config_dict["advanced"]["server_port"] = CONST_SERVER_PORT
+    config_dict["advanced"]["standard_time_enabled"] = True
+    config_dict["advanced"]["standard_time_servers"] = ['time.stdtime.gov.tw', 'clock.stdtime.gov.tw']
+    config_dict["advanced"]["standard_time_timeout"] = 1
+    config_dict["advanced"]["standard_time_sync_interval"] = 300
+    config_dict["advanced"]["standard_time_max_age"] = 900
+    config_dict["advanced"]["standard_time_retry_interval"] = 30
+    config_dict["advanced"]["standard_time_https_fallback"] = True
     config_dict["advanced"]["browser_connection_mode"] = "attach"
     config_dict["advanced"]["browser_port"] = 19327
     config_dict["advanced"]["warm_ticketplus_worker"] = True
@@ -525,13 +533,18 @@ def change_maxbot_status_by_keyword():
     # do not collide. maxbot_idle/resume(profile) resolve to that instance's
     # state dir. Ad-hoc / numbered instances (no profile json) are not scheduled
     # here -- their backing profile is only known to the launcher.
-    system_clock_data = datetime.now()
-    current_hms = system_clock_data.strftime('%H:%M:%S')
-    current_sec = system_clock_data.strftime('%S')
-
     for profile_name in list_profile_names():
         _, config_dict = load_json(profile_name)
         advanced = config_dict.get("advanced", {})
+        if not any(advanced.get(key) for key in
+                   ('idle_keyword', 'resume_keyword', 'idle_keyword_second', 'resume_keyword_second')):
+            continue
+        system_clock_data = standard_time.get_datetime(config_dict)
+        if system_clock_data is None:
+            standard_time.request_sync(config_dict)
+            continue
+        current_hms = system_clock_data.strftime('%H:%M:%S')
+        current_sec = system_clock_data.strftime('%S')
 
         if len(advanced.get("idle_keyword", "")) > 0:
             if util.is_text_match_keyword(advanced["idle_keyword"], current_hms):
@@ -695,6 +708,32 @@ class InstancesHandler(tornado.web.RequestHandler):
     def get(self):
         instances = [get_instance_status(name, self.application.workers) for name in list_instance_ids()]
         self.write({"instances": instances})
+
+class ClockHandler(tornado.web.RequestHandler):
+    def _clock_status(self, force=False):
+        profile = self.get_query_argument('profile', '')
+        if profile and not is_valid_profile_name(profile):
+            self.set_status(400)
+            self.write({'error': 'invalid profile name'})
+            return
+        _, config = load_json(profile)
+        started = standard_time.request_sync(config, force=force)
+        payload = dict(standard_time.get_status(config))
+        payload.update(profile=profile or CONST_DEFAULT_PROFILE,
+                       enabled=config.get('advanced', {}).get('standard_time_enabled', True) is not False,
+                       sync_started=bool(started))
+        self.set_header('Cache-Control', 'no-store')
+        self.write(payload)
+
+    def get(self):
+        self._clock_status()
+
+
+class ClockSyncHandler(ClockHandler):
+    def post(self):
+        # 校時在共用模組的背景執行緒進行，不讓 HTTP 請求等待 NTP。
+        self._clock_status(force=True)
+
 
 class AutoRefreshHandler(tornado.web.RequestHandler):
     def get(self):
@@ -1284,6 +1323,8 @@ def create_application(ocr=None):
         # status api
         ("/status", StatusHandler),
         ("/instances", InstancesHandler),
+        ("/clock", ClockHandler),
+        ("/clock/sync", ClockSyncHandler),
         ("/auto_refresh", AutoRefreshHandler),
         ("/pause", PauseHandler),
         ("/resume", ResumeHandler),

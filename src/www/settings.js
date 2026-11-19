@@ -71,6 +71,118 @@ function toggleAutoRefresh() {
 const homepage = document.querySelector('#homepage');
 const ticket_number = document.querySelector('#ticket_number');
 const refresh_datetime = document.querySelector('#refresh_datetime');
+const standardTimeEnabled = document.querySelector('#standard_time_enabled');
+const standardTimeSync = document.querySelector('#standard_time_sync');
+let standardClockAnchor = null;
+let standardClockRequest = 0;
+let standardClockSyncRequest = 0;
+let standardClockSyncBusy = false;
+let standardClockBurstTimer = null;
+
+function renderStandardClock() {
+    const value = document.querySelector('#standard_time_value');
+    const status = document.querySelector('#standard_time_status');
+    if (!value || !status) return;
+    const en = currentLanguage === 'en';
+    standardTimeSync.textContent = en ? 'Sync now' : '立即校時';
+    document.querySelector('label[for="standard_time_enabled"]').textContent = en
+        ? 'Use national standard time for scheduled actions (UTC+8)' : '指定時間使用國家標準時間（UTC+8）';
+    document.querySelector('#standard_time_help').textContent = en
+        ? 'Scheduled start, pause and resume use national standard time by default. Millisecond display is not a precision guarantee; network and processing errors remain. Unsynchronized or expired time blocks scheduled actions. Save a source change and restart the instance.'
+        : '預設以國家標準時間判斷指定開始、定時暫停與繼續。顯示含毫秒不代表毫秒精度，仍有網路與處理誤差。未校準或資料過期時會等候校時，不會自動改用本機時間；變更來源請儲存後重新開始。';
+    const anchor = standardClockAnchor;
+    const data = anchor && anchor.data;
+    const changed = data && data.enabled !== standardTimeEnabled.checked;
+    standardTimeSync.disabled = standardClockSyncBusy || !!changed || !standardTimeEnabled.checked || !!(data && data.status === 'syncing');
+    value.textContent = '—';
+    const scheduleValue = document.querySelector('#system_time');
+    if (scheduleValue) scheduleValue.textContent = '—';
+    setRowLabelForField('system_time', en ? 'Schedule clock' : '排程判斷時間');
+    if (changed) {
+        status.textContent = en ? 'Time source changed. Save settings to apply it.' : '時間來源已變更，請先儲存設定。';
+        return;
+    }
+    if (!data) {
+        status.textContent = en ? 'Reading time status. Scheduled actions wait until synchronization succeeds.' : '正在讀取校時狀態；未完成校時前，指定時間操作會等待。';
+        return;
+    }
+    const elapsed = Math.max(0, performance.now() - anchor.receivedAt);
+    const age = Number.isFinite(data.age_seconds) ? data.age_seconds + elapsed / 1000 : Infinity;
+    const maxAge = Number.isFinite(data.max_age_seconds) ? data.max_age_seconds : 900;
+    const local = data.enabled === false;
+    const epoch = local ? data.local_epoch : data.epoch;
+    const zoneMinutes = local ? data.local_utc_offset_minutes : 480;
+    if (local && !Number.isFinite(zoneMinutes)) {
+        status.textContent = en ? 'Cannot read the server computer time zone.' : '無法讀取設定服務的本機時區。';
+        return;
+    }
+    const valid = Number.isFinite(epoch) && (local || (data.synchronized === true && age <= maxAge));
+    if (!valid) {
+        const cause = data.status === 'syncing' ? (en ? 'Synchronizing' : '校時中')
+            : age > maxAge && data.synchronized ? (en ? 'Synchronization expired' : '校時資料已過期')
+            : data.status === 'stale' ? (en ? 'Synchronization expired' : '校時資料已過期')
+            : (en ? 'Time is not synchronized' : '尚未校準成功');
+        status.textContent = cause + (en ? '; scheduled actions wait for synchronization.' : '；指定時間操作會等待校時。')
+            + (data.error ? ' ' + String(data.error) : '');
+        return;
+    }
+    const clock = new Date(epoch * 1000 + elapsed + zoneMinutes * 60 * 1000);
+    const pad = (n, size = 2) => String(n).padStart(size, '0');
+    value.textContent = clock.getUTCFullYear() + '/' + pad(clock.getUTCMonth() + 1) + '/' + pad(clock.getUTCDate()) + ' '
+        + pad(clock.getUTCHours()) + ':' + pad(clock.getUTCMinutes()) + ':' + pad(clock.getUTCSeconds()) + '.' + pad(clock.getUTCMilliseconds(), 3);
+    if (scheduleValue) scheduleValue.textContent = value.textContent;
+    if (local) {
+        const zone = 'UTC' + (zoneMinutes >= 0 ? '+' : '-') + pad(Math.floor(Math.abs(zoneMinutes) / 60)) + ':' + pad(Math.abs(zoneMinutes) % 60);
+        status.textContent = en ? 'Local computer time (' + zone + '); national standard time is disabled.' : '本機時間（' + zone + '）；未使用國家標準時間。';
+        setRowLabelForField('system_time', en ? 'Local schedule clock (' + zone + ')' : '本機排程時間（' + zone + '）');
+        return;
+    }
+    setRowLabelForField('system_time', en ? 'National schedule clock (UTC+8)' : '標準排程時間（UTC+8）');
+    const https = String(data.protocol || data.source || '').toLowerCase().includes('https');
+    const source = https ? (en ? 'National standard time (official website fallback / estimated)' : '國家標準時間（官方網站備援／估算）')
+        : (en ? 'National standard time (NTP)' : '國家標準時間（NTP）');
+    const offset = Number.isFinite(data.offset_ms) ? Math.round(data.offset_ms) : null;
+    status.textContent = source + ' UTC+8'
+        + (offset === null ? '' : (en ? '; standard − local ≈ ' : '；標準減本機約 ') + (offset >= 0 ? '+' : '') + offset + ' ms')
+        + (data.status === 'syncing' ? (en ? '; updating in background' : '；背景校時中') : '')
+        + (data.error ? (en ? '; using a still-valid earlier synchronization' : '；目前沿用仍有效的上次校時資料') : '');
+}
+
+function refreshStandardClock() {
+    const request = ++standardClockRequest;
+    const profile = current_profile;
+    $.getJSON('/clock' + profile_query()).done(function(data) {
+        if (request !== standardClockRequest || profile !== current_profile) return;
+        standardClockAnchor = {data: data, receivedAt: performance.now()};
+        renderStandardClock();
+    }).fail(function() {
+        if (request !== standardClockRequest || profile !== current_profile) return;
+        standardClockAnchor = {data: {enabled: standardTimeEnabled.checked, status: 'error', synchronized: false,
+            error: currentLanguage === 'en' ? 'Cannot connect to the settings service.' : '無法連接設定服務。'}, receivedAt: performance.now()};
+        renderStandardClock();
+    });
+}
+
+function syncStandardClock() {
+    if (standardTimeSync.disabled) return;
+    const request = ++standardClockSyncRequest;
+    const profile = current_profile;
+    standardClockSyncBusy = true;
+    renderStandardClock();
+    $.ajax({url: '/clock/sync' + profile_query(), method: 'POST'}).always(function() {
+        if (request !== standardClockSyncRequest || profile !== current_profile) return;
+        standardClockSyncBusy = false;
+        let remaining = 6;
+        const recheck = function() {
+            if (request !== standardClockSyncRequest || profile !== current_profile) return;
+            refreshStandardClock();
+            if (--remaining > 0) standardClockBurstTimer = setTimeout(recheck, 1000);
+        };
+        clearTimeout(standardClockBurstTimer);
+        recheck();
+    });
+}
+
 const date_select_mode = document.querySelector('#date_select_mode');
 const date_keyword = document.querySelector('#date_keyword');
 const date_auto_fallback = document.querySelector('#date_auto_fallback');
@@ -735,11 +847,11 @@ function renderAutofillTabTranslations() {
 
 function renderRuntimeTabTranslations() {
     setRowLabelForField('last_url', 'Current URL');
-    setRowLabelForField('system_time', 'System time');
+    setRowLabelForField('system_time', 'Schedule clock (UTC+8)');
     applyOrRestore('#pause_btn', 'textContent', 'Pause');
     applyOrRestore('#resume_btn', 'textContent', 'Resume');
-    setRowLabelForField('idle_keyword', fieldLabel('System time - <span class="text-danger">Pause</span> keywords', 'idle_keyword'));
-    setRowLabelForField('resume_keyword', fieldLabel('System time - <span class="text-success">Resume</span> keywords', 'resume_keyword'));
+    setRowLabelForField('idle_keyword', fieldLabel('Schedule clock - <span class="text-danger">Pause</span> keywords', 'idle_keyword'));
+    setRowLabelForField('resume_keyword', fieldLabel('Schedule clock - <span class="text-success">Resume</span> keywords', 'resume_keyword'));
     setRowLabelForField('idle_keyword_second', fieldLabel('Seconds - <span class="text-danger">Pause</span> keywords', 'idle_keyword_second'));
     setRowLabelForField('resume_keyword_second', fieldLabel('Seconds - <span class="text-success">Resume</span> keywords', 'resume_keyword_second'));
 
@@ -834,6 +946,7 @@ function applyLanguage(language) {
     if (typeof update_multi_open_warnings === 'function') update_multi_open_warnings(last_profile_details);
     updateThemeStatus(document.documentElement.getAttribute('data-bs-theme') || 'light');
     renderAutoRefreshMode();
+    renderStandardClock();
 
     if (currentHelpField) {
         const openField = currentHelpField;
@@ -1254,6 +1367,14 @@ function load_settins_to_form(settings)
         homepage.value = settings.homepage;
         ticket_number.value = settings.ticket_number;
         refresh_datetime.value = settings.refresh_datetime;
+        standardTimeEnabled.checked = settings.advanced.standard_time_enabled !== false;
+        ++standardClockRequest;
+        ++standardClockSyncRequest;
+        clearTimeout(standardClockBurstTimer);
+        standardClockSyncBusy = false;
+        standardClockAnchor = null;
+        renderStandardClock();
+        refreshStandardClock();
         date_select_mode.value = settings.date_auto_select.mode;
         date_keyword.value = format_keyword_for_display(settings.date_auto_select.date_keyword);
         date_auto_fallback.checked = settings.date_auto_fallback || false;
@@ -1593,6 +1714,7 @@ function save_changes_to_dict(silent_flag)
             settings.homepage = homepage.value;
             settings.ticket_number = ticket_number_value;
             settings.refresh_datetime = refresh_datetime.value;
+            settings.advanced.standard_time_enabled = standardTimeEnabled.checked;
             settings.date_auto_select.mode = date_select_mode.value;
             settings.date_auto_select.date_keyword = format_config_keyword_for_json(date_keyword.value);
             settings.date_auto_fallback = date_auto_fallback.checked;
@@ -1725,6 +1847,7 @@ function maxbot_save_api(callback)
         .done(function(data) {
             console.log("[MaxBot] 設定儲存成功");
             check_unsaved_fields();
+            refreshStandardClock();
             if(callback) callback();
         })
         .fail(function(xhr, status, error) {
@@ -1982,11 +2105,7 @@ function maxbot_version_api()
 
 function update_system_time()
 {
-    var currentdate = new Date(); 
-    var datetime = ("0" + currentdate.getHours()).slice(-2) + ":"  
-                + ("0" + currentdate.getMinutes()).slice(-2) + ":" 
-                + ("0" + currentdate.getSeconds()).slice(-2);
-    $("#system_time").html(datetime);
+    renderStandardClock();
 }
 
 var status_interval= setInterval(() => {
@@ -2381,6 +2500,10 @@ function stopQuestionPolling() {
 
 // Start polling when page loads
 startQuestionPolling();
+standardTimeEnabled.addEventListener('change', renderStandardClock);
+standardTimeSync.addEventListener('click', syncStandardClock);
+setInterval(refreshStandardClock, 10000);
+setInterval(renderStandardClock, 100);
 
 // Cityline login hint visibility control
 if (cityline_account) {

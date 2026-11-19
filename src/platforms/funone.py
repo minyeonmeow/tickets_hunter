@@ -13,6 +13,7 @@ from zendriver import cdp
 
 
 import util
+import standard_time
 from nodriver_common import evaluate_refresh_if_enabled, sleep_before_auto_refresh
 from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled
 from nodriver_common import (
@@ -81,9 +82,20 @@ def _funone_server_now():
 
 def _funone_scheduled_delay(config_dict):
     target = str(config_dict.get("refresh_datetime") or "").strip()
+    if target != _state.get('scheduled_target_input'):
+        _state['scheduled_target_input'] = target
+        _state.pop('scheduled_target_value', None)
     if not target:
         return 0
-    return util.scheduled_start_delay(target)
+    now = standard_time.get_datetime(config_dict)
+    if now is None:
+        return float('inf')
+    # Keep time-only targets on the original date after midnight or a manual F5.
+    absolute_target = _state.get('scheduled_target_value')
+    if absolute_target is None:
+        absolute_target = target if '/' in target else now.strftime('%Y/%m/%d ') + target
+        _state['scheduled_target_value'] = absolute_target
+    return util.scheduled_start_delay(absolute_target, now=now)
 
 
 def _funone_clock_endpoint(url):
@@ -194,15 +206,19 @@ async def _funone_clock_prepare(tab, config_dict):
         _state["clock_probe_after"] = now + CONST_FUNONE_CLOCK_RESAMPLE
         _state["clock_probe"] = asyncio.create_task(_funone_clock_probe(tab))
     server_now = _funone_server_now()
-    if server_now:
-        offset = (server_now - datetime.now()).total_seconds()
-        _funone_clock_notice(f"依本機時間觸發；網站時間參考差約 {offset:+.0f} 秒（網站減本機，含秒精度及網路誤差）。")
+    reference_now = standard_time.get_datetime(config_dict)
+    source = '國家標準時間（UTC+8）' if config_dict.get('advanced', {}).get('standard_time_enabled', True) else '本機時間'
+    if reference_now is None:
+        _funone_clock_notice('國家標準時間尚未校時成功或資料已過期，保留預選並等待校時，不會依本機時間送出。')
+    elif server_now:
+        offset = (server_now - reference_now).total_seconds()
+        _funone_clock_notice(f"依{source}觸發；網站時間參考差約 {offset:+.0f} 秒（網站減時間來源，含秒精度及網路誤差）。")
     else:
-        _funone_clock_notice("依本機時間觸發；網站時間尚未取得，不影響指定時間操作。")
+        _funone_clock_notice(f"依{source}觸發；網站時間尚未取得，不影響指定時間操作。")
 
 
 async def _funone_refresh_open_status(tab, url, config_dict):
-    """Use the pre-sale Update Page button after the configured local time."""
+    """Use the pre-sale Update Page button after the configured source reaches the target."""
     if (not str(config_dict.get("refresh_datetime") or "").strip() or _funone_scheduled_delay(config_dict) > 0 or
             not util.is_auto_refresh_enabled() or _state.get("submission_pending") or
             await _funone_actions_paused(config_dict)):
@@ -229,6 +245,8 @@ async def _funone_refresh_open_status(tab, url, config_dict):
         refresh.click();
         return {status:'clicked'};
     })(EXPECTED, ALLOW)"""
+    if _funone_scheduled_delay(config_dict) > 0:
+        return False
     # Reserve before CDP: an uncertain click must not consume the cooldown twice.
     if allow:
         _state["web_refresh_at"] = now
@@ -237,7 +255,7 @@ async def _funone_refresh_open_status(tab, url, config_dict):
         status = result.get("status") if isinstance(result, dict) else None
         _state["pre_sale_page"] = status in ('clicked', 'waiting', 'cooldown')
         if status == 'clicked':
-            _funone_clock_notice("本機指定時間已到，已點更新頁面；保留預選，等待購買按鈕開放。")
+            _funone_clock_notice("指定時間已到，已點更新頁面；保留預選，等待購買按鈕開放。")
             return True
         if status and allow:
             _state["web_refresh_at"] = previous
@@ -1405,12 +1423,13 @@ async def nodriver_funone_order_submit(tab, config_dict, selection_verified=Fals
         return {clicked:false};
     })()
     """
-    if await _funone_actions_paused(config_dict):
+    submitted_step = await nodriver_funone_detect_step(tab)
+    if await _funone_actions_paused(config_dict) or _funone_scheduled_delay(config_dict) > 0:
         return False
     # Stamp before CDP: a timeout after a real click must not trigger another click.
     _state.update(submission_pending=True, order_submitted_url=current_url,
                   order_submitted_time=time.monotonic(),
-                  order_submitted_step=await nodriver_funone_detect_step(tab),
+                  order_submitted_step=submitted_step,
                   submit_wait_logged=False)
     try:
         result = util.parse_nodriver_result(await tab.evaluate(script))
