@@ -21,6 +21,8 @@ from nodriver_common import back_if_auto_refresh_enabled, navigate_page_if_enabl
 from nodriver_common import (
     asyncio_sleep_with_pause_check,
     check_and_handle_pause,
+    check_and_handle_quit,
+    create_builtin_ocr,
     create_universal_ocr,
     nodriver_check_checkbox,
     nodriver_current_url,
@@ -102,69 +104,40 @@ def _ensure_state():
 
 
 async def register_ibon_alert_handler(tab, config_dict):
-    """
-    Register the global JavaScriptDialogOpening handler for ibon native alerts.
-
-    Idempotent via _state["alert_handler_registered"] -- safe to call from both
-    early (pre-navigation) and lazy (inside nodriver_ibon_main) paths without
-    duplicating handlers, which would cause the same alert to be dispatched
-    multiple times.
-
-    Should be called BEFORE navigating to ibon homepage so the handler is
-    attached when window.alert(...) fires on page load (e.g. ibon's
-    "會員登入方式調整" notice that appears on every visit to ticket.ibon.com.tw).
-    """
-    debug = util.create_debug_logger(config_dict)
+    '''每個連線僅保留一個全域監聽，明確拒絕才更新送出狀態。'''
     _ensure_state()
-
-    if _state["alert_handler_registered"]:
+    previous = _state.get('alert_callback')
+    if _state.get('alert_tab') is tab and previous in tab.handlers.get(cdp.page.JavascriptDialogOpening, []):
         return
 
-    async def handle_ibon_alert(event):
-        # Skip alert handling when bot is paused (let user handle manually)
-        if os.path.exists(util.get_instance_state_path(CONST_MAXBOT_INT28_FILE)):
+    async def handle_ibon_alert(event, *_unused):
+        if await _ibon_actions_paused(config_dict) or _state.get('handoff_ready'):
             return
-
-        # On checkout page, only auto-dismiss known sold-out/failure alerts.
-        # Payment confirmations and other critical prompts require user action.
-        current_url = tab.target.url if (tab and hasattr(tab, 'target') and tab.target) else ""
-        if '/utk02/utk0206_' in current_url.lower():
-            checkout_safe_keywords = [
-                "已售完", "售完", "別人搶先一步", "已無可配座位",
-                "無可配座位", "已被購買",
-            ]
-            is_safe_to_dismiss = any(kw in event.message for kw in checkout_safe_keywords)
-            if not is_safe_to_dismiss:
-                debug.log(f"[IBON ALERT] Alert on checkout page, NOT auto-dismissing: '{event.message}'")
-                return
-            debug.log(f"[IBON ALERT] Checkout page sold-out/failure alert, auto-dismissing: '{event.message}'")
-
-        debug.log(f"[IBON ALERT] Alert detected: '{event.message}'")
-
-        # Dismiss the alert - try multiple times with small delays
-        for attempt in range(3):
-            try:
-                await tab.send(cdp.page.handle_java_script_dialog(accept=True))
-                debug.log(f"[IBON ALERT] Alert dismissed (attempt {attempt + 1})")
-                break
-            except Exception as dismiss_exc:
-                error_msg = str(dismiss_exc)
-                # CDP -32602 means no dialog is showing (already dismissed by local handler)
-                if "No dialog is showing" in error_msg or "-32602" in error_msg:
-                    debug.log("[IBON ALERT] Dialog already dismissed")
-                    break
-                if attempt < 2:
-                    await asyncio.sleep(0.1)
-                else:
-                    debug.log(f"[IBON ALERT] Failed to dismiss alert: {dismiss_exc}")
+        url = getattr(getattr(tab, 'target', None), 'url', '') or ''
+        if _ibon_is_checkout(url):
+            return
+        message = str(event.message or '')
+        reason = None
+        if re.search(r'驗證碼.*(?:錯|不正確|失敗)|(?:錯誤|不正確).*驗證碼|captcha.*(?:wrong|invalid|incorrect)', message, re.I):
+            reason = 'captcha'
+        elif re.search(r'已售完|售罄|票券不足|數量不足|別人搶先一步|無可配座位|已被購買', message):
+            reason = 'stock'
+        if not reason and '會員登入方式調整' not in message:
+            return
+        if await _ibon_actions_paused(config_dict):
+            return
+        try:
+            await tab.send(cdp.page.handle_java_script_dialog(accept=True))
+        except Exception:
+            return
+        if reason:
+            await _ibon_mark_rejected(tab, reason)
 
     try:
         tab.add_handler(cdp.page.JavascriptDialogOpening, handle_ibon_alert)
-        _state["alert_handler_registered"] = True
-        debug.log("[IBON ALERT] Global alert handler registered")
-    except Exception as handler_exc:
-        debug.log(f"[IBON ALERT][DEGRADED] Failed to register alert handler: {handler_exc}")
-        debug.log("[IBON ALERT][DEGRADED] ibon homepage alerts will NOT be auto-dismissed until next retry")
+        _state.update(alert_handler_registered=True, alert_tab=tab, alert_callback=handle_ibon_alert)
+    except Exception:
+        _state['alert_handler_registered'] = False
 
 
 async def dismiss_pending_ibon_dialog(tab, config_dict):
@@ -179,6 +152,10 @@ async def dismiss_pending_ibon_dialog(tab, config_dict):
 
     No-op if no dialog is currently showing.
     """
+    if await _ibon_actions_paused(config_dict) or _state.get('handoff_ready'):
+        return
+    if _ibon_is_checkout(getattr(getattr(tab, 'target', None), 'url', '')):
+        return
     debug = util.create_debug_logger(config_dict)
     try:
         await tab.send(cdp.page.handle_java_script_dialog(accept=True))
@@ -257,6 +234,10 @@ async def nodriver_ibon_date_auto_select_pierce(tab, config_dict):
     使用 CDP DOM.query_selector_all(pierce=True) 直接查詢 Shadow DOM 中的按鈕
     參考：https://ultrafunkamsterdam.github.io/nodriver/nodriver/cdp/dom.html
     """
+    if await _ibon_actions_paused(config_dict):
+        return False
+    entry = await _ibon_snapshot(tab)
+    if not entry: return False
     from zendriver import cdp
     from zendriver.cdp import runtime
     import random
@@ -551,6 +532,9 @@ async def nodriver_ibon_date_auto_select_pierce(tab, config_dict):
             raise Exception("Could not get object_id")
 
         # Click using JavaScript
+        live = await _ibon_snapshot(tab)
+        if not live or live['doc'] != entry['doc'] or await _ibon_actions_paused(config_dict):
+            return False
         result = await tab.send(runtime.call_function_on(
             function_declaration='function() { this.click(); return true; }',
             object_id=remote_object_id,
@@ -595,6 +579,10 @@ async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
     使用 CDP DOMSnapshot 穿透 closed Shadow DOM 搜尋購票按鈕
     參考：NoDriver API Guide 範例 1
     """
+    if await _ibon_actions_paused(config_dict):
+        return False
+    entry = await _ibon_snapshot(tab)
+    if not entry: return False
     from zendriver import cdp
     from zendriver.cdp import input_ as cdp_input
     import random
@@ -895,6 +883,9 @@ async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
 
         debug.log(f"[IBON DATE] Resolved button object_id: {remote_object_id}")
 
+        live = await _ibon_snapshot(tab)
+        if not live or live['doc'] != entry['doc'] or await _ibon_actions_paused(config_dict):
+            return False
         result = await tab.send(runtime.call_function_on(
             function_declaration='function() { this.click(); return true; }',
             object_id=remote_object_id,
@@ -970,6 +961,10 @@ async def nodriver_ibon_event_area_auto_select(tab, config_dict, area_keyword_it
             - is_need_refresh: Whether page refresh is needed
             - is_price_assign_by_bot: Whether area selection succeeded
     """
+    if await _ibon_actions_paused(config_dict):
+        return (False, False)
+    entry = await _ibon_snapshot(tab)
+    if not entry: return (False, False)
     debug = util.create_debug_logger(config_dict)
     auto_select_mode = config_dict["area_auto_select"]["mode"]
     area_auto_fallback = config_dict.get('area_auto_fallback', False)  # T021: Safe access for new field
@@ -1374,6 +1369,9 @@ async def nodriver_ibon_event_area_auto_select(tab, config_dict, area_keyword_it
             debug.log(f"[NEW EVENT CDP CLICK] Click position: ({x:.1f}, {y:.1f})")
 
             # Execute mouse click
+            live = await _ibon_snapshot(tab)
+            if not live or live['doc'] != entry['doc'] or await _ibon_actions_paused(config_dict):
+                return (False, False)
             await tab.mouse_click(x, y)
 
             debug.log(f"[NEW EVENT CDP CLICK] Mouse click executed successfully")
@@ -1416,6 +1414,10 @@ async def nodriver_ibon_area_auto_select(tab, config_dict, area_keyword_item="")
             - is_need_refresh: Whether page refresh is needed
             - is_price_assign_by_bot: Whether area selection succeeded
     """
+    if await _ibon_actions_paused(config_dict):
+        return (False, False)
+    entry = await _ibon_snapshot(tab)
+    if not entry: return (False, False)
     # 函數開始時檢查暫停
     if await check_and_handle_pause(config_dict):
         return False, False
@@ -1955,6 +1957,9 @@ async def nodriver_ibon_area_auto_select(tab, config_dict, area_keyword_item="")
                 y = (content_quad[1] + content_quad[5]) / 2
 
                 # Execute mouse click
+                live = await _ibon_snapshot(tab)
+                if not live or live['doc'] != entry['doc'] or await _ibon_actions_paused(config_dict):
+                    return (False, False)
                 await tab.mouse_click(x, y)
 
                 # Wait for navigation
@@ -1978,567 +1983,390 @@ async def nodriver_ibon_area_auto_select(tab, config_dict, area_keyword_item="")
 
     return is_need_refresh, is_price_assign_by_bot
 
-async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
-    """
-    ibon ticket number auto-selection using NoDriver CDP with keyword matching
+CONST_IBON_FORM_JS = r'''
+const doc=location.href+'|'+performance.timeOrigin,key='ticketsHunter.ibon.submit';
+const input=document.querySelector('input[placeholder*="驗證碼"],input[value="驗證碼"],#ctl00_ContentPlaceHolder1_CHK');
+const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
+const rows=()=>{
+    let items=Array.from(document.querySelectorAll('table.rwdtable tbody tr'));
+    if(!items.length)items=Array.from(document.querySelectorAll('table.table tbody tr'));
+    if(!items.length)items=Array.from(document.querySelectorAll('select#input-qty,select[id*="qty"]'));
+    return items.map((row,index)=>{
+        const select=row.matches('select')?row:row.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"]');
+        if(!select)return null;
+        return {index,name:(row.matches('select')?document.querySelectorAll('h4')[index]:row.querySelector('td:first-child'))?.textContent.trim()||'',
+            id:select.id||select.name||'',value:select.value,enabled:!select.disabled&&visible(select),
+            options:Array.from(select.options).filter(o=>!o.disabled&&!o.hidden&&!o.parentElement?.disabled).map(o=>o.value)};
+    }).filter(Boolean);
+};
+'''
 
-    Enhancement (2026-01-07):
-    - Supports ticket type keyword matching using area_keyword
-    - Supports keyword exclusion using keyword_exclude
-    - Respects auto_select_mode for fallback selection
 
-    Returns: is_ticket_number_assigned (bool)
-    """
-    # Check pause at function start
-    if await check_and_handle_pause(config_dict):
+async def _ibon_actions_paused(config_dict=None):
+    return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
+
+
+def _ibon_render(script, **parameters):
+    values = {'FORM': CONST_IBON_FORM_JS, 'NATIVE': CONST_NATIVE_INPUT_SETTER_JS}
+    values.update({key: json.dumps(value) for key, value in parameters.items()})
+    return re.sub(r'\b[A-Z][A-Z_]*\b', lambda match: values.get(match.group(), match.group()), script)
+
+
+def _ibon_is_checkout(url):
+    from urllib.parse import urlsplit
+    path = urlsplit(url or '').path.lower()
+    return bool(re.search(r'/utk02/utk020[67]_[^/]*\.aspx$', path) or
+                re.fullmatch(r'/event/[^/]+/checkout/?', path))
+
+
+async def _ibon_snapshot(tab):
+    try:
+        result = await tab.evaluate(r'''(() => {
+            FORM
+            const invalid=Array.from(document.forms).some(f=>f.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"],select[id*="qty"]')&&f.matches(':invalid'));
+            return {doc,url:location.href,referrer:document.referrer,validForm:!invalid,rows:rows(),hasCaptcha:!!input,
+                value:input?.value||'',inputReady:visible(input)&&!input.disabled};
+        })()'''.replace('FORM', CONST_IBON_FORM_JS))
+        return result if isinstance(result, dict) and result.get('doc') else None
+    except Exception:
+        return None
+
+
+def _ibon_origin(url):
+    from urllib.parse import urlsplit
+    parsed = urlsplit(url or '')
+    return parsed.scheme + '://' + parsed.netloc.rsplit('@', 1)[-1] if parsed.scheme in ('http', 'https') else ''
+
+
+def _ibon_flow_path(tab):
+    import hashlib
+    target = getattr(getattr(tab, 'target', None), 'target_id', None)
+    if not target:
+        raise ValueError('無法確認 ibon 分頁身分。')
+    name = hashlib.sha256(str(target).encode('utf8')).hexdigest() + '.json'
+    return util.get_instance_state_path('MAXBOT_IBON_FLOW_' + name)
+
+
+def _ibon_read_flow(tab):
+    try:
+        with open(_ibon_flow_path(tab), encoding='utf8') as source:
+            value = json.loads(source.read(4097))
+        return value if isinstance(value, dict) else {'handoff': False}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {'handoff': False}
+
+
+def _ibon_remove_flow(tab, nonce):
+    current = _ibon_read_flow(tab)
+    if current and current.get('nonce') == nonce:
+        try:
+            os.unlink(_ibon_flow_path(tab))
+        except OSError:
+            pass
+
+
+async def _ibon_clear_completed(tab, saved, flow):
+    if not flow or flow.get('handoff') is not True or saved.get('nonce') != flow.get('nonce'):
+        return False
+    if _ibon_origin(saved.get('route')) != flow.get('origin'):
+        return False
+    try:
+        cleared = await tab.evaluate(_ibon_render(r'''((nonce) => {
+            FORM
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            if(!saved||saved.nonce!==nonce)return false;
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];return true;
+        })(EXPECTED)''', EXPECTED=flow['nonce']))
+        if cleared:
+            _ibon_remove_flow(tab, flow['nonce'])
+        return bool(cleared)
+    except Exception:
         return False
 
-    debug = util.create_debug_logger(config_dict)
-    ticket_number = str(config_dict.get("ticket_number", 2))
-    is_ticket_number_assigned = False
 
-    # Get keyword settings for ticket type matching
-    area_keyword = config_dict["area_auto_select"].get("area_keyword", "").strip()
-    keyword_exclude = config_dict.get("keyword_exclude", "")
-    auto_select_mode = config_dict["area_auto_select"].get("mode", 1)
+def _ibon_candidates(snapshot, config_dict):
+    requested = str(config_dict.get('ticket_number', 2))
+    if not re.fullmatch(r'[1-9]\d{0,2}', requested):
+        return []
+    rows = [row for row in snapshot.get('rows', []) if row.get('enabled') and
+            requested in row.get('options', []) and row.get('name') and
+            not util.reset_row_text_if_match_keyword_exclude(config_dict, row['name'])]
+    keyword = config_dict.get('area_auto_select', {}).get('area_keyword', '').strip()
+    if not keyword:
+        return rows
+    for group in util.parse_keyword_string_to_array(keyword):
+        parts = [util.format_keyword_string(part) for part in group.split()]
+        matched = [row for row in rows if parts and all(
+            part in util.format_keyword_string(row['name']) for part in parts)]
+        if matched:
+            return matched
+    return rows if config_dict.get('area_auto_fallback', False) else []
 
+
+def _ibon_selection_ok(snapshot, config_dict):
+    if not snapshot:
+        return False
+    selected = [row for row in snapshot.get('rows', []) if row.get('value') not in ('0', '')]
+    allowed = _ibon_candidates(snapshot, config_dict)
+    return (len(selected) == 1 and selected[0]['value'] == str(config_dict.get('ticket_number', 2)) and
+            any(row['index'] == selected[0]['index'] and row['id'] == selected[0]['id'] for row in allowed))
+
+
+async def _ibon_capture(tab, config_dict):
+    import base64
+    import hashlib
+    before = await _ibon_snapshot(tab)
+    if not before or not before.get('inputReady') or await _ibon_actions_paused(config_dict):
+        return None
     try:
-        # Step 1: Wait for SELECT element
-        wait_result = await tab.evaluate('''
-            (() => {
-                return new Promise((resolve) => {
-                    let attempts = 0;
-                    const maxAttempts = 15;
+        encoded = await tab.evaluate(r'''(() => {
+            const img=document.querySelector('img[src*="pic.aspx"],img[src*="captcha"],img[id*="Captcha"]');
+            const canvas=img?document.createElement('canvas'):document.querySelector('canvas');
+            if(!canvas||img&&(!img.complete||!img.naturalWidth))return null;
+            if(img){canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;canvas.getContext('2d').drawImage(img,0,0);}
+            return canvas.toDataURL('image/png').split(',')[1];
+        })()''')
+        image = base64.b64decode(encoded) if isinstance(encoded, str) and encoded else None
+    except Exception:
+        image = None
+    if not image and not await _ibon_actions_paused(config_dict):
+        image = await nodriver_ibon_get_captcha_image_from_shadow_dom(tab, config_dict, wait_for_render=False)
+    after = await _ibon_snapshot(tab)
+    if not image or not after or before['doc'] != after['doc'] or await _ibon_actions_paused(config_dict):
+        return None
+    return {'doc': after['doc'], 'hash': hashlib.sha256(image).hexdigest(), 'image': image}
 
-                    const checkSelect = setInterval(() => {
-                        attempts++;
 
-                        let select = document.querySelector('table.rwdtable select.form-control-sm') ||
-                                    document.querySelector('table.table select[name*="AMOUNT_DDL"]') ||
-                                    document.querySelector('select.form-control-sm');
+async def _ibon_clear_rejected(tab, record):
+    if await _ibon_actions_paused():
+        return False
+    owned = _state.get('captcha_fill', {})
+    expected = dict(record, clearValue=owned.get('value') if owned.get('doc') == record.get('doc') else None)
+    try:
+        return bool(await tab.evaluate(_ibon_render(r'''((expected) => {
+            FORM
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            if(!saved||saved.nonce!==expected.nonce||saved.state!=='rejected')return false;
+            if(doc===saved.doc&&typeof expected.clearValue==='string'&&input?.value===expected.clearValue){
+                NATIVE
+                setNativeInputValue(input,'');
+            }
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];return true;
+        })(EXPECTED)''', EXPECTED=expected)))
+    except Exception:
+        return False
 
-                        if (select) {
-                            clearInterval(checkSelect);
-                            resolve({ready: true, selector_used: select.className || select.name});
-                        } else if (attempts >= maxAttempts) {
-                            clearInterval(checkSelect);
-                            resolve({ready: false, error: "Timeout waiting for SELECT element"});
-                        }
-                    }, 100);
-                });
-            })();
-        ''', await_promise=True)
 
-        # Must stay an IIFE: a bare arrow function evaluates to the function
-        # object, so the Promise never runs and await_promise has nothing to await.
-        if isinstance(wait_result, dict):
-            if wait_result.get('ready'):
-                debug.log(f"[TICKET DOM] SELECT element ready: {wait_result.get('selector_used')}")
-            else:
-                debug.log(f"[TICKET DOM] {wait_result.get('error')}")
-
-        # Step 2: Extract all ticket types with their names and availability
-        ticket_types_result = await tab.evaluate(f'''
-            (function() {{
-                let ticketTypes = [];
-                const targetTicketNumber = "{ticket_number}";
-
-                // Try new format first (table.rwdtable)
-                let rows = document.querySelectorAll('table.rwdtable tbody tr');
-                let tableType = 'rwdtable';
-
-                // Fallback to old format (table.table)
-                if (rows.length === 0) {{
-                    rows = document.querySelectorAll('table.table tbody tr');
-                    tableType = 'table';
-                }}
-
-                rows.forEach((row, index) => {{
-                    // Find SELECT element in this row
-                    let select = row.querySelector('select.form-control-sm') ||
-                                row.querySelector('select[name*="AMOUNT_DDL"]');
-
-                    if (!select) return;
-
-                    // Get ticket type name from first cell
-                    let nameCell = row.querySelector('td:first-child, td[data-title]');
-                    let ticketName = nameCell ? nameCell.textContent.trim() : '';
-
-                    // Get price from price cell
-                    let priceCell = row.querySelector('td:nth-child(3)');
-                    let price = priceCell ? priceCell.textContent.trim() : '';
-
-                    // Check if this ticket type has valid options (not sold out)
-                    let hasValidOption = Array.from(select.options).some(
-                        opt => opt.value !== '0' && opt.value !== ''
-                    );
-
-                    // Check current value
-                    let currentValue = select.value;
-                    let isAlreadySelected = currentValue !== '0' && currentValue !== '';
-
-                    // Check if target ticket_number option exists
-                    let hasTargetOption = Array.from(select.options).some(
-                        opt => opt.value === targetTicketNumber
-                    );
-
-                    ticketTypes.push({{
-                        index: index,
-                        name: ticketName,
-                        price: price,
-                        hasValidOption: hasValidOption,
-                        isAlreadySelected: isAlreadySelected,
-                        currentValue: currentValue,
-                        hasTargetOption: hasTargetOption,
-                        selectName: select.name || ''
-                    }});
-                }});
-
-                return {{
-                    ticketTypes: ticketTypes,
-                    tableType: tableType,
-                    totalRows: rows.length
-                }};
-            }})();
-        ''')
-
-        ticket_types_parsed = util.parse_nodriver_result(ticket_types_result)
-
-        if not isinstance(ticket_types_parsed, dict):
-            debug.log(f"[TICKET] Failed to parse ticket types")
+async def _ibon_submission_pending(tab, config_dict):
+    try:
+        record = await tab.evaluate(r'''(() => {
+            FORM
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            const tourReady=saved?.phase==='tour_cart'&&saved.doc===doc&&/\/event\/[^/]+\/options\/?$/i.test(location.pathname)&&
+                Array.from(document.querySelectorAll('button')).some(e=>visible(e)&&!e.disabled&&e.textContent.includes('確認付款方式'));
+            return {doc,saved,tourReady};
+        })()'''.replace('FORM', CONST_IBON_FORM_JS))
+    except Exception:
+        return True
+    if not isinstance(record, dict) or not record.get('doc'):
+        return True
+    saved = record.get('saved')
+    flow = _ibon_read_flow(tab)
+    if saved is not None and (not isinstance(saved, dict) or not isinstance(saved.get('nonce'), str)):
+        return True
+    if record.get('tourReady'):
+        return False
+    if saved and await _ibon_clear_completed(tab, saved, flow):
+        return False
+    if saved and saved.get('state') == 'rejected':
+        clear = saved.get('reason') == 'stock'
+        if not clear and time.monotonic() >= _state.get('rejected_check_after', 0):
+            _state['rejected_check_after'] = time.monotonic() + 0.25
+            frame = await _ibon_capture(tab, config_dict)
+            clear = bool(frame and (frame['doc'] != saved.get('doc') or frame['hash'] != saved.get('captcha')))
+        if clear and await _ibon_clear_rejected(tab, saved):
+            _ibon_remove_flow(tab, saved.get('nonce'))
+            _state.pop('pending_notice', None)
+            _state.pop('captcha_fill', None)
+            util.write_instance_status('running', '網站已明確拒絕上一筆，繼續偵測票況；尚未確認訂單完成。')
             return False
+    if saved and _state.get('pending_notice') != saved.get('nonce'):
+        _state['pending_notice'] = saved.get('nonce')
+        message = '上一筆送出尚待網站確認，停止重送；驗證碼被明確拒絕後需先換圖再繼續。'
+        util.create_debug_logger(config_dict).log('[IBON] ' + message)
+        util.write_instance_status('running', message)
+    return bool(saved or flow and flow.get('handoff') is not True)
 
-        ticket_types = ticket_types_parsed.get('ticketTypes', [])
 
-        if debug.enabled:
-            debug.log(f"[TICKET] Found {len(ticket_types)} ticket type(s)")
-            for tt in ticket_types:
-                status = "selected" if tt.get('isAlreadySelected') else ("available" if tt.get('hasValidOption') else "sold out")
-                debug.log(f"  [{tt.get('index')}] {tt.get('name')} - {tt.get('price')} ({status})")
+async def _ibon_mark_rejected(tab, reason):
+    try:
+        await tab.evaluate(r'''((reason) => {
+            FORM
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null'),active=window[Symbol.for(key)];
+            if(!saved||!active||saved.nonce!==active.nonce||saved.doc!==doc)return;
+            saved.state='rejected';saved.reason=reason;sessionStorage.setItem(key,JSON.stringify(saved));
+        })(REASON)'''.replace('FORM', CONST_IBON_FORM_JS).replace('REASON', json.dumps(reason)))
+    except Exception:
+        pass
 
-        if len(ticket_types) == 0:
-            debug.log(f"[TICKET] No ticket types found")
+
+async def _ibon_handoff(tab, config_dict):
+    live = await _ibon_snapshot(tab)
+    if not live or not _ibon_is_checkout(live['url']):
+        return False
+    flow = _ibon_read_flow(tab)
+    same_origin = bool(flow and flow.get('origin') == _ibon_origin(live['url']))
+    if flow and (same_origin or flow.get('origin') == _ibon_origin(live.get('referrer'))):
+        flow = dict(flow, handoff=True)
+        if not util.save_json(flow, _ibon_flow_path(tab)):
             return False
-
-        # Step 3: Check if any ticket type is already selected
-        for tt in ticket_types:
-            if tt.get('isAlreadySelected'):
-                debug.log(f"[TICKET] Already assigned: {tt.get('name')} = {tt.get('currentValue')}")
-                return True
-
-        # Step 4: Filter valid ticket types (with available options)
-        valid_tickets = [tt for tt in ticket_types if tt.get('hasValidOption')]
-
-        if len(valid_tickets) == 0:
-            debug.log(f"[TICKET] All ticket types sold out")
+    try:
+        cleared = await tab.evaluate(r'''((expected) => {
+            FORM
+            if(doc!==expected)return false;
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];return true;
+        })(EXPECTED)'''.replace('FORM', CONST_IBON_FORM_JS).replace('EXPECTED', json.dumps(live['doc'])))
+        if not cleared:
             return False
+    except Exception:
+        return False
+    if flow and same_origin:
+        _ibon_remove_flow(tab, flow['nonce'])
+    if not _state.get('handoff_ready'):
+        _state['handoff_ready'] = True
+        message = '已進入 ibon 結帳頁，請手動確認資料與付款；尚未確認訂單或付款完成。'
+        util.create_debug_logger(config_dict, enabled=True).log('[IBON] ' + message)
+        util.write_instance_status('waiting_manual', message)
+        if config_dict.get('advanced', {}).get('play_sound', {}).get('order'):
+            play_sound_while_ordering(config_dict)
+        notice = dict(config_dict)
+        notice['advanced'] = dict(config_dict.get('advanced', {}), discord_message=message, telegram_message=message)
+        send_discord_notification(notice, 'order', 'iBon')
+        send_telegram_notification(notice, 'order', 'iBon')
+    return True
 
-        # Step 5: Apply keyword_exclude filter
-        filtered_tickets = []
-        for ticket in valid_tickets:
-            ticket_name = ticket.get('name', '')
-            if keyword_exclude and len(keyword_exclude) > 0:
-                if util.reset_row_text_if_match_keyword_exclude(config_dict, ticket_name):
-                    debug.log(f"[TICKET] Excluded by keyword: {ticket_name}")
-                    continue
-            filtered_tickets.append(ticket)
 
-        if len(filtered_tickets) == 0:
-            debug.log(f"[TICKET] All ticket types excluded by keyword_exclude")
-            # Fallback to valid_tickets if all excluded
-            filtered_tickets = valid_tickets
+def _ibon_build_ocr(config_dict):
+    model = create_universal_ocr(config_dict)
+    return model if model is not None else create_builtin_ocr(
+        beta=config_dict.get('ocr_captcha', {}).get('beta', True), ranges=0)
 
-        # Step 5.5: Shortcut for single ticket type (skip keyword matching)
-        # Fix (2026-01-07): If only 1 valid ticket type, select it directly
-        if len(filtered_tickets) == 1:
-            matched_ticket = filtered_tickets[0]
-            debug.log(f"[TICKET] Single ticket type, selecting directly: {matched_ticket.get('name')}")
-        else:
-            # Step 6: Apply area_keyword matching (for multiple ticket types)
-            matched_ticket = None
 
-            if area_keyword and len(area_keyword) > 0:
-                # Parse keyword array (supports "kw1","kw2" format)
-                try:
-                    area_keyword_array = json.loads("[" + area_keyword + "]")
-                except:
-                    area_keyword_array = [area_keyword]
+async def _ibon_cached_ocr(config_dict, supplied=None):
+    cfg = config_dict.get('ocr_captcha', {})
+    if not cfg.get('enable'):
+        return None
+    key = tuple(cfg.get(name) for name in ('use_universal', 'beta', 'path'))
+    if _state.get('ocr_key') != key:
+        first = 'ocr_key' not in _state
+        _state['ocr_key'] = key
+        try:
+            _state['ocr_model'] = supplied if first and supplied is not None else await asyncio.to_thread(_ibon_build_ocr, config_dict)
+            if hasattr(_state['ocr_model'], 'set_ranges'):
+                _state['ocr_model'].set_ranges(0)
+        except Exception:
+            _state['ocr_model'] = None
+            util.create_debug_logger(config_dict).log('[IBON] OCR 模型載入失敗，請手動處理驗證碼。')
+    return _state.get('ocr_model')
 
-                # Try each keyword in priority order
-                for keyword_item in area_keyword_array:
-                    keyword_item = keyword_item.strip()
-                    if not keyword_item:
-                        continue
 
-                    for ticket in filtered_tickets:
-                        ticket_name = ticket.get('name', '')
-                        row_text = util.format_keyword_string(ticket_name)
-
-                        # Support AND logic (space-separated keywords must all match)
-                        keyword_parts = [kw.strip() for kw in keyword_item.split(' ') if kw.strip()]
-                        is_match = all(
-                            util.format_keyword_string(kw) in row_text
-                            for kw in keyword_parts
-                        )
-
-                        if is_match:
-                            matched_ticket = ticket
-                            debug.log(f"[TICKET] Keyword matched: '{keyword_item}' -> {ticket_name}")
-                            break
-
-                    if matched_ticket:
-                        break
-
-                if not matched_ticket:
-                    debug.log(f"[TICKET] No ticket matched keyword: {area_keyword}")
-
-        # Step 7: Fallback selection if no keyword match
-        if not matched_ticket:
-            if len(filtered_tickets) > 0:
-                # Use auto_select_mode for fallback
-                matched_ticket = util.get_target_item_from_matched_list(
-                    filtered_tickets, auto_select_mode
-                )
-                debug.log(f"[TICKET] Fallback selection: {matched_ticket.get('name') if matched_ticket else 'None'}")
-
-        if not matched_ticket:
-            debug.log(f"[TICKET] No suitable ticket type found")
+async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
+    '''只接受指定張數與符合優先關鍵字的單一票種，原子核對後再填值。'''
+    if await _ibon_actions_paused(config_dict) or await _ibon_submission_pending(tab, config_dict):
+        return False
+    for _ in range(15):
+        snapshot = await _ibon_snapshot(tab)
+        if snapshot and snapshot.get('rows'):
+            break
+        if await _ibon_actions_paused(config_dict):
             return False
-
-        # Step 8: Set the ticket quantity for the matched ticket type
-        target_index = matched_ticket.get('index', 0)
-        has_target_option = matched_ticket.get('hasTargetOption', False)
-
-        # Determine which value to set
-        # If target not available, JS will find max available option
-        value_to_set = ticket_number if has_target_option else ""
-
-        result = await tab.evaluate(f'''
-            (function() {{
-                // Find all rows
-                let rows = document.querySelectorAll('table.rwdtable tbody tr');
-                if (rows.length === 0) {{
-                    rows = document.querySelectorAll('table.table tbody tr');
-                }}
-
-                if ({target_index} >= rows.length) {{
-                    return {{success: false, error: "Target row index out of range"}};
-                }}
-
-                let row = rows[{target_index}];
-                let select = row.querySelector('select.form-control-sm') ||
-                            row.querySelector('select[name*="AMOUNT_DDL"]');
-
-                if (!select) {{
-                    return {{success: false, error: "SELECT not found in target row"}};
-                }}
-
-                let valueToSet = "{value_to_set}";
-
-                // If no preset value, find max available option
-                if (!valueToSet) {{
-                    const validOptions = Array.from(select.options).filter(opt =>
-                        parseInt(opt.value) > 0 && !isNaN(parseInt(opt.value))
-                    );
-                    if (validOptions.length === 0) {{
-                        return {{success: false, error: "No valid options available"}};
-                    }}
-                    const maxOpt = validOptions.reduce((max, opt) =>
-                        parseInt(opt.value) > parseInt(max.value) ? opt : max
-                    );
-                    valueToSet = maxOpt.value;
-                }}
-
-                // Set the value
-                select.value = valueToSet;
-
-                // Trigger events
-                select.dispatchEvent(new Event('input', {{bubbles: true}}));
-                select.dispatchEvent(new Event('change', {{bubbles: true}}));
-                select.dispatchEvent(new Event('blur', {{bubbles: true}}));
-
-                // Verify
-                const finalValue = select.value;
-                if (finalValue !== valueToSet) {{
-                    return {{success: false, error: "Value verification failed", expected: valueToSet, actual: finalValue}};
-                }}
-
-                return {{
-                    success: true,
-                    set_value: valueToSet,
-                    fallback: "{value_to_set}" === "",
-                    ticket_name: row.querySelector('td:first-child')?.textContent.trim() || '',
-                    verified: true
-                }};
-            }})();
-        ''')
-
-        result_parsed = util.parse_nodriver_result(result)
-
-        if isinstance(result_parsed, dict):
-            if result_parsed.get('success'):
-                is_ticket_number_assigned = True
-                ticket_name = result_parsed.get('ticket_name', '')
-                set_value = result_parsed.get('set_value', '')
-                if debug.enabled:
-                    if value_to_set != ticket_number:
-                        debug.log(f"[TICKET] Set '{ticket_name}' to {set_value} (fallback, target {ticket_number} not available)")
-                    else:
-                        debug.log(f"[TICKET] Set '{ticket_name}' to {set_value}")
-            else:
-                debug.log(f"[TICKET] Failed: {result_parsed.get('error')}")
-
-    except Exception as exc:
-        if debug.enabled:
-            debug.log(f"[TICKET ERROR] Exception: {exc}")
-            import traceback
-            traceback.print_exc()
-
-    return is_ticket_number_assigned
+        await asyncio.sleep(0.1)
+    if not snapshot or not snapshot.get('rows') or await _ibon_actions_paused(config_dict):
+        return False
+    candidates = _ibon_candidates(snapshot, config_dict)
+    if not candidates:
+        return False
+    if _ibon_selection_ok(snapshot, config_dict):
+        return True
+    target = util.get_target_item_from_matched_list(candidates, config_dict.get('area_auto_select', {}).get('mode', CONST_FROM_TOP_TO_BOTTOM))
+    if not target or await _ibon_actions_paused(config_dict):
+        return False
+    script = r'''((expected,target,amount) => {
+        FORM
+        if(doc!==expected.doc||sessionStorage.getItem(key))return false;
+        const current=rows();if(JSON.stringify(current)!==JSON.stringify(expected.rows))return false;
+        const elements=Array.from(document.querySelectorAll('table.rwdtable tbody tr'));
+        if(!elements.length)elements.push(...document.querySelectorAll('table.table tbody tr'));
+        if(!elements.length)elements.push(...document.querySelectorAll('select#input-qty,select[id*="qty"]'));
+        const desired=row=>row.index===target.index?amount:row.options.includes('0')?'0':row.options.includes('')?'':null;
+        for(const row of current){
+            const value=desired(row);
+            if(value===null||row.value!==value&&!row.options.includes(value))return false;
+        }
+        const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value')?.set;
+        for(const row of current){
+            const value=desired(row);if(row.value===value)continue;
+            const element=elements[row.index],select=element.matches('select')?element:element.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"]');
+            if(setter)setter.call(select,value);else select.value=value;
+            select.dispatchEvent(new Event('input',{bubbles:true}));select.dispatchEvent(new Event('change',{bubbles:true}));
+        }
+        const selected=rows().filter(row=>row.value!==''&&row.value!=='0');
+        return selected.length===1&&selected[0].index===target.index&&selected[0].value===amount;
+    })(SNAPSHOT,TARGET,AMOUNT)'''
+    try:
+        result = await tab.evaluate(_ibon_render(script, SNAPSHOT=snapshot, TARGET=target,
+                                                 AMOUNT=str(config_dict.get('ticket_number', 2))))
+        verified = await _ibon_snapshot(tab)
+        return bool(result and verified and verified['doc'] == snapshot['doc'] and _ibon_selection_ok(verified, config_dict))
+    except Exception:
+        return False
 
     # nodriver_ibon_get_captcha_image_from_shadow_dom moved to nodriver_common.py
     # as nodriver_get_captcha_image_from_dom_snapshot (shared by ibon and kham)
 
-async def nodriver_ibon_keyin_captcha_code(tab, answer="", auto_submit=False, config_dict=None):
-    """
-    ibon captcha input handling
-    Returns: (is_verifyCode_editing, is_form_submitted)
-    """
-    debug = util.create_debug_logger(config_dict)
-
-    is_verifyCode_editing = False
-    is_form_submitted = False
-
-    debug.log(f"[CAPTCHA INPUT] answer: {answer}, auto_submit: {auto_submit}")
-
+async def nodriver_ibon_keyin_captcha_code(tab, answer='', auto_submit=False, config_dict=None, captcha_frame=None):
+    '''保持人工輸入，核對同一張圖片後才填寫；送出統一走防護入口。'''
+    config_dict = config_dict or {}
+    if await _ibon_actions_paused(config_dict) or await _ibon_submission_pending(tab, config_dict):
+        return False, False
+    snapshot = await _ibon_snapshot(tab)
+    if not snapshot or not snapshot.get('inputReady'):
+        return False, False
+    if not answer or snapshot.get('value') not in ('', '驗證碼'):
+        if not snapshot.get('value') and not await _ibon_actions_paused(config_dict):
+            await tab.evaluate(r'''(() => { FORM if(input)input.focus(); })()'''.replace('FORM', CONST_IBON_FORM_JS))
+        return True, False
+    if not re.fullmatch(r'\d{4}', str(answer)):
+        return True, False
+    frame = await _ibon_capture(tab, config_dict)
+    if not frame or captcha_frame and (frame['doc'], frame['hash']) != (captcha_frame['doc'], captcha_frame['hash']):
+        return False, False
+    if await _ibon_actions_paused(config_dict):
+        return False, False
     try:
-        # Find captcha input box
-        # Selector 1: input[value="驗證碼"]
-        # Selector 2: #ctl00_ContentPlaceHolder1_CHK
-        form_verifyCode = None
-
-        try:
-            form_verifyCode = await tab.query_selector('input[placeholder*="驗證碼"]')
-        except:
-            pass
-
-        if not form_verifyCode:
-            try:
-                form_verifyCode = await tab.query_selector('input[value="驗證碼"]')
-            except:
-                pass
-
-        if not form_verifyCode:
-            try:
-                form_verifyCode = await tab.query_selector('#ctl00_ContentPlaceHolder1_CHK')
-            except:
-                pass
-
-        if not form_verifyCode:
-            debug.log("[CAPTCHA INPUT] Input box not found")
-            return is_verifyCode_editing, is_form_submitted
-
-        # Check if input box is visible
-        is_visible = False
-        try:
-            is_visible = await tab.evaluate('''
-                (function() {
-                    const selectors = [
-                        'input[placeholder*="驗證碼"]',
-                        'input[value="驗證碼"]',
-                        '#ctl00_ContentPlaceHolder1_CHK'
-                    ];
-                    for (let selector of selectors) {
-                        const element = document.querySelector(selector);
-                        if (element && !element.disabled && element.offsetParent !== null) {
-                            return true;
-                        }
-                    }
-                    return false;
-                })();
-            ''')
-        except:
-            pass
-
-        if not is_visible:
-            debug.log("[CAPTCHA INPUT] Input box not visible")
-            return is_verifyCode_editing, is_form_submitted
-
-        # If no answer provided, check if already has value for manual input mode
-        if not answer:
-            # Get current input value
-            inputed_value = ""
-            try:
-                inputed_value = await form_verifyCode.apply('function (element) { return element.value; }') or ""
-            except:
-                pass
-
-            # If already has value, skip (user manually inputed)
-            if inputed_value and inputed_value != "驗證碼":
-                debug.log(f"[CAPTCHA INPUT] Already has value: {inputed_value}")
-                is_verifyCode_editing = True
-                return is_verifyCode_editing, is_form_submitted
-
-            # Focus for manual input
-            try:
-                await form_verifyCode.click()
-                is_verifyCode_editing = True
-                debug.log("[CAPTCHA INPUT] Focused for manual input")
-            except:
-                pass
-            return is_verifyCode_editing, is_form_submitted
-
-        # Fill in answer
-        try:
-            await form_verifyCode.click()
-
-            # Clear placeholder value
-            await form_verifyCode.apply('function (element) { element.value = ""; }')
-
-            # Type answer
-            await form_verifyCode.send_keys(answer)
-
-            debug.log(f"[CAPTCHA INPUT] Filled answer: {answer}")
-
-            # Auto submit if enabled
-            if auto_submit:
-                # Check if ticket number is selected (any SELECT, not just first one)
-                # Fix (2026-01-07): Multi-ticket types may have selected ticket at index > 0
-                ticket_ok = await tab.evaluate('''
-                    (function() {
-                        // Try new EventBuy format first: table.rwdtable select.form-control-sm
-                        let selects = document.querySelectorAll('table.rwdtable select.form-control-sm');
-                        // Fallback to old .aspx format: table.table select[name*="AMOUNT_DDL"]
-                        if (selects.length === 0) {
-                            selects = document.querySelectorAll('table.table select[name*="AMOUNT_DDL"]');
-                        }
-                        if (selects.length === 0) return false;
-                        // Check if ANY select has a non-zero value (ticket selected)
-                        return Array.from(selects).some(select =>
-                            select.value !== "0" && select.value !== ""
-                        );
-                    })();
-                ''')
-
-                if ticket_ok:
-                    # Set up alert handler BEFORE clicking submit button
-                    alert_handled = False
-
-                    async def handle_submit_dialog(event):
-                        nonlocal alert_handled
-                        alert_handled = True
-                        debug.log(f"[CAPTCHA INPUT] Alert detected: '{event.message}'")
-                        # Auto-dismiss alert
-                        try:
-                            await tab.send(cdp.page.handle_java_script_dialog(accept=True))
-                            debug.log(f"[CAPTCHA INPUT] Alert dismissed")
-                        except Exception as dismiss_exc:
-                            debug.log(f"[CAPTCHA INPUT] Failed to dismiss alert: {dismiss_exc}")
-
-                    # Register alert handler
-                    try:
-                        tab.add_handler(cdp.page.JavascriptDialogOpening, handle_submit_dialog)
-                        debug.log(f"[CAPTCHA INPUT] Alert handler registered before submit")
-                    except Exception as handler_exc:
-                        debug.log(f"[CAPTCHA INPUT] Failed to register alert handler: {handler_exc}")
-
-                    # Find and click submit button
-                    # Multiple button patterns for different ibon page types:
-                    # - UTK0201 (EventBuy): #ctl00_ContentPlaceHolder1_A2
-                    # - UTK0202 (ticket selection): a[id*="AddShopingCart"] or a.btn.btn-primary.btn-block
-                    # CRITICAL: iBon requires calling ImageCode_Verify2() before submit
-                    submit_clicked = await tab.evaluate('''
-                        (function() {
-                            // Try multiple selectors in priority order
-                            let submitBtn = document.querySelector('#ctl00_ContentPlaceHolder1_A2');
-
-                            if (!submitBtn) {
-                                // UTK0202 page: try AddShopingCart button
-                                submitBtn = document.querySelector('a[id*="AddShopingCart"]');
-                            }
-
-                            if (!submitBtn) {
-                                // Generic fallback: any visible "下一步" button
-                                const buttons = document.querySelectorAll('a.btn.btn-primary.btn-block');
-                                for (let btn of buttons) {
-                                    if (btn.textContent.includes('下一步') &&
-                                        btn.offsetParent !== null &&  // is visible
-                                        btn.style.display !== 'none') {
-                                        submitBtn = btn;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (!submitBtn || submitBtn.disabled) {
-                                console.log('[CAPTCHA] Submit button not found or disabled');
-                                return false;
-                            }
-
-                            console.log('[CAPTCHA] Found submit button:', submitBtn.id || submitBtn.className);
-
-                            // Call iBon's frontend verification function if it exists
-                            if (typeof ImageCode_Verify2 === 'function') {
-                                try {
-                                    ImageCode_Verify2();
-                                    console.log('[CAPTCHA] Called ImageCode_Verify2()');
-                                } catch (e) {
-                                    console.log('[CAPTCHA] ImageCode_Verify2 failed:', e);
-                                }
-                            } else if (typeof ImageCode_Verify === 'function') {
-                                try {
-                                    ImageCode_Verify();
-                                    console.log('[CAPTCHA] Called ImageCode_Verify()');
-                                } catch (e) {
-                                    console.log('[CAPTCHA] ImageCode_Verify failed:', e);
-                                }
-                            }
-
-                            submitBtn.click();
-                            console.log('[CAPTCHA] Submit button clicked');
-                            return true;
-                        })();
-                    ''')
-
-                    if submit_clicked:
-                        is_form_submitted = True
-                        debug.log("[CAPTCHA INPUT] Form submitted")
-
-                        # Wait for potential alert to appear and be handled
-                        await asyncio.sleep(random.uniform(0.2, 0.6))
-
-                        if debug.enabled:
-                            if alert_handled:
-                                debug.log(f"[CAPTCHA INPUT] Alert was handled during wait")
-                            else:
-                                debug.log(f"[CAPTCHA INPUT] No alert appeared (captcha may be correct)")
-                    else:
-                        debug.log("[CAPTCHA INPUT] Submit button not found or disabled")
-
-                    # Remove alert handler
-                    try:
-                        tab.remove_handlers(cdp.page.JavascriptDialogOpening)
-                    except:
-                        pass
-                else:
-                    debug.log("[CAPTCHA INPUT] Ticket number not selected, skip submit")
-
-        except Exception as exc:
-            debug.log(f"[CAPTCHA INPUT ERROR] {exc}")
-
-    except Exception as exc:
-        if debug.enabled:
-            debug.log(f"[CAPTCHA INPUT ERROR] Exception: {exc}")
-            import traceback
-            traceback.print_exc()
-
-    return is_verifyCode_editing, is_form_submitted
+        filled = await tab.evaluate(_ibon_render(r'''((expected,answer) => {
+            FORM
+            if(doc!==expected||sessionStorage.getItem(key)||!visible(input)||input.disabled||input.value&&input.value!=='驗證碼')return false;
+            NATIVE
+            return setNativeInputValue(input,answer)&&input.checkValidity();
+        })(EXPECTED,ANSWER)''', EXPECTED=frame['doc'], ANSWER=str(answer)))
+    except Exception:
+        return False, False
+    if not filled:
+        return False, False
+    _state['captcha_fill'] = {'doc': frame['doc'], 'hash': frame['hash'], 'value': str(answer)}
+    submitted = await nodriver_ibon_purchase_button_press(tab, config_dict) if auto_submit else False
+    return True, submitted
 
 async def nodriver_ibon_refresh_captcha(tab, config_dict):
     """
     Refresh ibon captcha image by calling JavaScript refreshCaptcha() function
     Returns: success (bool)
     """
+    if await _ibon_actions_paused(config_dict) or await _ibon_submission_pending(tab, config_dict):
+        return False
     debug = util.create_debug_logger(config_dict)
 
     debug.log("[CAPTCHA REFRESH] Refreshing captcha")
@@ -2566,309 +2394,126 @@ async def nodriver_ibon_refresh_captcha(tab, config_dict):
     return ret
 
 async def nodriver_ibon_auto_ocr(tab, config_dict, ocr, away_from_keyboard_enable, previous_answer):
-    """
-    ibon OCR auto recognition logic
-    Returns: (is_need_redo_ocr, previous_answer, is_form_submitted)
-    """
-    debug = util.create_debug_logger(config_dict)
-
-    is_need_redo_ocr = False
-    is_form_submitted = False
-
-    # Check if input box exists
-    is_input_box_exist = False
+    '''一次辨識，計算不阻塞主迴圈；網址未變不代表網站拒絕。'''
+    if await _ibon_actions_paused(config_dict) or await _ibon_submission_pending(tab, config_dict):
+        return False, previous_answer, False
+    snapshot = await _ibon_snapshot(tab)
+    if not snapshot or not _ibon_selection_ok(snapshot, config_dict):
+        return False, previous_answer, False
+    if not snapshot.get('hasCaptcha'):
+        sent = await nodriver_ibon_purchase_button_press(tab, config_dict) if away_from_keyboard_enable else False
+        return False, previous_answer, sent
+    if snapshot.get('value') not in ('', '驗證碼'):
+        sent = await nodriver_ibon_purchase_button_press(tab, config_dict) if away_from_keyboard_enable else False
+        return False, previous_answer, sent
+    if ocr is None or time.monotonic() < _state.get('next_ocr_at', 0):
+        return False, previous_answer, False
+    frame = await _ibon_capture(tab, config_dict)
+    if not frame:
+        return False, previous_answer, False
+    _state['next_ocr_at'] = time.monotonic() + 0.5
+    identity = (frame['doc'], frame['hash'])
+    tries = _state.setdefault('ocr_tries', {})
+    if tries.get(identity, 0) >= 5:
+        return False, previous_answer, False
+    tries[identity] = tries.get(identity, 0) + 1
     try:
-        input_box = await tab.query_selector('input[placeholder*="驗證碼"], input[value="驗證碼"], #ctl00_ContentPlaceHolder1_CHK')
-        is_input_box_exist = input_box is not None
-    except:
-        pass
-
-    if not is_input_box_exist:
-        debug.log("[CAPTCHA OCR] Captcha input box not found")
-        return is_need_redo_ocr, previous_answer, is_form_submitted
-
-    if not ocr:
-        debug.log("[CAPTCHA OCR] OCR module not available")
-        return is_need_redo_ocr, previous_answer, is_form_submitted
-
-    # iBon clears ticket number after captcha error - reselect if needed
-    ticket_ok = await tab.evaluate('''
-        (function() {
-            // Try new EventBuy format first: table.rwdtable select.form-control-sm
-            let selects = document.querySelectorAll('table.rwdtable select.form-control-sm');
-            // Fallback to old .aspx format: table.table select[name*="AMOUNT_DDL"]
-            if (selects.length === 0) {
-                selects = document.querySelectorAll('table.table select[name*="AMOUNT_DDL"]');
-            }
-            if (selects.length === 0) return false;
-            const select = selects[0];
-            return select.value !== "0" && select.value !== "";
-        })();
-    ''')
-
-    if not ticket_ok:
-        # Retry with exponential backoff: 0.5s → 1.0s → 2.0s
-        max_retries = 3
-        is_ticket_number_assigned = False
-        debug = util.create_debug_logger(config_dict)
-
-        for attempt in range(1, max_retries + 1):
-            is_ticket_number_assigned = await nodriver_ibon_ticket_number_auto_select(tab, config_dict)
-
-            if is_ticket_number_assigned:
-                if attempt > 1:
-                    debug.log(f"[TICKET RETRY] Success after {attempt} attempt(s)")
-                break
-
-            if attempt < max_retries:
-                # #322: gentler backoff (selects already ensured by wait_for_select_elements)
-                # Exponential backoff: delay = 0.2 * (2 ^ (attempt - 1))
-                delay = 0.2 * (2 ** (attempt - 1))
-                debug.log(f"[TICKET RETRY] Attempt {attempt}/{max_retries} failed, waiting {delay}s (exponential backoff)")
-                await asyncio_sleep_with_pause_check(delay, config_dict)
-
-        if is_ticket_number_assigned:
-            # Wait for iBon to process ticket number change
-            await asyncio.sleep(random.uniform(0.15, 0.25))
-
-    # Get captcha image and do OCR
-    ocr_start_time = time.time()
-
-    img_base64 = await nodriver_ibon_get_captcha_image_from_shadow_dom(tab, config_dict)
-
-    ocr_answer = None
-    if img_base64:
-        try:
-            # Use global OCR instance (beta=True works best for iBon - 91.3% accuracy in tests)
-            # Preprocessing actually reduces accuracy (73.9% vs 91.3%)
-            ocr_answer = ocr.classification(img_base64)
-
-            debug.log(f"[CAPTCHA OCR] Using global OCR (beta=True), raw result: {ocr_answer}")
-
-            # Filter to digits only (iBon captchas are 4 digits)
-            if ocr_answer:
-                filtered = ''.join(filter(str.isdigit, ocr_answer))
-                if filtered != ocr_answer:
-                    debug.log(f"[CAPTCHA OCR] Filtered '{ocr_answer}' -> '{filtered}'")
-                ocr_answer = filtered
-        except Exception as exc:
-            debug.log(f"[CAPTCHA OCR] OCR classification failed: {exc}")
-
-    ocr_done_time = time.time()
-    ocr_elapsed_time = ocr_done_time - ocr_start_time
-
-    debug.log(f"[CAPTCHA OCR] Processing time: {ocr_elapsed_time:.3f}s")
-
-    # Process OCR result
-    if ocr_answer is None:
-        if away_from_keyboard_enable:
-            # Page not ready, retry
-            is_need_redo_ocr = True
-            await asyncio.sleep(0.1)
-        else:
-            # Manual mode
-            await nodriver_ibon_keyin_captcha_code(tab, config_dict=config_dict)
-    else:
-        ocr_answer = ocr_answer.strip()
-        debug.log(f"[CAPTCHA OCR] Result: {ocr_answer}")
-
-        if len(ocr_answer) == 4:
-            # Valid 4-digit answer
-            current_url_before_submit, _ = await nodriver_current_url(tab)
-            who_care_var, is_form_submitted = await nodriver_ibon_keyin_captcha_code(
-                tab, answer=ocr_answer, auto_submit=away_from_keyboard_enable, config_dict=config_dict
-            )
-
-            # Check if captcha was correct by verifying URL change
-            if is_form_submitted and away_from_keyboard_enable:
-                # Alert is already handled inside nodriver_ibon_keyin_captcha_code()
-                # Just check URL change to determine if captcha was correct
-                debug.log(f"[CAPTCHA OCR] Checking URL for verification...")
-
-                try:
-                    current_url_after_submit, _ = await nodriver_current_url(tab)
-                except Exception as url_exc:
-                    debug.log(f"[CAPTCHA OCR] Failed to get URL: {url_exc}")
-                    current_url_after_submit = current_url_before_submit  # Assume same page
-
-                if current_url_before_submit == current_url_after_submit:
-                    # Still on same page - captcha was incorrect (alert was shown and dismissed)
-                    debug.log(f"[CAPTCHA OCR] Captcha '{ocr_answer}' was incorrect, URL unchanged")
-
-                    # IMPORTANT: iBon automatically refreshes captcha after alert dismissal
-                    # Manual refresh is NOT needed and causes timing issues:
-                    # - Alert dismiss triggers iBon's auto-refresh
-                    # - Manual refresh would create a new captcha
-                    # - Next OCR might still fetch the old URL from DOM cache
-                    # Solution: Wait longer for iBon's refresh to fully stabilize
-                    debug.log("[CAPTCHA OCR] Waiting for iBon auto-refresh to complete...")
-
-                    await asyncio.sleep(random.uniform(0.8, 1.2))  # Wait for iBon auto-refresh
-
-                    is_need_redo_ocr = True
-                    is_form_submitted = False
-                else:
-                    # URL changed - captcha was correct
-                    debug.log(f"[CAPTCHA OCR] Captcha '{ocr_answer}' accepted, URL changed")
-                    debug.log(f"[CAPTCHA OCR] Before: {current_url_before_submit}")
-                    debug.log(f"[CAPTCHA OCR] After: {current_url_after_submit}")
-        else:
-            # Invalid length
-            debug.log(f"[CAPTCHA OCR] Invalid answer length: {len(ocr_answer)} (expected 4)")
-
-            if not away_from_keyboard_enable:
-                await nodriver_ibon_keyin_captcha_code(tab, config_dict=config_dict)
-            else:
-                is_need_redo_ocr = True
-                if previous_answer != ocr_answer:
-                    previous_answer = ocr_answer
-
-    return is_need_redo_ocr, previous_answer, is_form_submitted
+        answer = await asyncio.to_thread(ocr.classification, frame['image'])
+    except Exception:
+        return False, previous_answer, False
+    if await _ibon_actions_paused(config_dict):
+        return False, previous_answer, False
+    answer = ''.join(character for character in str(answer or '') if character in '0123456789')
+    if len(answer) != 4:
+        return False, previous_answer, False
+    _, submitted = await nodriver_ibon_keyin_captcha_code(
+        tab, answer, away_from_keyboard_enable, config_dict, captcha_frame=frame)
+    return False, answer, submitted
 
 async def nodriver_ibon_captcha(tab, config_dict, ocr):
-    """
-    ibon captcha main function
-    Returns: is_captcha_sent (bool)
-    """
-    # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
+    '''驗證碼僅回報是否已送出，不把無法辨識當成成功。'''
+    if await _ibon_actions_paused(config_dict) or await _ibon_submission_pending(tab, config_dict):
         return False
-
-    debug = util.create_debug_logger(config_dict)
-
-    away_from_keyboard_enable = config_dict["ocr_captcha"]["force_submit"]
-    if not config_dict["ocr_captcha"]["enable"]:
-        away_from_keyboard_enable = False
-
-    debug.log(f"[IBON CAPTCHA] Starting captcha handling")
-    debug.log(f"[IBON CAPTCHA] OCR enabled: {config_dict['ocr_captcha']['enable']}")
-    debug.log(f"[IBON CAPTCHA] Auto submit: {away_from_keyboard_enable}")
-
-    is_captcha_sent = False
-
-    if not config_dict["ocr_captcha"]["enable"]:
-        # Manual mode: focus captcha field if present; proceed only when no captcha on page
-        is_editing, _ = await nodriver_ibon_keyin_captcha_code(tab, config_dict=config_dict)
-        is_captcha_sent = not is_editing
-    else:
-        # Auto OCR mode
-        previous_answer = None
-        current_url, _ = await nodriver_current_url(tab)
-        fail_count = 0  # Track consecutive failures
-        total_fail_count = 0  # Track total failures
-
-        for redo_ocr in range(5):
-            is_need_redo_ocr, previous_answer, is_form_submitted = await nodriver_ibon_auto_ocr(
-                tab, config_dict, ocr, away_from_keyboard_enable, previous_answer
-            )
-
-            if not is_need_redo_ocr:
-                is_captcha_sent = True
-
-            if is_form_submitted:
-                debug.log("[IBON CAPTCHA] Form submitted successfully")
-                break
-
-            if not away_from_keyboard_enable:
-                debug.log("[IBON CAPTCHA] Switching to manual input mode")
-                break
-
-            if not is_need_redo_ocr:
-                break
-
-            # Track failures and refresh captcha after 3 consecutive failures
-            if is_need_redo_ocr:
-                fail_count += 1
-                total_fail_count += 1
-                debug.log(f"[IBON CAPTCHA] Fail count: {fail_count}, Total fails: {total_fail_count}")
-
-                # Check if total failures reached 5, switch to manual input mode
-                if total_fail_count >= 5:
-                    print("[IBON CAPTCHA] OCR failed 5 times, please enter captcha manually.")
-                    away_from_keyboard_enable = False
-                    await nodriver_ibon_keyin_captcha_code(tab, config_dict=config_dict)
-                    break
-
-                if fail_count >= 3:
-                    debug.log("[IBON CAPTCHA] 3 consecutive failures reached")
-
-                    # Try to dismiss any existing alert before continuing
-                    try:
-                        await tab.send(cdp.page.handle_java_script_dialog(accept=True))
-                        debug.log("[IBON CAPTCHA] Dismissed existing alert")
-                    except:
-                        pass
-
-                    # IMPORTANT: iBon auto-refreshes captcha after alert dismiss
-                    # Manual refresh causes timing conflicts with auto-refresh
-                    # await nodriver_ibon_refresh_captcha(tab, config_dict)  # REMOVED
-                    await asyncio.sleep(random.uniform(0.8, 1.2))  # Wait for iBon's auto-refresh to complete
-                    fail_count = 0  # Reset consecutive counter after refresh
-
-            # Check if URL changed
-            new_url, _ = await nodriver_current_url(tab)
-            if new_url != current_url:
-                debug.log("[IBON CAPTCHA] URL changed, exit OCR loop")
-                break
-
-            debug.log(f"[IBON CAPTCHA] Retry {redo_ocr + 1}/5")
-
-    return is_captcha_sent
+    snapshot = await _ibon_snapshot(tab)
+    if snapshot and not snapshot.get('hasCaptcha'):
+        return await nodriver_ibon_purchase_button_press(tab, config_dict)
+    if not config_dict.get('ocr_captcha', {}).get('enable'):
+        await nodriver_ibon_keyin_captcha_code(tab, config_dict=config_dict)
+        return False
+    _, _, sent = await nodriver_ibon_auto_ocr(
+        tab, config_dict, ocr, bool(config_dict.get('ocr_captcha', {}).get('force_submit')), None)
+    return sent
 
 async def nodriver_ibon_purchase_button_press(tab, config_dict):
-    """
-    Click the ibon purchase/next button after captcha is filled
-
-    Args:
-        tab: NoDriver tab object
-        config_dict: Configuration dictionary for debug settings
-
-    Returns:
-        bool: True if button clicked successfully, False otherwise
-    """
-    debug = util.create_debug_logger(config_dict)
-    is_button_clicked = False
-
+    '''同一分頁送出前檢查總張數，持續保存未知結果的鎖定。'''
+    if not config_dict.get('ocr_captcha', {}).get('force_submit') or await _ibon_actions_paused(config_dict):
+        return False
+    if _state.get('handoff_ready') or await _ibon_submission_pending(tab, config_dict):
+        return False
+    snapshot = await _ibon_snapshot(tab)
+    if not _ibon_selection_ok(snapshot, config_dict) or not snapshot.get('validForm') or _ibon_is_checkout(snapshot['url']):
+        return False
+    fingerprint = ''
+    if snapshot.get('hasCaptcha'):
+        if not re.fullmatch(r'\d{4}', snapshot.get('value', '')):
+            return False
+        frame = await _ibon_capture(tab, config_dict)
+        filled = _state.get('captcha_fill')
+        if not frame or not filled or (frame['doc'], frame['hash']) != (filled['doc'], filled['hash']):
+            return False
+        fingerprint = frame['hash']
+    if await _ibon_actions_paused(config_dict):
+        return False
+    import uuid
+    nonce = uuid.uuid4().hex
+    flow = {'nonce': nonce, 'origin': _ibon_origin(snapshot['url']), 'handoff': False}
+    previous_flow = _ibon_read_flow(tab)
     try:
-        # Primary selector: #ticket-wrap > a.btn
-        # Backup selectors from JavaScript extension analysis
-        selectors = [
-            '#ticket-wrap > a.btn',
-            'div#ticket-wrap > a[onclick]',
-            'div#ticket-wrap a.btn.btn-primary[href]'
-        ]
-
-        for selector in selectors:
-            try:
-                button = await tab.query_selector(selector)
-                if button:
-                    # Check if button is visible and enabled
-                    is_visible = await tab.evaluate(f'''
-                        (function() {{
-                            const btn = document.querySelector('{selector}');
-                            return btn && !btn.disabled && btn.offsetParent !== null;
-                        }})();
-                    ''')
-
-                    if is_visible:
-                        await button.click()
-                        is_button_clicked = True
-                        debug.log(f"[IBON PURCHASE] Successfully clicked button with selector: {selector}")
-                        break
-            except Exception as exc:
-                debug.log(f"[IBON PURCHASE] Selector {selector} failed: {exc}")
-                continue
-
-        if not is_button_clicked:
-            debug.log("[IBON PURCHASE] Purchase button not found or not clickable")
-
-    except Exception as exc:
-        if debug.enabled:
-            debug.log(f"[IBON PURCHASE ERROR] {exc}")
-            import traceback
-            traceback.print_exc()
-
-    return is_button_clicked
+        if not util.save_json(flow, _ibon_flow_path(tab)):
+            return False
+    except (OSError, ValueError):
+        return False
+    if await _ibon_actions_paused(config_dict):
+        _ibon_remove_flow(tab, nonce)
+        return False
+    script = r'''((expected,captcha,nonce) => {
+        FORM
+        const previous=JSON.parse(sessionStorage.getItem(key)||'null');
+        const tour=/\/event\/[^/]+\/options\/?$/i.test(location.pathname);
+        if(doc!==expected.doc||JSON.stringify(rows())!==JSON.stringify(expected.rows))return false;
+        if(input&&(!visible(input)||!/^\d{4}$/.test(input.value)||!input.checkValidity()))return false;
+        let phase='ticket',button=null;
+        if(tour){
+            phase=previous?.phase==='tour_cart'?'tour_confirm':'tour_cart';
+            const label=phase==='tour_cart'?'加入訂購':'確認付款方式';
+            button=Array.from(document.querySelectorAll('button')).find(e=>visible(e)&&!e.disabled&&e.textContent.includes(label));
+            if(previous&&(previous.phase!=='tour_cart'||previous.doc!==doc))return false;
+        }else{
+            if(previous)return false;
+            button=document.querySelector('#ctl00_ContentPlaceHolder1_A2')||document.querySelector('a[id*="AddShopingCart"]');
+        }
+        if(!button&&!tour)button=Array.from(document.querySelectorAll('#ticket-wrap > a.btn,a.btn.btn-primary.btn-block')).find(e=>visible(e)&&/下一步|購買/.test(e.textContent));
+        if(!visible(button)||button.disabled||button.getAttribute('aria-disabled')==='true')return false;
+        if(button.closest('form')&&!button.closest('form').checkValidity())return false;
+        const record={doc,route:location.href,nonce,state:'pending',captcha,phase};
+        try{sessionStorage.setItem(key,JSON.stringify(record));}catch(_){return false;}
+        window[Symbol.for(key)]=record;
+        try{button.click();return true;}catch(_){return false;}
+    })(SNAPSHOT,CAPTCHA,NONCE)'''
+    try:
+        invoked = bool(await tab.evaluate(_ibon_render(script, SNAPSHOT=snapshot, CAPTCHA=fingerprint, NONCE=nonce)))
+        if not invoked:
+            live = await _ibon_snapshot(tab)
+            stored = await tab.evaluate("sessionStorage.getItem('ticketsHunter.ibon.submit')")
+            saved = json.loads(stored) if stored else None
+            if live and live['doc'] == snapshot['doc'] and (not saved or saved.get('nonce') != nonce):
+                if previous_flow:
+                    util.save_json(previous_flow, _ibon_flow_path(tab))
+                else:
+                    _ibon_remove_flow(tab, nonce)
+        return invoked
+    except Exception:
+        return False
 
 async def nodriver_ibon_check_sold_out(tab, config_dict):
     """
@@ -3598,286 +3243,33 @@ async def nodriver_tour_ibon_event_detail(tab, config_dict):
     return is_button_clicked
 
 async def nodriver_tour_ibon_options(tab, config_dict):
-    """
-    Handle tour.ibon.com.tw options page (/event/{eventId}/options)
-    Select ticket quantity -> Add to cart -> Confirm payment method
-
-    Args:
-        tab: NoDriver tab object
-        config_dict: Configuration dictionary
-
-    Returns:
-        bool: True if all steps completed successfully
-    """
-    debug = util.create_debug_logger(config_dict)
-    is_all_completed = False
-
-    try:
-        debug.log("[TOUR IBON] Options page detected")
-
-        # Step 1: Select ticket quantity from <select> element
-        # Support multiple ticket types with area_keyword matching
-        ticket_number = config_dict.get("ticket_number", 2)
-
-        # Get area keyword for ticket type matching
-        area_keyword = ""
-        area_auto_select_enable = config_dict.get("area_auto_select", {}).get("enable", False)
-        if area_auto_select_enable:
-            area_keyword = config_dict.get("area_auto_select", {}).get("area_keyword", "")
-            area_keyword = util.format_keyword_string(area_keyword)
-
-        try:
-            # Step 1a: Get all ticket types from page
-            ticket_types = await tab.evaluate('''
-                (function() {
-                    var headings = document.querySelectorAll('h4');
-                    return Array.from(headings).map(h => h.textContent.trim());
-                })()
-            ''')
-
-            # Step 1b: Find matching ticket type using Python util function
-            target_index = 0  # Default to first ticket type
-            if area_keyword and ticket_types:
-                for i, ticket_name in enumerate(ticket_types):
-                    if util.is_text_match_keyword(area_keyword, ticket_name):
-                        target_index = i
-                        debug.log(f"[TOUR IBON] Keyword '{area_keyword}' matched ticket: {ticket_name}")
-                        break
-
-            # Step 1c: Select quantity for the matched ticket type
-            select_result = await tab.evaluate(f'''
-                (function() {{
-                    var targetIndex = {target_index};
-                    var ticketNumber = "{ticket_number}";
-                    var selects = document.querySelectorAll('select#input-qty, select[id*="qty"]');
-                    var headings = document.querySelectorAll('h4');
-
-                    if (selects.length > targetIndex) {{
-                        var select = selects[targetIndex];
-                        select.value = ticketNumber;
-                        select.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        return {{
-                            success: true,
-                            index: targetIndex,
-                            ticketName: headings[targetIndex] ? headings[targetIndex].textContent.trim() : '',
-                            value: select.value
-                        }};
-                    }}
-                    return {{ success: false, reason: 'no select found', selectCount: selects.length }};
-                }})()
-            ''')
-
-            if select_result and isinstance(select_result, dict) and select_result.get('success'):
-                debug.log(f"[TOUR IBON] Selected ticket: {select_result.get('ticketName', 'unknown')}, quantity: {ticket_number}")
-
-        except Exception as e:
-            debug.log(f"[TOUR IBON] Quantity selection error: {e}")
-
-        # Step 2: Click the ENABLED "加入訂購" button (only enabled after quantity selected)
-        await asyncio.sleep(0.3)
-
-        try:
-            result = await tab.evaluate('''
-                (function() {
-                    var buttons = Array.from(document.querySelectorAll('button'));
-                    // Find enabled "加入訂購" button (disabled buttons have disabled attribute)
-                    var addBtn = buttons.find(btn =>
-                        btn.textContent.includes("加入訂購") && !btn.disabled
-                    );
-                    if (addBtn) {
-                        addBtn.click();
-                        return { success: true };
-                    }
-                    // If no enabled button found, report all button states
-                    var allAddBtns = buttons.filter(btn => btn.textContent.includes("加入訂購"));
-                    return {
-                        success: false,
-                        reason: 'no enabled button',
-                        buttonCount: allAddBtns.length,
-                        allDisabled: allAddBtns.every(btn => btn.disabled)
-                    };
-                })()
-            ''')
-
-            if result and isinstance(result, dict) and result.get('success'):
-                debug.log("[TOUR IBON] Clicked: 加入訂購")
-            elif result and isinstance(result, dict) and not result.get('success'):
-                debug.log(f"[TOUR IBON] Add button not ready: {result.get('reason')}")
-        except Exception as e:
-            debug.log(f"[TOUR IBON] Add to cart error: {e}")
-
-        # Step 3: Wait and click "確認付款方式" button
-        await asyncio.sleep(0.5)
-
-        try:
-            result = await tab.evaluate('''
-                (function() {
-                    var buttons = Array.from(document.querySelectorAll('button'));
-                    var confirmBtn = buttons.find(btn => btn.textContent.includes("確認付款方式"));
-                    if (confirmBtn) {
-                        confirmBtn.click();
-                        return true;
-                    }
-                    return false;
-                })()
-            ''')
-
-            if result:
-                is_all_completed = True
-                debug.log("[TOUR IBON] Clicked: 確認付款方式")
-        except Exception as e:
-            debug.log(f"[TOUR IBON] Confirm payment error: {e}")
-
-    except Exception as e:
-        debug.log(f"[TOUR IBON] Options page error: {e}")
-
-    return is_all_completed
+    """旅遊網站每個加入訂購／確認階段僅送一次，結帳頁保留手動。"""
+    if await _ibon_actions_paused(config_dict):
+        return False
+    if not await nodriver_ibon_ticket_number_auto_select(tab, config_dict):
+        return False
+    return await nodriver_ibon_purchase_button_press(tab, config_dict)
 
 async def nodriver_tour_ibon_checkout(tab, config_dict):
-    """
-    Handle tour.ibon.com.tw checkout page (/event/{eventId}/checkout)
-    Fill form (name, phone) -> Check agreement -> Submit
-
-    Args:
-        tab: NoDriver tab object
-        config_dict: Configuration dictionary
-
-    Returns:
-        bool: True if form submitted successfully
-    """
-    debug = util.create_debug_logger(config_dict)
-    is_form_submitted = False
-
-    try:
-        debug.log("[TOUR IBON] Checkout page detected")
-
-        # Get personal data from config
-        real_name = config_dict.get("contact", {}).get("real_name", "")
-        phone = config_dict.get("contact", {}).get("phone", "")
-
-        if not real_name or not phone:
-            debug.log("[TOUR IBON] Missing contact data in settings")
-            return False
-
-        # JSON encode for safe JavaScript string insertion
-        real_name_js = json.dumps(real_name)
-        phone_js = json.dumps(phone)
-
-        # Step 1: Fill real name and phone using fieldset structure
-        try:
-            result = await tab.evaluate(f'''
-                (function() {{
-                    var fieldsets = document.querySelectorAll('fieldset');
-                    var nameInput = null;
-                    var phoneInput = null;
-
-                    fieldsets.forEach(function(fs) {{
-                        var legend = fs.querySelector('legend');
-                        var input = fs.querySelector('input');
-                        if (legend && input && !input.readOnly) {{
-                            if (legend.textContent.includes('真實姓名')) nameInput = input;
-                            if (legend.textContent.includes('手機號碼')) phoneInput = input;
-                        }}
-                    }});
-
-                    var results = {{ name: false, phone: false }};
-
-                    if (nameInput) {{
-                        nameInput.focus();
-                        nameInput.value = {real_name_js};
-                        nameInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        nameInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        nameInput.blur();
-                        results.name = true;
-                    }}
-
-                    if (phoneInput) {{
-                        phoneInput.focus();
-                        phoneInput.value = {phone_js};
-                        phoneInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        phoneInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        phoneInput.blur();
-                        results.phone = true;
-                    }}
-
-                    return results;
-                }})()
-            ''')
-
-            if result and isinstance(result, dict):
-                if result.get('name'):
-                    debug.log(f"[TOUR IBON] Filled name: {real_name}")
-                if result.get('phone'):
-                    debug.log(f"[TOUR IBON] Filled phone: {phone}")
-        except Exception as e:
-            debug.log(f"[TOUR IBON] Form fill error: {e}")
-
-        # Step 2: Check agreement checkbox (wait for form validation first)
-        await asyncio.sleep(0.5)
-
-        try:
-            result = await tab.evaluate('''
-                (function() {
-                    // Try by id first, then fallback to search
-                    var agreeCheckbox = document.getElementById('agreeCheck');
-                    if (!agreeCheckbox) {
-                        var checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]'));
-                        agreeCheckbox = checkboxes.find(cb => {
-                            var parent = cb.closest('div');
-                            return parent && parent.textContent.includes("我已詳閱");
-                        });
-                    }
-                    if (agreeCheckbox && !agreeCheckbox.checked) {
-                        agreeCheckbox.click();
-                        return { clicked: true, checked: agreeCheckbox.checked };
-                    }
-                    return { clicked: false, checked: agreeCheckbox ? agreeCheckbox.checked : false };
-                })()
-            ''')
-
-            if result:
-                debug.log(f"[TOUR IBON] Agreement checkbox: {result}")
-        except Exception as e:
-            debug.log(f"[TOUR IBON] Checkbox error: {e}")
-
-        # Step 3: Click submit button (下一步) - wait for validation to complete
-        await asyncio.sleep(0.5)
-
-        try:
-            result = await tab.evaluate('''
-                (function() {
-                    var buttons = Array.from(document.querySelectorAll('button'));
-                    var submitBtn = buttons.find(btn => btn.textContent.includes("下一步") && !btn.disabled);
-                    if (submitBtn) {
-                        submitBtn.click();
-                        return true;
-                    }
-                    return false;
-                })()
-            ''')
-
-            if result:
-                is_form_submitted = True
-                debug.log("[TOUR IBON] Clicked: 下一步")
-        except Exception as e:
-            debug.log(f"[TOUR IBON] Submit error: {e}")
-
-    except Exception as e:
-        debug.log(f"[TOUR IBON] Checkout error: {e}")
-
-    return is_form_submitted
+    """旅遊結帳頁交還使用者，不自動填寫、勾選或送出。"""
+    return await _ibon_handoff(tab, config_dict)
 
 async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
     # 函數開始時檢查暫停
-    if await check_and_handle_pause(config_dict):
+    if await _ibon_actions_paused(config_dict):
         return False
     _ensure_state()
+    if _state.get('handoff_ready'):
+        return True
+    if _ibon_is_checkout(url):
+        return await _ibon_handoff(tab, config_dict)
+    await register_ibon_alert_handler(tab, config_dict)
+    if await _ibon_submission_pending(tab, config_dict):
+        return False
+    ocr = await _ibon_cached_ocr(config_dict, ocr)
 
     # Check if kicked to login page (Cookie/Session expired)
     debug = util.create_debug_logger(config_dict)
-
-    # Lazy-register alert handler (no-op if already registered by goto_homepage)
-    await register_ibon_alert_handler(tab, config_dict)
 
     # Queue-IT detection: track enter/exit time for diagnostics
     url_lower = url.lower()
@@ -4132,7 +3524,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                             _state["livemap_last_attempt"] = None
                             livemap_debug.log(f"[IBON LIVEMAP] Area '{failed_area_name}' (id={failed_area_id}) sold out, added to blacklist ({len(failed_set)} total)")
 
-                        livemap_areas = util.ibon_fetch_and_parse_livemap(perf_id, livemap_debug)
+                        livemap_areas = await asyncio.to_thread(util.ibon_fetch_and_parse_livemap, perf_id, livemap_debug)
 
                         if livemap_areas:
                             # Filter out previously failed areas (stale CDN data)
@@ -4311,13 +3703,6 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                     # Step 3: Handle captcha (after ticket number is selected)
                     is_captcha_sent = False
                     try:
-                        ocr = None
-                        if config_dict["ocr_captcha"]["enable"]:
-                            import ddddocr
-                            ocr = create_universal_ocr(config_dict)
-                            if ocr is None:
-                                ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                                ocr.set_ranges(0)
                         is_captcha_sent = await nodriver_ibon_captcha(tab, config_dict, ocr)
                     except Exception as exc:
                         debug.log(f"[IBON] Captcha error: {exc}")
@@ -4343,7 +3728,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                     # Step 4: Submit purchase
                     if is_ticket_number_assigned and is_captcha_sent:
                         try:
-                            click_ret = await nodriver_ibon_purchase_button_press(tab, config_dict)
+                            click_ret = is_captcha_sent  # CAPTCHA handler already used the guarded submit path.
                             if click_ret:
                                 # Play "ticket" sound when attempting to enter checkout (found ticket)
                                 if not _state.get("played_sound_ticket", False):
@@ -4402,13 +3787,6 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                     # Step 2: Handle captcha (only executed when tickets are available)
                     is_captcha_sent = False
                     try:
-                        ocr = None
-                        if config_dict["ocr_captcha"]["enable"]:
-                            import ddddocr
-                            ocr = create_universal_ocr(config_dict)
-                            if ocr is None:
-                                ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                                ocr.set_ranges(0)
                         is_captcha_sent = await nodriver_ibon_captcha(tab, config_dict, ocr)
                     except Exception as exc:
                         debug.log(f"[IBON] Captcha error: {exc}")
@@ -4458,7 +3836,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                     # Step 4: Submit purchase
                     if is_ticket_number_assigned and is_captcha_sent:
                         try:
-                            click_ret = await nodriver_ibon_purchase_button_press(tab, config_dict)
+                            click_ret = is_captcha_sent  # CAPTCHA handler already used the guarded submit path.
                             if click_ret:
                                 # Play "ticket" sound when attempting to enter checkout (found ticket)
                                 if not _state.get("played_sound_ticket", False):
@@ -4604,17 +3982,6 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                 if not Captcha_Browser is None:
                     Captcha_Browser.set_domain(domain_name, captcha_url=captcha_url)
 
-                ocr = None
-                if config_dict["ocr_captcha"]["enable"]:
-                    try:
-                        import ddddocr
-                        ocr = create_universal_ocr(config_dict)
-                        if ocr is None:
-                            ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                            ocr.set_ranges(0)
-                    except Exception as exc:
-                        debug.log(f"[NEW EVENTBUY] OCR init error: {exc}")
-
                 # Call ibon captcha handler (handles both OCR and manual mode)
                 is_captcha_sent = await nodriver_ibon_captcha(tab, config_dict, ocr)
 
@@ -4623,7 +3990,7 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                 if is_captcha_sent:
                     debug.log("[NEW EVENTBUY] Clicking purchase button")
 
-                    click_ret = await nodriver_ibon_purchase_button_press(tab, config_dict)
+                    click_ret = is_captcha_sent  # CAPTCHA handler already used the guarded submit path.
 
                     # Play sound if button clicked successfully
                     if click_ret:
@@ -4758,24 +4125,13 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         if not Captcha_Browser is None:
                             Captcha_Browser.set_domain(domain_name, captcha_url=captcha_url)
 
-                        ocr = None
-                        if config_dict["ocr_captcha"]["enable"]:
-                            try:
-                                import ddddocr
-                                ocr = create_universal_ocr(config_dict)
-                                if ocr is None:
-                                    ocr = ddddocr.DdddOcr(show_ad=False, beta=config_dict["ocr_captcha"]["beta"])
-                                    ocr.set_ranges(0)
-                            except Exception as exc:
-                                debug.log(f"[IBON] OCR init error: {exc}")
-
                         # Call ibon captcha handler (handles both OCR and manual mode)
                         is_captcha_sent = await nodriver_ibon_captcha(tab, config_dict, ocr)
                     
                     #print("is_ticket_number_assigned:", is_ticket_number_assigned)
                     if is_ticket_number_assigned:
                         if is_captcha_sent:
-                            click_ret = await nodriver_ibon_purchase_button_press(tab, config_dict)
+                            click_ret = is_captcha_sent  # CAPTCHA handler already used the guarded submit path.
 
                             # only this case: "ticket number CHANGED by bot" and "cpatcha sent" to play sound!
                             if click_ret:
@@ -4829,33 +4185,5 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                     if not is_name_based:
                         is_button_clicked = await nodriver_press_button(tab, 'a.btn.btn-pink.continue')
 
-    # Check if reached checkout page (ticket purchase successful)
-    # https://orders.ibon.com.tw/application/UTK02/UTK0206_.aspx
-    if '/utk02/utk0206_.aspx' in url.lower():
-        # Show debug message (only once)
-        if not _state["shown_checkout_message"]:
-            debug.log("[IBON] Reached checkout page - ticket purchase successful!")
-        _state["shown_checkout_message"] = True
-
-        # Play sound notification (only once)
-        if not _state["played_sound_order"]:
-            if config_dict["advanced"]["play_sound"]["order"]:
-                play_sound_while_ordering(config_dict)
-            send_discord_notification(config_dict, "order", "iBon")
-            send_telegram_notification(config_dict, "order", "iBon")
-        _state["played_sound_order"] = True
-
-        # If headless mode, open browser to show checkout page (only once)
-        if config_dict["advanced"]["headless"]:
-            if not _state["is_popup_checkout"]:
-                checkout_url = url
-                print("搶票成功, 請前往該帳號訂單查看: %s" % (checkout_url))
-                webbrowser.open_new(checkout_url)
-                _state["is_popup_checkout"] = True
-    else:
-        # Reset status when leaving checkout page
-        _state["is_popup_checkout"] = False
-        _state["played_sound_order"] = False
-        _state["shown_checkout_message"] = False
     return tab
 
