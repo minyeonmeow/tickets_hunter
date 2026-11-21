@@ -941,6 +941,7 @@ async def _run_bot(args, session):
     }
     ticketplus_handoff_done = False  # Leave buyer data and payment to the user.
     tixcraft_handoff_done = False
+    ibon_handoff_done = False
 
     # Initialize config mtime (hot-reload watches the file actually loaded)
     app_root = util.get_app_root()
@@ -1000,6 +1001,8 @@ async def _run_bot(args, session):
                         util.write_instance_status("waiting_manual", "已進入購票資料確認頁，請手動處理；尚未確認訂單與付款完成。")
                     elif tixcraft_handoff_done:
                         util.write_instance_status("waiting_manual", "已進入拓元結帳頁，請手動確認資料與付款；尚未確認訂單或付款完成。")
+                    elif ibon_handoff_done:
+                        util.write_instance_status("waiting_manual", "已進入 ibon 結帳頁，請手動確認資料與付款；尚未確認訂單或付款完成。")
                     else:
                         util.write_instance_status("running")
                     logger.info(f'[繼續耗時] 已重新接手瀏覽器：{time.monotonic() - resume_started:.3f} 秒')
@@ -1075,7 +1078,7 @@ async def _run_bot(args, session):
             continue
 
         # Gate: block platform dispatching until refresh_datetime target time
-        if tixcraft_handoff_done:
+        if tixcraft_handoff_done or ibon_handoff_done:
             await asyncio.sleep(0.1)
             continue
         if await check_refresh_datetime_gate(tab, config_dict, refresh_datetime_state):
@@ -1140,7 +1143,9 @@ async def _run_bot(args, session):
             await nodriver_famiticket_main(tab, url, config_dict)
 
         if 'ibon.com' in url:
-            await nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser)
+            ibon_result = await nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser)
+            if ibon_result is True:
+                ibon_handoff_done = True
 
         kham_family = False
         if 'kham.com.tw' in url:

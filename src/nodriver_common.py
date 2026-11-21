@@ -1569,7 +1569,7 @@ def nodriver_overwrite_prefs(conf):
 
 # ===== Shared captcha image capture =====
 
-async def nodriver_get_captcha_image_from_dom_snapshot(tab, config_dict):
+async def nodriver_get_captcha_image_from_dom_snapshot(tab, config_dict, wait_for_render=True):
     """
     Use DOMSnapshot to find captcha image inside Shadow DOM and get base64 data.
     Supports IMG elements with '/pic.aspx?TYPE=' pattern and CANVAS fallback.
@@ -1580,7 +1580,8 @@ async def nodriver_get_captcha_image_from_dom_snapshot(tab, config_dict):
 
     # Wait for page to stabilize before capturing
     import random
-    await asyncio.sleep(random.uniform(0.5, 0.8))
+    if wait_for_render:
+        await asyncio.sleep(random.uniform(0.5, 0.8))
 
     img_base64 = None
 
@@ -1656,7 +1657,7 @@ async def nodriver_get_captcha_image_from_dom_snapshot(tab, config_dict):
             if img_backend_node_id:
                 # Initialize DOM document first (required after page reload)
                 try:
-                    await tab.send(cdp.dom.get_document())
+                    await tab.send(cdp.dom.get_document(pierce=True))
                 except:
                     pass  # Document may already be initialized
 
@@ -1669,7 +1670,8 @@ async def nodriver_get_captcha_image_from_dom_snapshot(tab, config_dict):
                         # Scroll element into view first to ensure it's rendered
                         try:
                             await tab.send(cdp.dom.scroll_into_view_if_needed(node_id=img_node_id))
-                            await asyncio.sleep(0.1)
+                            if wait_for_render:
+                                await asyncio.sleep(0.1)
                         except:
                             pass  # Element may already be visible
 
