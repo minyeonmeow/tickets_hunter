@@ -2779,7 +2779,7 @@ def ibon_fetch_and_parse_livemap(performance_id, debug=None):
 
     Returns list of area dicts or empty list on failure.
     Each dict: page_name, performance_id, area_id, group_id,
-               area_name, price (int), remaining (int).
+               area_name, price (int), remaining (int or None for 熱賣中).
     """
     areas = []
     url = f"{IBON_LIVEMAP_CDN_BASE}/{performance_id}/1_{performance_id}_live.map"
@@ -2798,7 +2798,7 @@ def ibon_fetch_and_parse_livemap(performance_id, debug=None):
         return areas
 
     send_pattern = r"Send\('(\d+)',\s*'([^']+)',\s*'([^']+)',\s*'([^']*)'\)"
-    title_pattern = r'title="[^:]+:([^"]*?)\s+\u7968\u50f9[\uff1a:]([^\s]+)\s+\u5c1a\u9918[\uff1a:](\d+)"'
+    title_pattern = r'title="[^:]+:([^"]*?)\s+\u7968\u50f9[\uff1a:]([^\s]+)\s+\u5c1a\u9918[\uff1a:](\d+|熱賣中)"'
 
     for area_match in re.finditer(r'<area[^>]+>', content):
         area_html = area_match.group()
@@ -2808,7 +2808,7 @@ def ibon_fetch_and_parse_livemap(performance_id, debug=None):
             try:
                 price_str = title_match.group(2).replace(',', '')
                 price = int(price_str)
-                remaining = int(title_match.group(3))
+                remaining = None if title_match.group(3) == '熱賣中' else int(title_match.group(3))
             except (ValueError, IndexError):
                 continue
 
@@ -2841,9 +2841,12 @@ def ibon_livemap_select_area(livemap_areas, config_dict, area_keyword_item, debu
 
     matched = []
     for area in livemap_areas:
-        area_label = f"{area['area_name']} | price={area['price']} | remaining={area['remaining']}"
+        remaining = area['remaining']
+        remaining_text = '熱賣中' if remaining is None else remaining
+        area_label = f"{area['area_name']} | price={area['price']} | remaining={remaining_text}"
 
-        if area['remaining'] < ticket_number:
+        # An on-sale label has no exact stock count; Stage 6 verifies the full quantity.
+        if remaining is not None and remaining < ticket_number:
             if debug:
                 debug.log(f"[IBON LIVEMAP] {area_label} -> skip: insufficient (need {ticket_number})")
             continue

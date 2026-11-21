@@ -1987,6 +1987,7 @@ CONST_IBON_FORM_JS = r'''
 const doc=location.href+'|'+performance.timeOrigin,key='ticketsHunter.ibon.submit';
 const input=document.querySelector('input[placeholder*="驗證碼"],input[value="驗證碼"],#ctl00_ContentPlaceHolder1_CHK');
 const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
+const area=()=>document.querySelector('#ctl00_ContentPlaceHolder1_PRICE_STR,span[id$="_PRICE_STR"]')?.textContent.trim()||'';
 const rows=()=>{
     let items=Array.from(document.querySelectorAll('table.rwdtable tbody tr'));
     if(!items.length)items=Array.from(document.querySelectorAll('table.table tbody tr'));
@@ -1995,6 +1996,7 @@ const rows=()=>{
         const select=row.matches('select')?row:row.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"]');
         if(!select)return null;
         return {index,name:(row.matches('select')?document.querySelectorAll('h4')[index]:row.querySelector('td:first-child'))?.textContent.trim()||'',
+            price:row.matches('select')?'':row.querySelector('td:nth-child(3)')?.textContent.trim()||'',
             id:select.id||select.name||'',value:select.value,enabled:!select.disabled&&visible(select),
             options:Array.from(select.options).filter(o=>!o.disabled&&!o.hidden&&!o.parentElement?.disabled).map(o=>o.value)};
     }).filter(Boolean);
@@ -2024,7 +2026,7 @@ async def _ibon_snapshot(tab):
         result = await tab.evaluate(r'''(() => {
             FORM
             const invalid=Array.from(document.forms).some(f=>f.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"],select[id*="qty"]')&&f.matches(':invalid'));
-            return {doc,url:location.href,referrer:document.referrer,validForm:!invalid,rows:rows(),hasCaptcha:!!input,
+            return {doc,url:location.href,referrer:document.referrer,area:area(),validForm:!invalid,rows:rows(),hasCaptcha:!!input,
                 value:input?.value||'',inputReady:visible(input)&&!input.disabled};
         })()'''.replace('FORM', CONST_IBON_FORM_JS))
         return result if isinstance(result, dict) and result.get('doc') else None
@@ -2090,16 +2092,20 @@ def _ibon_candidates(snapshot, config_dict):
     requested = str(config_dict.get('ticket_number', 2))
     if not re.fullmatch(r'[1-9]\d{0,2}', requested):
         return []
+    # Stage 6: retain the selected area when matching the ticket-type rows.
+    def label(row):
+        return ' '.join(str(value or '') for value in (snapshot.get('area'), row.get('name'), row.get('price'))).strip()
+
     rows = [row for row in snapshot.get('rows', []) if row.get('enabled') and
             requested in row.get('options', []) and row.get('name') and
-            not util.reset_row_text_if_match_keyword_exclude(config_dict, row['name'])]
+            not util.reset_row_text_if_match_keyword_exclude(config_dict, label(row))]
     keyword = config_dict.get('area_auto_select', {}).get('area_keyword', '').strip()
     if not keyword:
         return rows
     for group in util.parse_keyword_string_to_array(keyword):
         parts = [util.format_keyword_string(part) for part in group.split()]
         matched = [row for row in rows if parts and all(
-            part in util.format_keyword_string(row['name']) for part in parts)]
+            part in util.format_keyword_string(label(row)) for part in parts)]
         if matched:
             return matched
     return rows if config_dict.get('area_auto_fallback', False) else []
@@ -2287,7 +2293,14 @@ async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
         return False
     candidates = _ibon_candidates(snapshot, config_dict)
     if not candidates:
+        notice = (snapshot['doc'], snapshot.get('area'), str(snapshot['rows']),
+                  str(config_dict.get('area_auto_select')), config_dict.get('keyword_exclude'), config_dict.get('ticket_number'))
+        if _state.get('selection_notice') != notice:
+            _state['selection_notice'] = notice
+            util.create_debug_logger(config_dict, enabled=True).log(
+                '[IBON] 找不到符合區域／票種關鍵字、排除條件及指定張數的選項，等待票況或手動處理。')
         return False
+    _state.pop('selection_notice', None)
     if _ibon_selection_ok(snapshot, config_dict):
         return True
     target = util.get_target_item_from_matched_list(candidates, config_dict.get('area_auto_select', {}).get('mode', CONST_FROM_TOP_TO_BOTTOM))
@@ -2295,7 +2308,7 @@ async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
         return False
     script = r'''((expected,target,amount) => {
         FORM
-        if(doc!==expected.doc||sessionStorage.getItem(key))return false;
+        if(doc!==expected.doc||area()!==(expected.area||'')||sessionStorage.getItem(key))return false;
         const current=rows();if(JSON.stringify(current)!==JSON.stringify(expected.rows))return false;
         const elements=Array.from(document.querySelectorAll('table.rwdtable tbody tr'));
         if(!elements.length)elements.push(...document.querySelectorAll('table.table tbody tr'));
@@ -2480,7 +2493,7 @@ async def nodriver_ibon_purchase_button_press(tab, config_dict):
         FORM
         const previous=JSON.parse(sessionStorage.getItem(key)||'null');
         const tour=/\/event\/[^/]+\/options\/?$/i.test(location.pathname);
-        if(doc!==expected.doc||JSON.stringify(rows())!==JSON.stringify(expected.rows))return false;
+        if(doc!==expected.doc||area()!==(expected.area||'')||JSON.stringify(rows())!==JSON.stringify(expected.rows))return false;
         if(input&&(!visible(input)||!/^\d{4}$/.test(input.value)||!input.checkValidity()))return false;
         let phase='ticket',button=null;
         if(tour){
@@ -3553,7 +3566,8 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
 
                             if livemap_selected:
                                 skip_url = util.ibon_build_skip_url(livemap_selected)
-                                livemap_debug.log(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} (remaining: {livemap_selected['remaining']}) -> {skip_url}")
+                                remaining_text = '熱賣中（未提供精確餘票）' if livemap_selected['remaining'] is None else livemap_selected['remaining']
+                                livemap_debug.log(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} (remaining: {remaining_text}) -> {skip_url}")
                                 debug.log(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} -> skip to next step")
                                 # Track this attempt so we can blacklist if it fails
                                 _state["livemap_last_attempt"] = {
