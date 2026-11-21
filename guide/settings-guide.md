@@ -597,6 +597,27 @@ NTP 連線失敗時，可改用[官方網站時鐘](https://www.stdtime.gov.tw/h
 
 ### 猜測驗證碼（ocr_captcha）
 
+#### OCR 辨識方式（provider，實驗）
+
+在「進階設定」的 OCR 設定可選擇「本機模型（ddddocr）」或「百度雲 OCR」。預設仍為本機模型。
+百度模式目前接入拓元與 FunOne，參考 [Interpark 專案的 OCR 選用方式](https://github.com/michelle11032424-jpg/Interpark-/blob/main/interpark-ticket-main/runner.py)，
+使用百度[通用文字辨識標準版](https://ai.baidu.com/ai-doc/OCR/zk3h7xz52)的 `general_basic` API，不需要 App ID。
+
+選擇百度會將驗證碼圖片傳至百度，可能使用帳戶額度或產生費用；呼叫前請自行確認帳戶方案。
+請填入自己的 API Key、Secret Key，儲存設定、斷開並重新開始搶票實例。
+金鑰儲存在本機私人設定檔，輸入欄位遮罩不代表檔案加密；不要分享含金鑰的設定檔。
+本機模型路徑與自訓練開關在百度模式下不使用，切回本機後原值仍保留。
+
+圖片辨識沿用原平台的圖片一致性、格式檢查、暫停與防重複送出機制。
+「自動送出」仍由原開關控制，進入結帳／購票資料頁後仍交給使用者處理。
+缺少金鑰或 API 失敗不會默默切換 OCR，亦不使用參考專案內的任何帳戶設定。
+授權會依有效期快取，失效時最多重新授權一次；同一張成功辨識的圖片重用結果。
+所有授權與圖片請求皆有逾時及錯誤節流，錯誤不記錄金鑰、token、圖片或原始 API 回應。
+
+設定檔 `ocr_captcha` 新增：`provider`（`local`／`baidu`）、`baidu_api_key`、`baidu_secret_key`、
+`baidu_timeout`（每次 HTTP 逾時秒數，預設 5）與 `baidu_retry_interval`（最短辨識／失敗重試間隔秒數，預設 1）。
+百度模式不保證比本機快或準；本機模擬測試僅驗證介接與流程，實際效果需自行填入金鑰後比較。
+
 #### 啟用（enable）
 型別：布林值 | 預設：**false**（停用）
 
@@ -686,7 +707,7 @@ NTP 連線失敗時，可改用[官方網站時鐘](https://www.stdtime.gov.tw/h
 是否使用內建通用自訓 OCR 模型進行驗證碼辨識。
 
 **說明**：
-- 啟用（預設）— 使用通用模型（`assets/model/universal/`），準確率 99%+，支援數字、大小寫英文字母
+- 啟用（預設）— 使用通用模型（`assets/model/universal/`），支援數字、大小寫英文字母；實際準確率需依平台與圖片測試
 - 停用 — 改用 ddddocr 官方模型
 
 **支援平台**：TixCraft、iBon、KHAM

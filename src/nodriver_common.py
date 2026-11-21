@@ -22,6 +22,7 @@ from zendriver.core.util import get_registered_instances
 import util
 import settings
 import chrome_downloader
+from ocr_baidu import BaiduOCR
 
 
 async def reload_page_if_enabled(tab):
@@ -193,12 +194,19 @@ def create_ocr_for_platform(config_dict):
     """Create the best OCR instance for the current platform.
 
     Priority:
+    0. Explicit Baidu experiment -> cloud adapter for supported platforms
     1. use_universal=False -> None (ddddocr fallback in caller)
     2. User custom path (not the default) -> use user's path
     3. tixcraft / ticketmaster / indievox homepage -> try tixcraft_tm model
     4. Fallback -> universal model
     """
     ocr_cfg = config_dict.get("ocr_captcha", {})
+    if ocr_cfg.get('provider', 'local') == 'baidu':
+        from urllib.parse import urlsplit
+        host = urlsplit(config_dict.get('homepage', '')).hostname or ''
+        if host not in ('tixcraft.com', 'www.tixcraft.com', 'tickets.funone.io'):
+            raise ValueError('百度 OCR 實驗目前支援拓元與 FunOne，其他平台請選本機 OCR。')
+        return BaiduOCR(ocr_cfg)
     if not ocr_cfg.get("use_universal", True):
         return None
 

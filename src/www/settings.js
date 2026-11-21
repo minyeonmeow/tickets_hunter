@@ -225,6 +225,27 @@ const ocr_captcha_enable = document.querySelector('#ocr_captcha_enable');
 const ocr_captcha_image_source = document.querySelector('#ocr_captcha_image_source');
 const ocr_captcha_force_submit = document.querySelector('#ocr_captcha_force_submit');
 const ocr_captcha_use_universal = document.querySelector('#ocr_captcha_use_universal');
+const ocr_provider = document.querySelector('#ocr_provider');
+const baidu_ocr_api_key = document.querySelector('#baidu_ocr_api_key');
+const baidu_ocr_secret_key = document.querySelector('#baidu_ocr_secret_key');
+function renderOcrProvider() {
+    const cloud = ocr_provider.value === 'baidu';
+    const en = currentLanguage === 'en';
+    document.querySelector('#baidu_ocr_fields').classList.toggle('d-none', !cloud);
+    setRowLabelForField('ocr_provider', en ? 'OCR provider' : 'OCR 辨識方式');
+    setRowLabelForField('baidu_ocr_api_key', en ? 'Baidu OCR API Key' : '百度 OCR API Key');
+    setRowLabelForField('baidu_ocr_secret_key', en ? 'Baidu OCR Secret Key' : '百度 OCR Secret Key');
+    ocr_provider.options[0].textContent = en ? 'Local model (ddddocr)' : '本機模型（ddddocr）';
+    ocr_provider.options[1].textContent = en ? 'Baidu cloud OCR (experimental; uploads images)' : '百度雲 OCR（實驗，圖片會上傳）';
+    document.querySelector('#ocr_provider_help').textContent = en
+        ? 'Baidu mode supports TixCraft and FunOne. CAPTCHA images are sent to Baidu general_basic; account quota or charges may apply. Submission and payment controls remain unchanged. Save, disconnect and start again after changing providers.'
+        : '百度模式目前支援拓元與 FunOne，會將驗證碼圖片傳至百度通用文字辨識 API；可能使用帳戶額度或產生費用。自動送出仍依原設定，購票與付款流程不變。變更後請儲存、斷開並重新開始。';
+    document.querySelector('#baidu_ocr_secret_help').textContent = en
+        ? 'Use your own credentials, stored only in your private local settings. Do not share settings files. Missing credentials or API errors do not silently switch OCR services.'
+        : '請使用自己的金鑰，只儲存於本機私人設定；不要分享設定檔。未填金鑰或 API 失敗時不會偷偷改用其他辨識服務。';
+    ocr_captcha_use_universal.disabled = cloud;
+    ocr_model_path.disabled = cloud;
+}
 const remote_url = document.querySelector('#remote_url');
 const ocr_model_path = document.querySelector('#ocr_model_path');
 
@@ -947,6 +968,7 @@ function applyLanguage(language) {
     updateThemeStatus(document.documentElement.getAttribute('data-bs-theme') || 'light');
     renderAutoRefreshMode();
     renderStandardClock();
+    renderOcrProvider();
 
     if (currentHelpField) {
         const openField = currentHelpField;
@@ -1421,6 +1443,9 @@ function load_settins_to_form(settings)
 
 
         ocr_captcha_enable.checked = settings.ocr_captcha.enable;
+        ocr_provider.value = settings.ocr_captcha.provider === 'baidu' ? 'baidu' : 'local';
+        baidu_ocr_api_key.value = settings.ocr_captcha.baidu_api_key || '';
+        baidu_ocr_secret_key.value = settings.ocr_captcha.baidu_secret_key || '';
         ocr_captcha_image_source.value  = settings.ocr_captcha.image_source;
         ocr_captcha_force_submit.checked = settings.ocr_captcha.force_submit;
 
@@ -1446,6 +1471,7 @@ function load_settins_to_form(settings)
         } else {
             ocr_model_path.value = "";
         }
+        renderOcrProvider();
 
         // dictionary
         user_guess_string.value = format_keyword_for_display(settings.advanced.user_guess_string);
@@ -1762,6 +1788,9 @@ function save_changes_to_dict(silent_flag)
 
 
             settings.ocr_captcha.enable = ocr_captcha_enable.checked;
+            settings.ocr_captcha.provider = ocr_provider.value;
+            settings.ocr_captcha.baidu_api_key = baidu_ocr_api_key.value.trim();
+            settings.ocr_captcha.baidu_secret_key = baidu_ocr_secret_key.value.trim();
             settings.ocr_captcha.image_source = ocr_captcha_image_source.value;
             settings.ocr_captcha.force_submit = ocr_captcha_force_submit.checked;
             settings.ocr_captcha.use_universal = ocr_captcha_use_universal.checked;
@@ -2501,6 +2530,7 @@ function stopQuestionPolling() {
 // Start polling when page loads
 startQuestionPolling();
 standardTimeEnabled.addEventListener('change', renderStandardClock);
+ocr_provider.addEventListener('change', renderOcrProvider);
 standardTimeSync.addEventListener('click', syncStandardClock);
 setInterval(refreshStandardClock, 10000);
 setInterval(renderStandardClock, 100);

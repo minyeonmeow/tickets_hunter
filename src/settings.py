@@ -163,6 +163,11 @@ def get_default_config():
     config_dict["ocr_captcha"]["image_source"] = CONST_OCR_CAPTCH_IMAGE_SOURCE_CANVAS
     config_dict["ocr_captcha"]["use_universal"] = True
     config_dict["ocr_captcha"]["path"] = "assets/model/universal"
+    config_dict["ocr_captcha"]["provider"] = "local"
+    config_dict["ocr_captcha"]["baidu_api_key"] = ""
+    config_dict["ocr_captcha"]["baidu_secret_key"] = ""
+    config_dict["ocr_captcha"]["baidu_timeout"] = 5
+    config_dict["ocr_captcha"]["baidu_retry_interval"] = 1
     config_dict["webdriver_type"] = CONST_WEBDRIVER_TYPE_NODRIVER
 
     config_dict["date_auto_select"] = {}

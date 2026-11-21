@@ -750,6 +750,26 @@
           </div>
         </div>
 
+        <div class="row mb-3" data-under="tixcraft funone">
+          <label for="ocr_provider" class="col-sm-2 col-form-label">OCR 辨識方式</label>
+          <div class="col-sm-10 col-lg-8 col-xl-6">
+            <select class="form-select" id="ocr_provider">
+              <option value="local">本機模型（ddddocr）</option>
+              <option value="baidu">百度雲 OCR（實驗，圖片會上傳）</option>
+            </select>
+            <div class="form-text" id="ocr_provider_help">百度模式目前支援拓元與 FunOne，會將驗證碼圖片傳至百度通用文字辨識 API；可能使用帳戶額度或產生費用。自動送出仍依原設定，購票與付款流程不變。變更後請儲存、斷開並重新開始。</div>
+          </div>
+        </div>
+        <div id="baidu_ocr_fields" class="d-none" data-under="tixcraft funone">
+          <div class="row mb-3">
+            <label for="baidu_ocr_api_key" class="col-sm-2 col-form-label">百度 OCR API Key</label>
+            <div class="col-sm-10 col-lg-8 col-xl-6"><input class="form-control" type="password" id="baidu_ocr_api_key" autocomplete="off" spellcheck="false" /></div>
+          </div>
+          <div class="row mb-3">
+            <label for="baidu_ocr_secret_key" class="col-sm-2 col-form-label">百度 OCR Secret Key</label>
+            <div class="col-sm-10 col-lg-8 col-xl-6"><input class="form-control" type="password" id="baidu_ocr_secret_key" autocomplete="off" spellcheck="false" /><div class="form-text" id="baidu_ocr_secret_help">請使用自己的金鑰，只儲存於本機私人設定；不要分享設定檔。未填金鑰或 API 失敗時不會偷偷改用其他辨識服務。</div></div>
+          </div>
+        </div>
         <div class="row mb-3" data-under="tixcraft ibon kham ticket udn famiticket funone ticketplus">
           <label for="ocr_captcha_image_source" class="col-sm-2 col-form-label">OCR圖片取得方式<span class="help-icon" data-help="ocr_captcha_image_source" title="OCR 圖片取得方式說明" tabindex="0" role="button" aria-label="OCR 圖片取得方式 說明"></span></label>
           <div class="col-sm-10 col-lg-8 col-xl-6">
