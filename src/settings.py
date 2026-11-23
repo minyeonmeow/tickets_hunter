@@ -265,6 +265,9 @@ def get_default_config():
     config_dict["advanced"]["ticketplus_queue_timing"] = True
     config_dict["advanced"]["ticketplus_stock_api"] = True
     config_dict["advanced"]["ticketplus_stock_api_timeout"] = 5
+    config_dict["advanced"]["ibon_stock_api_timeout"] = 3
+    config_dict["advanced"]["ibon_submit_api_timeout"] = 10
+    config_dict["advanced"]["ibon_submit_recovery_limit"] = 3
     config_dict["advanced"]["ticketplus_direct_flow"] = False
     config_dict["advanced"]["ticketplus_enqueue_retry_experiment"] = False
     config_dict["advanced"]["ticketplus_enqueue_retry_interval"] = 1.0
@@ -812,6 +815,16 @@ class DisconnectHandler(tornado.web.RequestHandler):
         if profile_name and not is_valid_profile_name(profile_name):
             self.set_status(400)
             self.write({"error": "invalid profile name"})
+            return
+        # A durable run boundary also reaches an offline or paused browser on its next attach.
+        reset_path = get_instance_state_filepath(profile_name, util.CONST_BROWSER_SESSION_RESET_FILE)
+        try:
+            os.makedirs(os.path.dirname(reset_path), exist_ok=True)
+            with open(reset_path, "w", encoding="ascii") as marker:
+                marker.write(os.urandom(16).hex())
+        except OSError:
+            self.set_status(500)
+            self.write({"error": "無法記錄斷開狀態，請稍後重試。"})
             return
         filepath = get_instance_state_filepath(profile_name, util.CONST_BROWSER_DISCONNECT_FILE)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)

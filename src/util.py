@@ -112,7 +112,18 @@ def get_app_root():
 
 CONST_AUTO_REFRESH_DISABLED_FILE = "MAXBOT_AUTO_REFRESH_DISABLED.txt"
 CONST_BROWSER_DISCONNECT_FILE = "MAXBOT_BROWSER_DISCONNECT.txt"
+CONST_BROWSER_SESSION_RESET_FILE = "MAXBOT_BROWSER_SESSION_RESET.txt"
 CONST_INSTANCE_STATUS_FILE = "MAXBOT_INSTANCE_STATUS.json"
+
+
+def get_browser_session_generation():
+    """Read the instance's durable, explicit disconnect boundary."""
+    try:
+        with open(get_instance_state_path(CONST_BROWSER_SESSION_RESET_FILE), encoding='ascii') as marker:
+            token = marker.read(65).strip()
+        return token if re.fullmatch(r'[a-f0-9]{32}', token) else None
+    except (OSError, UnicodeError):
+        return None
 
 
 def write_instance_status(state, message="", path=None):

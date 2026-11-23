@@ -740,7 +740,8 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                     "ticketplus_session_api", "ticketplus_session_api_cache_seconds",
                     "standard_time_enabled", "standard_time_servers", "standard_time_timeout",
                     "standard_time_sync_interval", "standard_time_max_age", "standard_time_retry_interval",
-                    "standard_time_https_fallback"
+                    "standard_time_https_fallback",
+                    "ibon_stock_api_timeout", "ibon_submit_api_timeout", "ibon_submit_recovery_limit"
                 ]
                 for field in adv_fields:
                     if field in new_config["advanced"]:
@@ -753,6 +754,23 @@ async def reload_config(config_dict, last_mtime, config_filepath):
 
     return config_dict, last_mtime
 
+async def _disconnect_platform_run(session):
+    if not session.get('browser'):
+        return
+    if not os.path.isfile(util.get_instance_state_path(util.CONST_BROWSER_DISCONNECT_FILE)):
+        return
+    completed = session.setdefault('disconnected_platforms', set())
+    for name, disconnect in (('ibon', nodriver_ibon_disconnect), ('tixcraft', nodriver_tixcraft_disconnect)):
+        if name in completed:
+            continue
+        try:
+            await asyncio.wait_for(disconnect(session.get('tab'), session.get('config')), timeout=0.7)
+            completed.add(name)
+        except (Exception, asyncio.CancelledError):
+            # The durable disconnect generation is consumed on the next attach if CDP is unavailable.
+            pass
+
+
 async def main(args):
     session = {"heartbeat": "heartbeat.txt"}
     try:
@@ -761,6 +779,7 @@ async def main(args):
         util.write_instance_status("error", "搶票程序發生錯誤，請重新開始；若持續發生，請查看命令視窗。")
         raise
     finally:
+        await _disconnect_platform_run(session)
         try:
             await asyncio.wait_for(nodriver_ticketplus_retry_reset(), timeout=0.7)
         except (Exception, asyncio.CancelledError):
@@ -806,6 +825,7 @@ async def _run_bot(args, session):
     util.write_instance_status("starting", "正在連接 Chrome。")
     logger.info(f'[啟動耗時] Python 模組就緒：{time.monotonic() - _BOOT_STARTED:.3f} 秒')
     config_dict = get_config_dict(args)
+    session['config'] = config_dict
     if config_dict:
         standard_time.request_sync(config_dict)
 
@@ -898,6 +918,7 @@ async def _run_bot(args, session):
         print("Load config error!")
         sys.exit()
 
+    session.update(tab=tab, browser=driver)
     util.write_instance_status("starting", "瀏覽器已連接，正在準備搶票。")
     url = ""
     last_url = ""
@@ -996,6 +1017,7 @@ async def _run_bot(args, session):
                     resume_started = time.monotonic()
                     driver, tab = await nodriver_attach_browser(conf, config_dict, external_target_id)
                     session["browser"] = driver
+                    session["tab"] = tab
                     external_disconnected = False
                     if ticketplus_handoff_done:
                         util.write_instance_status("waiting_manual", "已進入購票資料確認頁，請手動處理；尚未確認訂單與付款完成。")
@@ -1019,6 +1041,8 @@ async def _run_bot(args, session):
         if is_quit_bot:
             try:
                 disconnect_requested = os.path.isfile(util.get_instance_state_path(util.CONST_BROWSER_DISCONNECT_FILE))
+                if disconnect_requested:
+                    await _disconnect_platform_run(session)
                 if external_browser or disconnect_requested:
                     await nodriver_ticketplus_retry_reset()
                     await nodriver_disconnect_browser(driver, preserve_process=disconnect_requested)

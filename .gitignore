@@ -8,6 +8,9 @@
 # Local tests (keep on disk, do not commit)
 /tests/
 
+# HAR captures may contain cookies, form state and personal data
+*.[hH][aA][rR]
+
 # Python cache
 __pycache__/
 *.pyc

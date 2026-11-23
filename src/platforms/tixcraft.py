@@ -69,6 +69,7 @@ __all__ = [
     "nodriver_tixcraft_auto_ocr",
     "nodriver_tixcraft_ticket_main_ocr",
     "nodriver_tixcraft_main",
+    "nodriver_tixcraft_disconnect",
     "nodriver_ticketmaster_check_ip_block",
 ]
 
@@ -2603,6 +2604,60 @@ function captchaId(){
 '''
 
 
+CONST_TIXCRAFT_DISCONNECT_RESET_JS = r'''
+const resetSubmission=({generation,force,pythonStale,instance})=>{
+    if(!generation&&!force)return {cleared:false};
+    const key='ticketsHunter.tixcraft.submit',active=window[Symbol.for(key)];
+    let saved=null,corrupt=false;try{saved=JSON.parse(sessionStorage.getItem(key)||'null');}catch(_){corrupt=true;}
+    if(saved&&(typeof saved!=='object'||typeof saved.nonce!=='string'))corrupt=true;
+    const foreign=record=>record?.instanceId&&record.instanceId!==instance;
+    if(!force&&(foreign(saved)||foreign(active)))return {cleared:false};
+    const stale=!!generation&&(saved&&saved.resetToken!==generation||active&&active.resetToken!==generation);
+    if(!force&&(!stale&&!pythonStale||corrupt))return {cleared:false};
+    if(!force&&!stale&&(saved||active))return {cleared:false};
+    if(!saved&&!active&&!corrupt&&!pythonStale)return {cleared:false};
+    sessionStorage.removeItem(key);delete window[Symbol.for(key)];return {cleared:true};
+};
+'''
+
+
+def _tixcraft_disconnect_parameters(force=False):
+    generation = util.get_browser_session_generation()
+    stale = bool(_state.get('tixcraft_submit_pending') and
+                 (force or generation and generation != _state.get('tixcraft_submit_generation')))
+    return {'generation': generation, 'force': force, 'pythonStale': stale, 'instance': util.get_instance_id()}
+
+
+async def _tixcraft_finish_disconnect(config_dict):
+    for key in ('tixcraft_submit_pending', 'tixcraft_submit_generation', 'tixcraft_pending_notice',
+                'tixcraft_ticket_selection', 'tixcraft_manual_captcha', 'captcha_rejected_notice'):
+        _state.pop(key, None)
+    _state['captcha_alert_detected'] = False
+    _state['ocr_completed_url'] = ''
+    message = '已依「斷開瀏覽器」解除本輪本機送出鎖定，可在原分頁重新開始；已送達網站的請求無法撤回，訂單結果仍以網站為準。'
+    util.create_debug_logger(config_dict, enabled=True).log('[TIXCRAFT] ' + message)
+
+
+async def nodriver_tixcraft_disconnect(tab, config_dict=None):
+    """Explicit disconnect ends this run without clicking, navigating or cancelling an order."""
+    if tab is None:
+        return
+    urls = str(getattr(getattr(tab, 'target', None), 'url', '') or '') + ' ' + str((config_dict or {}).get('homepage', ''))
+    if not _state.get('tixcraft_submit_pending') and not any(
+            domain in urls for domain in ('tixcraft.com', 'indievox.com', 'ticketmaster.')):
+        return
+    try:
+        cleared = await tab.evaluate(r'''(() => {
+            RESET_LOGIC
+            return resetSubmission(RESET_DATA).cleared;
+        })()'''.replace('RESET_LOGIC', CONST_TIXCRAFT_DISCONNECT_RESET_JS).replace(
+            'RESET_DATA', json.dumps(_tixcraft_disconnect_parameters(force=True))))
+    except Exception:
+        return
+    if cleared is True:
+        await _tixcraft_finish_disconnect(config_dict)
+
+
 async def _tixcraft_mark_submission_rejected(tab):
     """只在明確驗證碼錯誤視窗已關閉後標記，換碼前仍保持鎖定。"""
     try:
@@ -2657,19 +2712,26 @@ async def _tixcraft_mark_submission_failed(tab):
     return bool(cleared)
 
 
-def _tixcraft_pending_notice(config_dict, identity):
+def _tixcraft_pending_notice(config_dict, identity, source='saved'):
     if _state.get('tixcraft_pending_notice') == identity:
         return
     _state['tixcraft_pending_notice'] = identity
-    message = '上一筆送出尚待網站確認，暫不重新送出；請查看瀏覽器排隊或訂單結果。'
+    if source == 'read_failure':
+        message = '暫時無法讀取頁面與送出狀態，正在重新確認，暫不送出；這不代表已經送出購票。'
+    else:
+        origins = {'saved': '瀏覽器保留的紀錄', 'active': '本頁送出紀錄', 'python': '程式保留的待確認指令'}
+        message = ('上一筆送出尚待網站確認（' + origins.get(source, '待確認紀錄') +
+                   '），暫不重送；請確認排隊或訂單結果。如要結束本輪，可按「斷開瀏覽器」後在原分頁重新開始。')
     util.create_debug_logger(config_dict).log('[TIXCRAFT] ' + message)
-    util.write_instance_status('running', message)
+    util.write_instance_status('running' if source == 'read_failure' else 'waiting_manual', message)
 
 
 async def _tixcraft_submission_pending(tab, config_dict=None):
     """結果未知時跨重連與 F5 保留鎖定，不能只靠時間或 URL 猜測。"""
     try:
         result = await tab.evaluate(r'''(() => {
+            RESET_LOGIC
+            const reset=resetSubmission(RESET_DATA);
             CAPTCHA_ID
             const doc=location.href+'|'+performance.timeOrigin,key='ticketsHunter.tixcraft.submit';
             const r=window[Symbol.for(key)],saved=JSON.parse(sessionStorage.getItem(key)||'null');
@@ -2681,24 +2743,33 @@ async def _tixcraft_submission_pending(tab, config_dict=None):
                 sessionStorage.removeItem(key);delete window[Symbol.for(key)];
                 return {documentId:doc,pending:false,released:true};
             }
-            return {documentId:doc,pending:!!saved||!!r,rejected,nonce:saved?.nonce};
-        })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS))
+            return {documentId:doc,pending:!!saved||!!r,rejected,nonce:saved?.nonce,
+                source:saved?'saved':r?'active':null,resetToken:saved?.resetToken??r?.resetToken??null,
+                released:reset.cleared,releaseReason:reset.cleared?'disconnect':null};
+        })()'''.replace('RESET_LOGIC', CONST_TIXCRAFT_DISCONNECT_RESET_JS).replace(
+            'RESET_DATA', json.dumps(_tixcraft_disconnect_parameters())).replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS))
     except Exception:
-        _tixcraft_pending_notice(config_dict, _state.get('tixcraft_submit_pending', 'unknown'))
+        _tixcraft_pending_notice(config_dict, ('read_failure', _state.get('tixcraft_submit_pending')), 'read_failure')
         return True
     if not isinstance(result, dict) or not result.get('documentId'):
-        _tixcraft_pending_notice(config_dict, _state.get('tixcraft_submit_pending', 'unknown'))
+        _tixcraft_pending_notice(config_dict, ('read_failure', _state.get('tixcraft_submit_pending')), 'read_failure')
         return True
     doc = result['documentId']
     if result.get('released'):
-        _state.pop('tixcraft_submit_pending', None)
-        _state['captcha_alert_detected'] = False
-        _state['ocr_completed_url'] = ''
-        util.write_instance_status('running', '網站已明確拒絕上一筆且驗證碼已更新，繼續偵測與選票。')
+        if result.get('releaseReason') == 'disconnect':
+            await _tixcraft_finish_disconnect(config_dict)
+        else:
+            _state.pop('tixcraft_submit_pending', None)
+            _state.pop('tixcraft_submit_generation', None)
+            _state['captcha_alert_detected'] = False
+            _state['ocr_completed_url'] = ''
+        util.write_instance_status('running', '上一輪狀態已解除，繼續偵測與核對選票。')
     pending = result.get('pending') is True or bool(_state.get('tixcraft_submit_pending'))
     if pending:
         _state.setdefault('tixcraft_submit_pending', doc)
-        _tixcraft_pending_notice(config_dict, doc)
+        if result.get('source'):
+            _state['tixcraft_submit_generation'] = result.get('resetToken')
+        _tixcraft_pending_notice(config_dict, (doc, result.get('source')), result.get('source') or 'python')
         if result.get('rejected'):
             await _tixcraft_refresh_rejected(tab, config_dict, doc, result.get('nonce'))
     else:
@@ -2754,6 +2825,8 @@ async def _tixcraft_submit_form(tab, config_dict, require_captcha=False, expecte
         return False
     selection = _state.get('tixcraft_ticket_selection', {})
     _state['tixcraft_submit_pending'] = document_id
+    generation = util.get_browser_session_generation()
+    _state['tixcraft_submit_generation'] = generation
     script = r'''(() => {
         CAPTCHA_ID
         const doc=location.href+'|'+performance.timeOrigin,key=Symbol.for('ticketsHunter.tixcraft.submit');
@@ -2776,12 +2849,12 @@ async def _tixcraft_submit_form(tab, config_dict, require_captcha=False, expecte
         const button=form.querySelector('button[type="submit"],button:not([type]),input[type="submit"]');
         if(!button||button.matches(':disabled'))return {state:'not_ready'};
         const nonce=globalThis.crypto?.randomUUID?.()||Date.now().toString(36)+'-'+Math.random().toString(36);
-        const record={documentId:doc,state:'invoked',captcha:captchaId(),nonce};
-        try{sessionStorage.setItem('ticketsHunter.tixcraft.submit',JSON.stringify({documentId:doc,route:location.href,nonce:record.nonce,state:record.state}));}
+        const record={documentId:doc,state:'invoked',captcha:captchaId(),nonce,resetToken:RESET_TOKEN,instanceId:INSTANCE_ID};
+        try{sessionStorage.setItem('ticketsHunter.tixcraft.submit',JSON.stringify({documentId:doc,route:location.href,nonce:record.nonce,state:record.state,resetToken:record.resetToken,instanceId:record.instanceId}));}
         catch(_){return {state:'not_ready'};}
         window[key]=record;
         try{button.click();return {state:'invoked'};}catch(_){return {state:'unknown'};}
-    })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('EXPECTED', json.dumps(document_id)).replace(
+    })()'''.replace('INSTANCE_ID', json.dumps(util.get_instance_id())).replace('RESET_TOKEN', json.dumps(generation)).replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('EXPECTED', json.dumps(document_id)).replace(
         'TICKETMASTER', json.dumps(is_ticketmaster)).replace('ALLOW_LESS', json.dumps(bool(
             config_dict.get('tixcraft', {}).get('allow_less_tickets', False)))).replace(
         'AMOUNT', json.dumps(config_dict.get('ticket_number', 2))).replace(
@@ -2794,6 +2867,7 @@ async def _tixcraft_submit_form(tab, config_dict, require_captcha=False, expecte
     state = result.get('state') if isinstance(result, dict) else 'unknown'
     if state in ('not_ready', 'changed'):
         _state.pop('tixcraft_submit_pending', None)
+        _state.pop('tixcraft_submit_generation', None)
     return state in ('invoked', 'pending')
 
 

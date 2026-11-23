@@ -72,6 +72,7 @@ __all__ = [
     "nodriver_tour_ibon_options",
     "nodriver_tour_ibon_checkout",
     "nodriver_ibon_main",
+    "nodriver_ibon_disconnect",
 ]
 
 # Module-level state (replaces global ibon_dict)
@@ -93,8 +94,6 @@ def _ensure_state():
         "queue_it_enter_time": None,
         "shown_checkout_message": False,
         "alert_handler_registered": False,
-        "livemap_failed_areas": {},
-        "livemap_last_attempt": None,
         "played_sound_ticket": False,
         "last_homepage_redirect_time": 0,
         "vaildate_submitted_url": None,
@@ -226,351 +225,78 @@ async def nodriver_ibon_login(tab, config_dict, driver):
             traceback.print_exc()
         return {'success': False, 'reason': 'exception', 'error': str(cookie_error)}
 
-async def nodriver_ibon_date_auto_select_pierce(tab, config_dict):
-    """
-    NoDriver ibon 日期自動選擇實作 - 使用 CDP pierce=True 參數
-    直接穿透 Shadow DOM，比 DOMSnapshot 更簡潔高效
+CONST_IBON_DATE_ROWS_JS = r'''
+const dateRows=()=>Array.from(document.querySelectorAll('button.btn-buy')).map((button,index)=>{
+    const row=button.closest('.tr,tr,[role="row"]')||button.closest('.d-flex');
+    return {index,text:button.textContent.trim(),date_context:row?.textContent.trim()||'',
+        disabled:button.disabled||button.getAttribute('aria-disabled')==='true'||!button.getClientRects().length};
+});
+'''
 
-    使用 CDP DOM.query_selector_all(pierce=True) 直接查詢 Shadow DOM 中的按鈕
-    參考：https://ultrafunkamsterdam.github.io/nodriver/nodriver/cdp/dom.html
-    """
+
+def _ibon_date_target(buttons, config_dict):
+    enabled = [button for button in buttons if not button.get('disabled') and button.get('date_context') and
+               not util.reset_row_text_if_match_keyword_exclude(config_dict, button['date_context'])]
+    keyword = config_dict.get('date_auto_select', {}).get('date_keyword', '').strip()
+    matched = enabled if not keyword else []
+    for group in util.parse_keyword_string_to_array(keyword) if keyword else []:
+        parts = [part.lower() for part in group.split() if part.strip()]
+        found = next((button for button in enabled if parts and all(
+            part in (button.get('text', '') + ' ' + button['date_context']).lower() for part in parts)), None)
+        if found:
+            matched = [found]
+            break
+    if not matched and keyword and config_dict.get('date_auto_fallback', False):
+        matched = enabled
+    return util.get_target_item_from_matched_list(matched, config_dict.get('date_auto_select', {}).get('mode', CONST_FROM_TOP_TO_BOTTOM))
+
+
+async def nodriver_ibon_date_auto_select_pierce(tab, config_dict):
+    """一般 DOM 一次讀取完整場次；Shadow DOM 由主入口保留 CDP 回退。"""
     if await _ibon_actions_paused(config_dict):
         return False
-    entry = await _ibon_snapshot(tab)
-    if not entry: return False
-    from zendriver import cdp
-    from zendriver.cdp import runtime
-    import random
-    import json
-
-    debug = util.create_debug_logger(config_dict)
-    auto_select_mode = config_dict["date_auto_select"]["mode"]
-    date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
-    date_auto_fallback = config_dict.get('date_auto_fallback', False)  # T017: Safe access for new field
-
-    debug.log("[IBON DATE PIERCE] Starting date selection with pierce=True")
-    debug.log("date_keyword:", date_keyword)
-    debug.log("auto_select_mode:", auto_select_mode)
-
-    # Step 1: Auto-detect buttons (no fixed wait - responds immediately when ready)
-    debug.log("[IBON DATE PIERCE] Auto-detecting purchase buttons...")
-
-    await tab  # Sync state
-
-    # Initialize CDP DOM state (required for perform_search to work)
+    generation = _ibon_reset_token()
     try:
-        await tab.send(cdp.dom.get_document(depth=0, pierce=False))
-    except:
-        pass
-
-    # Auto-detect: fast polling until buttons found or timeout
-    import time
-    max_wait = 3  # Maximum wait (safety limit)
-    check_interval = 0.1  # Fast polling for quick response
-    start_time = time.time()
-    button_found = False
-
-    while (time.time() - start_time) < max_wait:
-        try:
-            # Use CDP search to check button presence (penetrates Shadow DOM)
-            search_id, result_count = await tab.send(cdp.dom.perform_search(
-                query='button.btn-buy',
-                include_user_agent_shadow_dom=True
-            ))
-
-            # Clean up search
-            try:
-                await tab.send(cdp.dom.discard_search_results(search_id=search_id))
-            except:
-                pass
-
-            if result_count > 0:
-                button_found = True
-                elapsed = time.time() - start_time
-                debug.log(f"[IBON DATE PIERCE] Found {result_count} button(s) after {elapsed:.2f}s")
-                break
-        except:
-            pass
-
-        await tab.sleep(check_interval)
-
-    if not button_found:
-        elapsed = time.time() - start_time
-        debug.log(f"[IBON DATE PIERCE] No buttons found after {elapsed:.1f}s, proceeding with search anyway...")
-
-    # Step 4: Get document with pierce=True to enable Shadow DOM traversal
-    # Use shallow depth to avoid CBOR stack overflow on complex pages
+        data = await tab.evaluate(_ibon_render(r'''(() => {
+            DATE_ROWS
+            const doc=location.href+'|'+performance.timeOrigin,active=window[Symbol.for('ticketsHunter.ibon.date')];
+            return {doc,buttons:dateRows(),pending:active?.doc===doc&&active.resetToken===GENERATION};
+        })()''', GENERATION=generation))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get('doc') or not data.get('buttons'):
+        return None
+    if data.get('pending'):
+        return False
+    if any(not button.get('disabled') and not button.get('date_context') for button in data['buttons']):
+        return None
+    target = _ibon_date_target(data['buttons'], config_dict)
+    if not target or await _ibon_actions_paused(config_dict):
+        return False
     try:
-        doc_result = await tab.send(cdp.dom.get_document(depth=0, pierce=False))
-        root_node_id = doc_result.node_id
-        debug.log(f"[IBON DATE PIERCE] Got document root: {root_node_id}")
-    except Exception as e:
-        debug.log(f"[IBON DATE PIERCE] Failed to get document: {e}")
+        result = await tab.evaluate(_ibon_render(r'''((expected,target) => {
+            DATE_ROWS
+            const key=Symbol.for('ticketsHunter.ibon.date'),doc=location.href+'|'+performance.timeOrigin;
+            if(doc!==expected||window[key]?.doc===doc&&window[key].resetToken===GENERATION)return false;
+            const live=dateRows().find(row=>row.index===target.index);
+            if(!live||live.disabled||live.date_context!==target.date_context||live.text!==target.text)return false;
+            const button=document.querySelectorAll('button.btn-buy')[target.index];
+            window[key]={doc,index:target.index,resetToken:GENERATION};
+            try{button.click();return true;}catch(_){return false;}
+        })(EXPECTED,TARGET)''', EXPECTED=data['doc'], TARGET=target, GENERATION=generation))
+        if result:
+            util.create_debug_logger(config_dict).log('[IBON DATE] 已依日期關鍵字優先順序選擇場次。')
+        return bool(result)
+    except Exception:
+        # A lost click reply must not invoke a second selection path.
         return False
 
-    # Step 5: Use perform_search with pierce capability
-    # Note: query_selector_all doesn't support pierce in current NoDriver version
-    # Use perform_search which can traverse Shadow DOM
-    try:
-        # Perform search to find buttons (automatically pierces Shadow DOM)
-        search_id, result_count = await tab.send(cdp.dom.perform_search(
-            query='button.btn-buy',
-            include_user_agent_shadow_dom=True
-        ))
-
-        debug.log(f"[IBON DATE PIERCE] Found {result_count} button(s) via search")
-
-        if result_count == 0:
-            debug.log("[IBON DATE PIERCE] No purchase buttons found")
-            # Cleanup search
-            try:
-                await tab.send(cdp.dom.discard_search_results(search_id=search_id))
-            except:
-                pass
-            return False
-
-        # Get search results (node IDs)
-        button_node_ids = await tab.send(cdp.dom.get_search_results(
-            search_id=search_id,
-            from_index=0,
-            to_index=result_count
-        ))
-
-        # Cleanup search
-        try:
-            await tab.send(cdp.dom.discard_search_results(search_id=search_id))
-        except:
-            pass
-
-    except Exception as e:
-        debug.log(f"[IBON DATE PIERCE] perform_search failed: {e}")
-        return False
-
-    # Step 5: Extract button data and date context
-    purchase_buttons = []
-
-    for node_id in button_node_ids:
-        try:
-            # Describe button node to get attributes
-            node_desc = await tab.send(cdp.dom.describe_node(node_id=node_id))
-            # node_desc directly contains the node info, not wrapped in .node
-            node = node_desc if hasattr(node_desc, 'attributes') else node_desc.node
-
-            # Parse attributes
-            attrs = {}
-            if hasattr(node, 'attributes') and node.attributes:
-                for i in range(0, len(node.attributes), 2):
-                    if i + 1 < len(node.attributes):
-                        attrs[node.attributes[i]] = node.attributes[i + 1]
-
-            button_class = attrs.get('class', '')
-            button_disabled = 'disabled' in attrs
-
-            # Extract date context by traversing up to find .tr container
-            date_context = ''
-
-            # Start from button's parent (not the button itself)
-            try:
-                button_desc = await tab.send(cdp.dom.describe_node(node_id=node_id))
-                button_node = button_desc if hasattr(button_desc, 'attributes') else button_desc.node
-
-                # Get parent_id to start traversal
-                if not hasattr(button_node, 'parent_id') or not button_node.parent_id:
-                    current_node_id = None
-                else:
-                    current_node_id = button_node.parent_id  # Start from parent, not button itself
-            except Exception:
-                current_node_id = None
-
-            if current_node_id:
-                for level in range(10):  # Max 10 levels up (now starting from parent = level 1)
-                    try:
-                        parent_desc = await tab.send(cdp.dom.describe_node(node_id=current_node_id))
-                        # Same fix: node_desc might be the node itself
-                        parent_node = parent_desc if hasattr(parent_desc, 'attributes') else parent_desc.node
-
-                        # Parse parent attributes
-                        parent_attrs = {}
-                        if hasattr(parent_node, 'attributes') and parent_node.attributes:
-                            for i in range(0, len(parent_node.attributes), 2):
-                                if i + 1 < len(parent_node.attributes):
-                                    parent_attrs[parent_node.attributes[i]] = parent_node.attributes[i + 1]
-
-                        parent_class = parent_attrs.get('class', '')
-
-                        # Check if this is .tr container (flexible matching)
-                        is_tr_container = (
-                            ' tr ' in f' {parent_class} ' or
-                            parent_class.endswith(' tr') or
-                            parent_class.startswith('tr ') or
-                            'd-flex' in parent_class  # ibon uses d-flex for containers
-                        )
-
-                        if is_tr_container:
-                            # Found container; extract its full text (not a 200-char slice).
-                            # Strip HTML tags so date_context holds the date column AND the
-                            # session-name column (e.g. "雙日票"), enabling keyword match on
-                            # ticket-type names when sessions share the same start date.
-                            try:
-                                outer_html = await tab.send(cdp.dom.get_outer_html(node_id=current_node_id))
-                                date_context = util.remove_html_tags(outer_html)
-                                break
-                            except Exception:
-                                pass
-
-                        # Move up to parent
-                        if hasattr(parent_node, 'parent_id') and parent_node.parent_id:
-                            current_node_id = parent_node.parent_id
-                        else:
-                            break
-
-                    except Exception:
-                        break
-
-            purchase_buttons.append({
-                'node_id': node_id,
-                'class': button_class,
-                'disabled': button_disabled,
-                'date_context': date_context
-            })
-
-        except Exception as e:
-            debug.log(f"[IBON DATE PIERCE] Failed to process button: {e}")
-            continue
-
-    if len(purchase_buttons) == 0:
-        debug.log("[IBON DATE PIERCE] No valid buttons extracted")
-        return False
-
-    # Step 6: Filter disabled buttons + keyword_exclude (Stage 4: date selection)
-    enabled_buttons = []
-    for btn in purchase_buttons:
-        if btn['disabled']:
-            continue
-        if util.reset_row_text_if_match_keyword_exclude(config_dict, btn.get('date_context', '')):
-            debug.log(f"[IBON DATE PIERCE] Excluded by keyword_exclude: {btn.get('date_context', '')[:50]}")
-            continue
-        enabled_buttons.append(btn)
-
-    debug.log(f"[IBON DATE PIERCE] {len(enabled_buttons)} enabled button(s)")
-
-    if len(enabled_buttons) == 0:
-        debug.log("[IBON DATE PIERCE] All buttons disabled")
-        return False
-
-    # Step 7: Apply keyword matching with early return pattern (T004-T007)
-    matched_buttons = []
-    target_found = False
-
-    if len(date_keyword) > 0 and enabled_buttons:
-        keyword_array = util.parse_keyword_string_to_array(date_keyword)
-        debug.log(f"[IBON DATE PIERCE KEYWORD] Start checking keywords in order: {keyword_array}")
-
-        # NEW: Iterate keywords in priority order (early return)
-        for keyword_index, keyword_item in enumerate(keyword_array):
-            debug.log(f"[IBON DATE PIERCE KEYWORD] Checking keyword #{keyword_index + 1}: {keyword_item}")
-
-            # Check all buttons for this keyword
-            for button in enabled_buttons:
-                date_context = button.get('date_context', '').lower()
-                sub_keywords = [kw.strip() for kw in keyword_item.split(' ') if kw.strip()]
-                is_match = all(sub_kw.lower() in date_context for sub_kw in sub_keywords)
-
-                if is_match:
-                    # T006: Keyword matched log - IMMEDIATELY select and stop
-                    matched_buttons = [button]
-                    target_found = True
-                    debug.log(f"[IBON DATE PIERCE KEYWORD] Keyword #{keyword_index + 1} matched: '{keyword_item}'")
-                    debug.log(f"[IBON DATE PIERCE SELECT] Selected date: {date_context[:50]} (keyword match)")
-                    break
-
-            if target_found:
-                # EARLY RETURN: Stop checking further keywords
-                break
-
-        # T007: All keywords failed log
-        if not target_found:
-            debug.log(f"[IBON DATE PIERCE KEYWORD] All keywords failed to match")
-    else:
-        matched_buttons = enabled_buttons
-
-    # Step 8: Conditional fallback based on date_auto_fallback switch (T018-T020)
-    if len(matched_buttons) == 0 and len(date_keyword) > 0:
-        if date_auto_fallback:
-            # T018: Fallback enabled
-            debug.log(f"[IBON DATE PIERCE FALLBACK] date_auto_fallback=true, triggering auto fallback")
-            matched_buttons = enabled_buttons
-        else:
-            # T019: Fallback disabled - strict mode (no selection, will reload)
-            debug.log(f"[IBON DATE PIERCE FALLBACK] date_auto_fallback=false, fallback is disabled")
-            debug.log(f"[IBON DATE PIERCE SELECT] No date selected, will reload page and retry")
-            return False  # Return False to trigger reload logic in caller
-
-    # Step 9: Select target based on mode
-    target_button = util.get_target_item_from_matched_list(matched_buttons, auto_select_mode)
-
-    # T013: Log selected date with selection type
-    if debug.enabled:
-        is_keyword_match = (len(date_keyword) > 0 and len(matched_buttons) < len(enabled_buttons))
-        selection_type = "keyword match" if is_keyword_match else "fallback"
-        debug.log(f"[IBON DATE PIERCE SELECT] Selected date: {target_button.get('date_context', 'N/A')} ({selection_type})")
-
-    # Step 10: Click button using CDP
-    try:
-        # Scroll into view
-        await tab.send(cdp.dom.scroll_into_view_if_needed(node_id=target_button['node_id']))
-        await tab.sleep(0.2)
-
-        # Resolve node to RemoteObject
-        resolved = await tab.send(cdp.dom.resolve_node(node_id=target_button['node_id']))
-
-        if hasattr(resolved, 'object'):
-            remote_object_id = resolved.object.object_id
-        elif hasattr(resolved, 'object_id'):
-            remote_object_id = resolved.object_id
-        else:
-            raise Exception("Could not get object_id")
-
-        # Click using JavaScript
-        live = await _ibon_snapshot(tab)
-        if not live or live['doc'] != entry['doc'] or await _ibon_actions_paused(config_dict):
-            return False
-        result = await tab.send(runtime.call_function_on(
-            function_declaration='function() { this.click(); return true; }',
-            object_id=remote_object_id,
-            return_by_value=True
-        ))
-
-        debug.log(f"[IBON DATE PIERCE] Click result: {result}")
-        debug.log("[IBON DATE PIERCE] Button clicked successfully")
-
-        await tab.sleep(0.5)
-        return True
-
-    except Exception as e:
-        debug.log(f"[IBON DATE PIERCE] Click failed: {e}")
-        return False
 
 async def nodriver_ibon_date_auto_select(tab, config_dict):
-    """
-    NoDriver ibon 日期自動選擇實作 - 主入口（包含 fallback）
-
-    優先使用 pierce=True 方法（更快、更簡潔）
-    失敗時回退到 DOMSnapshot 方法（更穩定但較慢）
-    """
-    debug = util.create_debug_logger(config_dict)
-
-    # Try pierce method first (faster)
-    try:
-        result = await nodriver_ibon_date_auto_select_pierce(tab, config_dict)
-        if result:
-            return True
-        else:
-            debug.log("[IBON DATE] pierce method failed, trying DOMSnapshot fallback...")
-    except Exception as e:
-        debug.log(f"[IBON DATE] pierce method error: {e}, trying DOMSnapshot fallback...")
-
-    # Fallback to original DOMSnapshot method
+    result = await nodriver_ibon_date_auto_select_pierce(tab, config_dict)
+    if result is not None:
+        return result
+    util.create_debug_logger(config_dict).log('[IBON DATE] 一般 DOM 無法取得完整場次，改用 CDP DOMSnapshot。')
     return await nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict)
 
 async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
@@ -770,7 +496,7 @@ async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
     for btn in purchase_buttons:
         if btn['disabled']:
             continue
-        if util.reset_row_text_if_match_keyword_exclude(config_dict, btn.get('date_context', '')):
+        if btn.get('date_context') and util.reset_row_text_if_match_keyword_exclude(config_dict, btn['date_context']):
             debug.log(f"[IBON DATE] Excluded by keyword_exclude: {btn.get('date_context', '')[:50]}")
             continue
         enabled_buttons.append(btn)
@@ -860,7 +586,6 @@ async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
 
         # Scroll element into view
         await tab.send(cdp.dom.scroll_into_view_if_needed(node_id=node_id))
-        await tab.sleep(0.2)
 
         # Use CDP Runtime.callFunctionOn to click button in closed Shadow DOM
         from zendriver.cdp import runtime
@@ -886,18 +611,22 @@ async def nodriver_ibon_date_auto_select_domsnapshot(tab, config_dict):
         live = await _ibon_snapshot(tab)
         if not live or live['doc'] != entry['doc'] or await _ibon_actions_paused(config_dict):
             return False
-        result = await tab.send(runtime.call_function_on(
-            function_declaration='function() { this.click(); return true; }',
+        result, error = await tab.send(runtime.call_function_on(
+            function_declaration=_ibon_render('''function() {
+                const key=Symbol.for('ticketsHunter.ibon.date'),doc=location.href+'|'+performance.timeOrigin;
+                if(doc!==EXPECTED||this.disabled||this.getAttribute('aria-disabled')==='true'||
+                    window[key]?.doc===doc&&window[key].resetToken===GENERATION)return false;
+                window[key]={doc,resetToken:GENERATION};this.click();return true;
+            }''', EXPECTED=entry['doc'], GENERATION=_ibon_reset_token()),
             object_id=remote_object_id,
             return_by_value=True
         ))
 
         debug.log(f"[IBON DATE] Button clicked, result: {result}")
 
-        if result:
+        if not error and result and result.value is True:
             debug.log("[IBON DATE] Purchase button clicked successfully")
             is_date_assigned = True
-            await tab.sleep(0.5)
         else:
             debug.log("[IBON DATE] Click failed")
 
@@ -1987,21 +1716,238 @@ CONST_IBON_FORM_JS = r'''
 const doc=location.href+'|'+performance.timeOrigin,key='ticketsHunter.ibon.submit';
 const input=document.querySelector('input[placeholder*="驗證碼"],input[value="驗證碼"],#ctl00_ContentPlaceHolder1_CHK');
 const visible=e=>!!e&&e.getClientRects().length>0&&getComputedStyle(e).visibility!=='hidden';
-const area=()=>document.querySelector('#ctl00_ContentPlaceHolder1_PRICE_STR,span[id$="_PRICE_STR"]')?.textContent.trim()||'';
-const rows=()=>{
-    let items=Array.from(document.querySelectorAll('table.rwdtable tbody tr'));
-    if(!items.length)items=Array.from(document.querySelectorAll('table.table tbody tr'));
-    if(!items.length)items=Array.from(document.querySelectorAll('select#input-qty,select[id*="qty"]'));
+const area=(root=document)=>root.querySelector('#ctl00_ContentPlaceHolder1_PRICE_STR,span[id$="_PRICE_STR"]')?.textContent.trim()||'';
+const rows=(root=document,detached=false)=>{
+    let items=Array.from(root.querySelectorAll('table.rwdtable tbody tr'));
+    if(!items.length)items=Array.from(root.querySelectorAll('table.table tbody tr'));
+    if(!items.length)items=Array.from(root.querySelectorAll('select#input-qty,select[id*="qty"]'));
     return items.map((row,index)=>{
         const select=row.matches('select')?row:row.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"]');
         if(!select)return null;
-        return {index,name:(row.matches('select')?document.querySelectorAll('h4')[index]:row.querySelector('td:first-child'))?.textContent.trim()||'',
+        const shown=detached?!select.closest('[hidden]')&&!Array.from(select.closest('form')?.querySelectorAll('[style]')||[]).some(e=>e.contains(select)&&/display\s*:\s*none|visibility\s*:\s*hidden/i.test(e.getAttribute('style'))):visible(select);
+        return {index,name:(row.matches('select')?root.querySelectorAll('h4')[index]:row.querySelector('td:first-child'))?.textContent.trim()||'',
             price:row.matches('select')?'':row.querySelector('td:nth-child(3)')?.textContent.trim()||'',
-            id:select.id||select.name||'',value:select.value,enabled:!select.disabled&&visible(select),
+            id:select.id||select.name||'',field:select.name||'',value:select.value,enabled:!select.disabled&&shown,
             options:Array.from(select.options).filter(o=>!o.disabled&&!o.hidden&&!o.parentElement?.disabled).map(o=>o.value)};
     }).filter(Boolean);
 };
 '''
+
+CONST_IBON_API_REPLY_JS = r'''
+const parseReply=(text,status)=>{
+    const classify=message=>{
+        if(/驗證碼|captcha|recaptcha|turnstile/i.test(message))return 'captcha';
+        if(/VIEWSTATE|EVENTVALIDATION|狀態資訊|狀態驗證|事件驗證/i.test(message))return 'form_state';
+        if(/登入|login|sign.in|session.*expir|操作逾時|連線逾時/i.test(message))return 'session';
+        if(/售完|售罄|無可配|票券不足|數量不足|已被購買/.test(message))return 'stock';
+        if(/張數|購票數量|購買數量|購票上限|限購/.test(message))return 'quantity';
+        return 'site_message';
+    };
+    const fallback=(reason,format='unknown',category=null)=>({kind:'unknown',status,reason,format,
+        response_chars:text.length,message_class:category});
+    if(status!==200)return fallback('http');
+    let cursor=0;const records=[];
+    try{
+        while(cursor<text.length){
+            const read=()=>{const end=text.indexOf('|',cursor);if(end<0)throw Error();const v=text.slice(cursor,end);cursor=end+1;return v;};
+            const length=read();if(!/^\d+$/.test(length))throw Error();
+            const size=Number(length),kind=read(),id=read(),end=cursor+size;
+            if(size>2000000||text[end]!=='|')throw Error();
+            records.push({kind,id,body:text.slice(cursor,end)});cursor=end+1;
+        }
+        if(!records.length||records[0].kind!=='#')throw Error();
+    }catch(_){
+        const html=/^\s*(?:<!doctype|<html|<head|<body)/i.test(text);
+        const cloudflare=/challenge-platform|cf-chl-|Just a moment|驗證您是否是人類/i.test(text);
+        return fallback('protocol',html?'html':'unknown',cloudflare?'cloudflare':null);
+    }
+    const errors=records.filter(r=>r.kind==='error');
+    const messages=records.filter(r=>r.kind==='scriptStartupBlock'&&/(?:alert|_ev)\s*\(/.test(r.body));
+    const category=errors.length?classify(errors.map(r=>r.body).join('\n')):
+        messages.length?classify(messages.map(r=>r.body).join('\n')):null;
+    const paths=new Set();
+    const accept=value=>{
+        try{
+            const target=new URL(value,location.href);
+            if(target.origin===location.origin&&/^\/application\/UTK02\/UTK0206_\.aspx$/i.test(target.pathname)&&!target.search&&!target.hash)
+                paths.add(target.pathname);
+        }catch(_){}
+    };
+    for(const record of records){
+        if(record.kind==='pageRedirect'){
+            try{accept(decodeURIComponent(record.body));}catch(_){}
+        }
+        if(record.kind==='scriptStartupBlock'){
+            const pattern=/(?:top\.|window\.)?location\.replace\(\s*(['"])([^'"\r\n]+)\1\s*\)/g;
+            for(const match of record.body.matchAll(pattern))accept(match[2]);
+        }
+    }
+    const scripts=records.filter(r=>r.kind==='scriptStartupBlock');
+    const refused=scripts.length>0&&scripts.every(r=>{
+        const match=r.body.trim().match(/^(?:window\.)?alert\(\s*(['"])([^'"\\\r\n]*)\1\s*\)\s*;?$/);
+        return match&&/已售完|售罄|無可配座位|票券不足|數量不足|別人搶先一步|已被購買/.test(match[2]);
+    });
+    if(paths.size===1&&!errors.length&&!messages.length)return {kind:'checkout',status,path:Array.from(paths)[0],format:'aspnet_delta'};
+    if(!paths.size&&!errors.length&&refused&&!records.some(r=>r.kind==='pageRedirect'))
+        return {kind:'rejected',status,reason:'stock',format:'aspnet_delta',message_class:'stock'};
+    return fallback(errors.length?'server_error':'unconfirmed','aspnet_delta',category);
+};
+'''
+
+CONST_IBON_API_POST_JS = r'''((expected,targetRow,amount,allowSplit,nonce,timeout) => {
+    const commandAt=performance.timeOrigin+performance.now();
+    FORM
+    PARSE_REPLY
+    const fail=reason=>({started:false,reason});
+    if(document.readyState==='loading'||/^(?:Just a moment|請稍候|正在驗證|Checking your browser)/i.test(document.title.trim())||
+        document.querySelector('#challenge-form,#challenge-running,#challenge-stage,.cf-browser-verification'))return fail('not_ready');
+    const cached=expected.detached?window[Symbol.for('ticketsHunter.ibon.form')]:null;
+    if(expected.detached&&(!cached||cached.doc!==doc||cached.url!==expected.url||cached.token!==expected.form_token))
+        return fail('changed');
+    const root=cached?.form||document,detached=!!cached;
+    if(doc!==expected.doc||area(root)!==(expected.area||'')||JSON.stringify(rows(root,detached))!==JSON.stringify(expected.rows))
+        return fail('changed');
+    if(sessionStorage.getItem(key)||input)return fail('pending');
+    const form=cached?.form||document.forms.namedItem('aspnetForm');
+    if(!form)return fail('form');
+    if(!form.checkValidity())return fail('validation');
+    const action=new URL(form.getAttribute('action')||expected.url,expected.url),current=new URL(expected.url);
+    if(action.origin!==location.origin||action.pathname!==current.pathname||action.search!==current.search||
+        !/\/UTK0201_001\.aspx$/i.test(action.pathname))return fail('form');
+    const target='ctl00$ContentPlaceHolder1$A2';
+    const manager=window.Sys?.WebForms?.PageRequestManager?.getInstance?.();
+    const managerID=cached?.managerID||manager?._scriptManagerID;
+    if(managerID!=='ctl00$ScriptManager1')return fail('not_ready');
+    if(manager?.get_isInAsyncPostBack?.())return fail('busy');
+    const payload=new URLSearchParams();
+    for(const [name,value] of new FormData(form)){if(typeof value!=='string')return fail('form');payload.append(name,value);}
+    if(allowSplit){
+        const check=form.elements.namedItem('ctl00$ContentPlaceHolder1$notConsecutive');
+        if(check?.type==='checkbox'&&!check.disabled)payload.set(check.name,check.value||'on');
+    }
+    const currentRows=rows(root,detached);
+    const selected=currentRows.find(row=>row.index===targetRow.index&&row.id===targetRow.id&&row.field===targetRow.field);
+    if(!selected?.enabled||!selected.options.includes(amount)||!selected.field||!payload.has(selected.field))
+        return fail('changed');
+    for(const row of currentRows){
+        const value=row.index===selected.index?amount:row.options.includes('0')?'0':row.options.includes('')?'':null;
+        if(value===null||!row.field)return fail('changed');
+        if(payload.has(row.field))payload.set(row.field,value);
+        else if(value!==''&&value!=='0')return fail('changed');
+    }
+    const quantities=Array.from(payload).filter(([name,value])=>name.endsWith('$AMOUNT_DDL')&&value!==''&&value!=='0');
+    if(quantities.length!==1||quantities[0][0]!==selected.field||quantities[0][1]!==amount)return fail('changed');
+    for(const name of ['__VIEWSTATE','__EVENTVALIDATION'])if(!payload.get(name))return fail('state');
+    if(payload.get('ctl00$ContentPlaceHolder1$PERFORMANCE_ID')!==current.searchParams.get('PERFORMANCE_ID')||
+        payload.get('ctl00$ContentPlaceHolder1$PERFORMANCE_PRICE_AREA_ID')!==current.searchParams.get('PERFORMANCE_PRICE_AREA_ID'))
+        return fail('changed');
+    payload.set(managerID,'ctl00$ContentPlaceHolder1$AjaxPanel|'+target);
+    payload.set('__EVENTTARGET',target);payload.set('__EVENTARGUMENT','');payload.set('__ASYNCPOST','true');
+    const retry=JSON.parse(sessionStorage.getItem(key+'.retry')||'null');
+    if(retry?.requireForm&&!detached)return fail('refresh');
+    if(retry?.nextAt>performance.timeOrigin+performance.now())return fail('cooldown');
+    const record={doc,route:location.href,nonce,state:'pending',captcha:'',phase:'ticket_api'};
+    try{sessionStorage.setItem(key,JSON.stringify(record));}catch(_){return fail('storage');}
+    const controller=new AbortController();
+    record.abort=()=>controller.abort();window[Symbol.for(key)]=record;
+    for(const row of currentRows){
+        const select=form.elements.namedItem(row.field);
+        if(select?.tagName==='SELECT')select.value=payload.get(row.field)||'0';
+    }
+    form.inert=true;
+    if(detached){
+        const sourceForm=document.forms.namedItem('aspnetForm');if(sourceForm)sourceForm.inert=true;
+        delete window[Symbol.for('ticketsHunter.ibon.form')];
+    }
+    const publish=result=>{
+        try{
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null'),active=window[Symbol.for(key)];
+            if(!saved||saved.nonce!==nonce||active?.nonce!==nonce||active.stopped||doc!==location.href+'|'+performance.timeOrigin)return;
+            saved.apiResult=result;sessionStorage.setItem(key,JSON.stringify(saved));
+            window.dispatchEvent(new CustomEvent('ticketsHunter.ibon.result',{detail:{nonce}}));
+        }catch(_){}
+    };
+    const requestBody=payload.toString();let sentAt=null;
+    void (async()=>{
+        const started=performance.now(),timer=setTimeout(()=>controller.abort(),timeout);
+        sentAt=performance.timeOrigin+started;
+        try{
+            const response=await fetch(action.href,{method:'POST',credentials:'same-origin',redirect:'error',
+                headers:{'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',
+                         'X-MicrosoftAjax':'Delta=true','X-Requested-With':'XMLHttpRequest'},
+                body:requestBody,signal:controller.signal});
+            const headersAt=performance.now();
+            const text=await response.text();
+            const bodyAt=performance.now();
+            const result=text.length<=2000000?parseReply(text,response.status):{kind:'unknown',status:response.status,reason:'protocol'};
+            const completedAt=performance.now();
+            publish({...result,elapsed_ms:completedAt-started,request_ms:bodyAt-started,
+                     headers_ms:headersAt-started,body_ms:bodyAt-headersAt,parse_ms:completedAt-bodyAt,
+                     sent_at_ms:sentAt,completed_at_ms:performance.timeOrigin+completedAt});
+        }catch(error){
+            publish({kind:'unknown',status:0,reason:error.name==='AbortError'?'timeout':'network',
+                     elapsed_ms:performance.now()-started,sent_at_ms:sentAt,
+                     completed_at_ms:performance.timeOrigin+performance.now()});
+        }finally{clearTimeout(timer);}
+    })();
+    return {started:true,timing:{build_ms:sentAt===null?null:sentAt-commandAt}};
+})(SNAPSHOT,TARGET,AMOUNT,ALLOW_SPLIT,NONCE,TIMEOUT)'''
+
+CONST_IBON_FORM_FETCH_JS = r'''(async (endpoint,expected,timeout)=>{
+    FORM
+    if(doc!==expected||sessionStorage.getItem(key))return {discarded:true};
+    const target=new URL(endpoint);
+    if(target.origin!==location.origin||!/\/UTK0201_001\.aspx$/i.test(target.pathname))return null;
+    const slot=Symbol.for('ticketsHunter.ibon.form'),token=crypto.randomUUID();
+    window[slot]={doc,url:target.href,token};
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout),started=performance.now();
+    try{
+        const response=await fetch(target.href,{method:'GET',credentials:'same-origin',cache:'no-store',
+            redirect:'error',headers:{Accept:'text/html'},signal:controller.signal});
+        const headersAt=performance.now();
+        if(!response.ok)return null;
+        const text=await response.text(),completed=performance.now();
+        if(doc!==location.href+'|'+performance.timeOrigin||window[slot]?.token!==token)return {discarded:true};
+        if(text.length>2000000)return null;
+        const template=document.createElement('template');template.innerHTML=text;
+        const content=template.content,forms=content.querySelectorAll('form#aspnetForm'),form=forms[0];
+        const scripts=Array.from(content.querySelectorAll('script:not([src])')).map(s=>s.textContent).join('\n');
+        if(forms.length!==1||!/PageRequestManager\._initialize\(\s*(['"])ctl00\$ScriptManager1\1\s*,\s*(['"])aspnetForm\2\s*,/.test(scripts))
+            return null;
+        for(const element of [form,...form.querySelectorAll('*')]){
+            for(const attribute of Array.from(element.attributes))if(/^on/i.test(attribute.name))element.removeAttribute(attribute.name);
+        }
+        if(form.querySelector('input[placeholder*="驗證碼"],input[value="驗證碼"],#ctl00_ContentPlaceHolder1_CHK,img[src*="pic.aspx"],.g-recaptcha,.cf-turnstile,iframe')||
+            /(?:grecaptcha|turnstile)\.(?:execute|render)/i.test(scripts))return null;
+        for(const name of ['__VIEWSTATE','__EVENTVALIDATION']){
+            if(!form.elements.namedItem(name)?.value)return null;
+        }
+        if(form.elements.namedItem('ctl00$ContentPlaceHolder1$PERFORMANCE_ID')?.value!==target.searchParams.get('PERFORMANCE_ID')||
+            form.elements.namedItem('ctl00$ContentPlaceHolder1$PERFORMANCE_PRICE_AREA_ID')?.value!==target.searchParams.get('PERFORMANCE_PRICE_AREA_ID'))
+            return null;
+        const formRows=rows(form,true);if(!formRows.length)return null;
+        window[slot]={doc,url:target.href,token,form,managerID:'ctl00$ScriptManager1'};
+        return {doc,url:target.href,source_url:location.href,area:area(form),rows:formRows,validForm:form.checkValidity(),
+            hasCaptcha:false,ready:'complete',verifying:false,detached:true,form_token:token,
+            navigation:{html_ms:completed-started,first_byte_ms:headersAt-started,dom_ready_ms:null}};
+    }catch(_){return null;}finally{clearTimeout(timer);}
+})(ENDPOINT,EXPECTED,TIMEOUT)'''
+
+CONST_IBON_RESULT_WAIT_JS = r'''((nonce,expected,timeout)=>new Promise(resolve=>{
+    const key='ticketsHunter.ibon.submit';let timer;
+    const finish=value=>{
+        clearTimeout(timer);window.removeEventListener('ticketsHunter.ibon.result',receive);resolve(value);
+    };
+    const receive=()=>{
+        try{
+            const doc=location.href+'|'+performance.timeOrigin,saved=JSON.parse(sessionStorage.getItem(key)||'null');
+            if(doc!==expected||!saved||saved.nonce!==nonce)return finish(null);
+            if(saved.apiResult)finish({doc,saved,browser_now_ms:performance.timeOrigin+performance.now(),event_driven:true});
+        }catch(_){finish(null);}
+    };
+    window.addEventListener('ticketsHunter.ibon.result',receive);
+    timer=setTimeout(()=>finish(null),timeout);receive();
+}))(NONCE,EXPECTED,TIMEOUT)'''
 
 
 async def _ibon_actions_paused(config_dict=None):
@@ -2009,7 +1955,8 @@ async def _ibon_actions_paused(config_dict=None):
 
 
 def _ibon_render(script, **parameters):
-    values = {'FORM': CONST_IBON_FORM_JS, 'NATIVE': CONST_NATIVE_INPUT_SETTER_JS}
+    values = {'FORM': CONST_IBON_FORM_JS, 'NATIVE': CONST_NATIVE_INPUT_SETTER_JS,
+              'PARSE_REPLY': CONST_IBON_API_REPLY_JS, 'DATE_ROWS': CONST_IBON_DATE_ROWS_JS}
     values.update({key: json.dumps(value) for key, value in parameters.items()})
     return re.sub(r'\b[A-Z][A-Z_]*\b', lambda match: values.get(match.group(), match.group()), script)
 
@@ -2026,8 +1973,15 @@ async def _ibon_snapshot(tab):
         result = await tab.evaluate(r'''(() => {
             FORM
             const invalid=Array.from(document.forms).some(f=>f.querySelector('select.form-control-sm,select[name*="AMOUNT_DDL"],select[id*="qty"]')&&f.matches(':invalid'));
-            return {doc,url:location.href,referrer:document.referrer,area:area(),validForm:!invalid,rows:rows(),hasCaptcha:!!input,
-                value:input?.value||'',inputReady:visible(input)&&!input.disabled};
+            const verifying=/^(?:Just a moment|請稍候|正在驗證|Checking your browser)/i.test(document.title.trim())||
+                !!document.querySelector('#challenge-form,#challenge-running,#challenge-stage,.cf-browser-verification');
+            const nav=performance.getEntriesByType('navigation')[0];
+            const navigation=nav?{html_ms:nav.responseEnd>0?nav.responseEnd:null,
+                first_byte_ms:nav.responseStart>0?nav.responseStart-nav.requestStart:null,
+                dom_ready_ms:nav.domContentLoadedEventEnd>0?nav.domContentLoadedEventEnd:null}:null;
+            const retry=JSON.parse(sessionStorage.getItem(key+'.retry')||'null');
+            return {doc,url:location.href,referrer:document.referrer,ready:document.readyState,verifying,area:area(),validForm:!invalid,rows:rows(),hasCaptcha:!!input,needsFreshForm:!!retry?.requireForm,
+                value:input?.value||'',inputReady:visible(input)&&!input.disabled,navigation};
         })()'''.replace('FORM', CONST_IBON_FORM_JS))
         return result if isinstance(result, dict) and result.get('doc') else None
     except Exception:
@@ -2067,6 +2021,119 @@ def _ibon_remove_flow(tab, nonce):
             os.unlink(_ibon_flow_path(tab))
         except OSError:
             pass
+
+
+def _ibon_reset_token():
+    return util.get_browser_session_generation()
+
+
+async def _ibon_reset_disconnected(tab, config_dict):
+    token = _ibon_reset_token()
+    if not token:
+        return False
+    flow = _ibon_read_flow(tab)
+    if not flow or token == flow.get('reset_token') or not flow.get('nonce'):
+        return False
+    try:
+        result = await tab.evaluate(_ibon_render(r'''((expected) => {
+            FORM
+            if(location.origin!==expected.origin)return {away:true};
+            let saved=null;try{saved=JSON.parse(sessionStorage.getItem(key)||'null');}catch(_){}
+            const active=window[Symbol.for(key)];
+            if(saved&&saved.nonce!==expected.nonce||active&&active.nonce!==expected.nonce)return null;
+            if(active){active.stopped=true;if(typeof active.abort==='function')active.abort();}
+            if(active&&typeof Sys!=='undefined'){
+                const manager=Sys.WebForms?.PageRequestManager?.getInstance?.();
+                if(manager?.get_isInAsyncPostBack?.())manager.abortPostBack?.();
+            }
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];
+            delete window[Symbol.for('ticketsHunter.ibon.form')];
+            const form=document.forms.namedItem('aspnetForm');if(form)form.inert=false;
+            sessionStorage.setItem(key+'.retry',JSON.stringify({count:0,nextAt:0,requireForm:true}));
+            window.dispatchEvent(new CustomEvent('ticketsHunter.ibon.result',{detail:{nonce:expected.nonce}}));
+            return {cleared:true};
+        })(EXPECTED)''', EXPECTED=flow))
+    except Exception:
+        return False
+    if not isinstance(result, dict) or not (result.get('cleared') or result.get('away')):
+        return False
+    if result.get('cleared'):
+        _ibon_remove_flow(tab, flow['nonce'])
+    for key in ('pending_notice', 'api_result_notice', 'api_following_nonce', 'captcha_fill', 'stock_poll', 'booking_timing'):
+        _state.pop(key, None)
+    notice = (flow['nonce'], token)
+    if _state.get('disconnect_reset_notice') != notice:
+        _state['disconnect_reset_notice'] = notice
+        util.create_debug_logger(config_dict, enabled=True).log(
+            '[IBON] 已依「斷開瀏覽器」解除本輪本機送出鎖定；重新開始可沿用原分頁。已送達網站的請求無法撤回，購物車與訂單請以網站為準。')
+    return True
+
+
+async def nodriver_ibon_disconnect(tab, config_dict=None):
+    """Explicit disconnect ends this run; pause and unexpected failures retain their guards."""
+    if tab is None:
+        return
+    await _ibon_reset_disconnected(tab, config_dict)
+
+
+def _ibon_recovery_policy(config_dict):
+    import math
+    advanced = config_dict.get('advanced', {})
+    try:
+        interval = float(advanced.get('auto_reload_page_interval', 1))
+    except (TypeError, ValueError):
+        interval = 1
+    if not math.isfinite(interval) or interval <= 0:
+        interval = 1
+    limit = advanced.get('ibon_submit_recovery_limit', 3)
+    if type(limit) is not int or not 1 <= limit <= 20:
+        limit = 3
+    return interval, limit
+
+
+async def _ibon_recover_api_rejection(tab, config_dict, saved, flow):
+    if (not flow or flow.get('nonce') != saved.get('nonce') or
+            flow.get('origin') != _ibon_origin(saved.get('route')) or await _ibon_actions_paused(config_dict)):
+        return False
+    interval, limit = _ibon_recovery_policy(config_dict)
+    try:
+        result = await tab.evaluate(_ibon_render(r'''((nonce,interval,limit,generation) => {
+            FORM
+            const saved=JSON.parse(sessionStorage.getItem(key)||'null'),active=window[Symbol.for(key)];
+            const reply=saved?.apiResult;
+            if(!saved||saved.nonce!==nonce||active&&active.nonce!==nonce||reply?.kind!=='rejected'||
+                reply.status!==200||reply.reason!=='stock'||reply.format!=='aspnet_delta')return null;
+            let retry=JSON.parse(sessionStorage.getItem(key+'.retry')||'null');
+            if(retry?.generation!==generation)retry=null;
+            const count=Number.isInteger(retry?.count)&&retry.count>=0?retry.count:0;
+            if(count>=limit)return {limit:true,count};
+            sessionStorage.setItem(key+'.retry',JSON.stringify({count:count+1,
+                nextAt:performance.timeOrigin+performance.now()+interval*1000,requireForm:true,generation}));
+            sessionStorage.removeItem(key);delete window[Symbol.for(key)];
+            delete window[Symbol.for('ticketsHunter.ibon.form')];
+            const form=document.forms.namedItem('aspnetForm');if(form)form.inert=false;
+            return {cleared:true,count:count+1};
+        })(NONCE,INTERVAL,LIMIT,GENERATION)''', NONCE=saved['nonce'], INTERVAL=interval,
+            LIMIT=limit, GENERATION=_ibon_reset_token()))
+    except Exception:
+        return False
+    if not isinstance(result, dict):
+        return False
+    debug = util.create_debug_logger(config_dict, enabled=True)
+    if result.get('cleared'):
+        _ibon_remove_flow(tab, saved['nonce'])
+        _state.pop('stock_poll', None)
+        _state.pop('booking_timing', None)
+        message = '網站已明確回覆票券不足，已自動解除本輪鎖定；' + format(interval, '.3f') + ' 秒後重新讀取表單與票況（自動恢復 ' + str(result['count']) + '/' + str(limit) + '）。'
+        debug.log('[IBON 自動恢復] ' + message)
+        util.write_instance_status('running', message)
+        return True
+    if result.get('limit') and _state.get('recovery_limit_notice') != saved['nonce']:
+        _state['recovery_limit_notice'] = saved['nonce']
+        message = '連續自動恢復已達上限，暫停重送；可按「斷開瀏覽器」結束本輪後重新開始。'
+        debug.log('[IBON 自動恢復] ' + message)
+        util.write_instance_status('waiting_manual', message)
+    return False
 
 
 async def _ibon_clear_completed(tab, saved, flow):
@@ -2166,13 +2233,16 @@ async def _ibon_clear_rejected(tab, record):
 
 
 async def _ibon_submission_pending(tab, config_dict):
+    if await _ibon_reset_disconnected(tab, config_dict):
+        return False
     try:
         record = await tab.evaluate(r'''(() => {
             FORM
             const saved=JSON.parse(sessionStorage.getItem(key)||'null');
             const tourReady=saved?.phase==='tour_cart'&&saved.doc===doc&&/\/event\/[^/]+\/options\/?$/i.test(location.pathname)&&
                 Array.from(document.querySelectorAll('button')).some(e=>visible(e)&&!e.disabled&&e.textContent.includes('確認付款方式'));
-            return {doc,saved,tourReady};
+            const retry=JSON.parse(sessionStorage.getItem(key+'.retry')||'null');
+            return {doc,saved,tourReady,retry,browser_now_ms:performance.timeOrigin+performance.now()};
         })()'''.replace('FORM', CONST_IBON_FORM_JS))
     except Exception:
         return True
@@ -2186,6 +2256,17 @@ async def _ibon_submission_pending(tab, config_dict):
         return False
     if saved and await _ibon_clear_completed(tab, saved, flow):
         return False
+    if not saved and flow and flow.get('handoff') is not True:
+        notice = ('unconfirmed_flow', flow.get('nonce'))
+        if _state.get('pending_notice') != notice:
+            _state['pending_notice'] = notice
+            message = ('上一筆 ibon 送出尚未確認，保留防重送狀態。請先查看購物車與訂單；'
+                       '按「斷開瀏覽器」可結束本輪並解除本機鎖定，再於原分頁重新開始。')
+            util.create_debug_logger(config_dict, enabled=True).log('[IBON] ' + message)
+            util.write_instance_status('waiting_manual', message)
+        return True
+    if saved and saved.get('phase') == 'ticket_api':
+        return await _ibon_api_follow_up(tab, config_dict, record['doc'], saved, flow, record.get('browser_now_ms'))
     if saved and saved.get('state') == 'rejected':
         clear = saved.get('reason') == 'stock'
         if not clear and time.monotonic() >= _state.get('rejected_check_after', 0):
@@ -2203,7 +2284,9 @@ async def _ibon_submission_pending(tab, config_dict):
         message = '上一筆送出尚待網站確認，停止重送；驗證碼被明確拒絕後需先換圖再繼續。'
         util.create_debug_logger(config_dict).log('[IBON] ' + message)
         util.write_instance_status('running', message)
-    return bool(saved or flow and flow.get('handoff') is not True)
+    retry = record.get('retry')
+    cooling = isinstance(retry, dict) and isinstance(retry.get('nextAt'), (int, float)) and retry['nextAt'] > record.get('browser_now_ms', 0)
+    return bool(saved or flow and flow.get('handoff') is not True or cooling)
 
 
 async def _ibon_mark_rejected(tab, reason):
@@ -2222,6 +2305,7 @@ async def _ibon_handoff(tab, config_dict):
     live = await _ibon_snapshot(tab)
     if not live or not _ibon_is_checkout(live['url']):
         return False
+    checkout_seen_at = time.perf_counter()
     flow = _ibon_read_flow(tab)
     same_origin = bool(flow and flow.get('origin') == _ibon_origin(live['url']))
     if flow and (same_origin or flow.get('origin') == _ibon_origin(live.get('referrer'))):
@@ -2232,7 +2316,8 @@ async def _ibon_handoff(tab, config_dict):
         cleared = await tab.evaluate(r'''((expected) => {
             FORM
             if(doc!==expected)return false;
-            sessionStorage.removeItem(key);delete window[Symbol.for(key)];return true;
+            sessionStorage.removeItem(key);sessionStorage.removeItem(key+'.retry');
+            delete window[Symbol.for(key)];return true;
         })(EXPECTED)'''.replace('FORM', CONST_IBON_FORM_JS).replace('EXPECTED', json.dumps(live['doc'])))
         if not cleared:
             return False
@@ -2242,6 +2327,8 @@ async def _ibon_handoff(tab, config_dict):
         _ibon_remove_flow(tab, flow['nonce'])
     if not _state.get('handoff_ready'):
         _state['handoff_ready'] = True
+        await _ibon_timing_mark(config_dict, 'checkout_seen', '程式確認進入結帳頁（' + _ibon_page_timing(live) + '）', at=checkout_seen_at)
+        await _ibon_timing_summary(config_dict)
         message = '已進入 ibon 結帳頁，請手動確認資料與付款；尚未確認訂單或付款完成。'
         util.create_debug_logger(config_dict, enabled=True).log('[IBON] ' + message)
         util.write_instance_status('waiting_manual', message)
@@ -2278,6 +2365,227 @@ async def _ibon_cached_ocr(config_dict, supplied=None):
     return _state.get('ocr_model')
 
 
+def _ibon_stock_context(url):
+    from urllib.parse import parse_qsl, urlsplit
+    parsed = urlsplit(url or '')
+    if parsed.hostname not in ('orders.ibon.com.tw', 'ticket.ibon.com.tw'):
+        return None
+    if not re.fullmatch(r'/application/utk02/utk020[12]_[^/]*\.aspx', parsed.path.lower()):
+        return None
+    params = {}
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        key = key.upper()
+        if key in params:
+            return None
+        params[key] = value
+    performance = params.get('PERFORMANCE_ID', '')
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', performance):
+        return None
+    return {'performance_id': performance, 'area_id': params.get('PERFORMANCE_PRICE_AREA_ID', ''),
+            'api_url': 'https://orders.ibon.com.tw/ImageServer/Data/QWARE_TICKET/images/Temp/'
+                       + performance + '/1_' + performance + '_live.map'}
+
+
+def _ibon_parse_stock(text, performance_id):
+    from html.parser import HTMLParser
+
+    class StockMap(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.areas = []
+            self.seen = set()
+
+        def handle_starttag(self, tag, attributes):
+            if tag != 'area':
+                return
+            attributes = dict(attributes)
+            send = re.search(r"Send\('(\d{4})',\s*'([^']+)',\s*'([^']+)',\s*'([^']*)'\)", attributes.get('href', ''))
+            title = re.fullmatch(r'票區[:：](.*?)\s+票價[:：]([\d,]+)\s+尚餘[:：](\d+|熱賣中)', attributes.get('title', '').strip())
+            if not send or not title:
+                return
+            page, performance, area_id, group = send.groups()
+            if performance != performance_id or page not in ('0201', '0202', '0205'):
+                return
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', area_id) or not re.fullmatch(r'\d{0,8}', group):
+                return
+            identity = (page, area_id, group)
+            if identity in self.seen:
+                return
+            self.seen.add(identity)
+            self.areas.append({'page_name': page, 'performance_id': performance, 'area_id': area_id,
+                               'group_id': group, 'area_name': title[1].strip(),
+                               'price': int(title[2].replace(',', '')),
+                               'remaining': None if title[3] == '熱賣中' else int(title[3])})
+
+    parser = StockMap()
+    parser.feed(text)
+    return parser.areas or None
+
+
+def _ibon_stock_summary(areas, config_dict):
+    keyword = config_dict.get('area_auto_select', {}).get('area_keyword', '').strip()
+    groups = util.parse_keyword_string_to_array(keyword) or ([keyword] if keyword else [''])
+    labels, seen = [], set()
+    for row in areas:
+        text = row['area_name'] + ' ' + str(row['price'])
+        if not any(all(part in text for part in group.strip('"').split()) for group in groups):
+            continue
+        identity = (row['area_id'], row['area_name'], row['remaining'])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        remaining = '熱賣中（數量未知）' if row['remaining'] is None else str(row['remaining'])
+        excluded = '（已排除）' if util.reset_row_text_if_match_keyword_exclude(config_dict, text) else ''
+        labels.append(row['area_name'] + '=' + remaining + excluded)
+    return '；'.join(labels) if labels else '無關鍵字相符票區'
+
+
+async def _ibon_stock_request(tab, context, config_dict, expected_doc):
+    import math
+    try:
+        timeout = float(config_dict.get('advanced', {}).get('ibon_stock_api_timeout', 3))
+    except (TypeError, ValueError):
+        timeout = 3
+    if not math.isfinite(timeout) or not 0.2 <= timeout <= 30:
+        timeout = 3
+    script = _ibon_render(r'''(async (endpoint,expected,timeout) => {
+        const doc=()=>location.href+'|'+performance.timeOrigin;
+        const url=new URL(endpoint);
+        if(doc()!==expected||url.origin!==location.origin)return {status:0,error:'context'};
+        url.searchParams.set('v',crypto.randomUUID());
+        const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
+        try{
+            const response=await fetch(url.href,{method:'GET',credentials:'same-origin',cache:'no-store',
+                redirect:'error',headers:{'X-Requested-With':'XMLHttpRequest'},signal:controller.signal});
+            if(!response.ok)return {status:response.status,error:'http'};
+            const text=await response.text();
+            if(doc()!==expected)return {status:response.status,error:'context'};
+            return text.length<=2000000?{status:response.status,text}:{status:response.status,error:'large'};
+        }catch(error){return {status:0,error:error.name==='AbortError'?'timeout':'network'};}finally{clearTimeout(timer);}
+    })(ENDPOINT,EXPECTED,TIMEOUT)''', ENDPOINT=context['api_url'], EXPECTED=expected_doc, TIMEOUT=timeout*1000)
+    sequence = _state.get('stock_request_seq', 0) + 1
+    _state['stock_request_seq'] = sequence
+    debug = util.create_debug_logger(config_dict, enabled=True)
+    prefix = '[IBON API #' + str(sequence) + '] 場次 ' + context['performance_id']
+    debug.log(prefix + '：開始讀取票況。')
+    started, areas, outcome = time.monotonic(), None, '瀏覽器讀取失敗'
+    task = asyncio.create_task(tab.evaluate(script, await_promise=True))
+    try:
+        while not task.done():
+            if not util.is_auto_refresh_enabled() or await _ibon_actions_paused(config_dict):
+                outcome = '已暫停或停止自動重整，忽略本次結果'
+                return None
+            await asyncio.wait({task}, timeout=0.05)
+        result = task.result()
+        if isinstance(result, dict):
+            status = result.get('status', 200 if isinstance(result.get('text'), str) else 0)
+            outcome = 'HTTP ' + str(status) if status else '讀取失敗'
+            error = result.get('error')
+            reasons = {'context': '頁面或網域已改變，忽略結果', 'large': '回應超出大小限制',
+                       'timeout': '讀取逾時', 'network': '網路讀取失敗'}
+            if error:
+                outcome += '，' + reasons.get(error, '網站回應失敗')
+            elif isinstance(result.get('text'), str):
+                areas = _ibon_parse_stock(result['text'], context['performance_id'])
+                outcome += '，票況解析成功' if areas is not None else '，回應不是有效票況資料'
+        return areas
+    except asyncio.CancelledError:
+        outcome = '讀取已中止，忽略本次結果'
+        raise
+    except Exception:
+        outcome += '，讀取或解析失敗'
+        return None
+    finally:
+        # Let CDP finish its read; cancelling its transaction can kill the zendriver listener.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        detail = '' if areas is None else '；' + _ibon_stock_summary(areas, config_dict)
+        debug.log(prefix + '：結果 ' + outcome + '；耗時 ' + format(time.monotonic() - started, '.3f') + ' 秒' + detail)
+
+
+def _ibon_stock_target(areas, config_dict):
+    keyword = config_dict.get('area_auto_select', {}).get('area_keyword', '').strip()
+    groups = util.parse_keyword_string_to_array(keyword) or ([keyword] if keyword else [''])
+    for group in groups:
+        target = util.ibon_livemap_select_area(areas, config_dict, group)
+        if target:
+            return target
+    if config_dict.get('area_auto_fallback', False):
+        return util.ibon_livemap_select_area(areas, config_dict, '')
+    return None
+
+
+async def _ibon_stock_area_select(tab, url, config_dict, *, retry_ticket=False):
+    import math
+    context = _ibon_stock_context(url)
+    if not context or not config_dict.get('area_auto_select', {}).get('enable') or not util.is_auto_refresh_enabled():
+        return False
+    if await _ibon_actions_paused(config_dict) or _state.get('handoff_ready') or await _ibon_submission_pending(tab, config_dict):
+        return True
+    snapshot = await _ibon_snapshot(tab)
+    if not snapshot or _ibon_stock_context(snapshot['url']) != context:
+        return True
+    if snapshot.get('verifying') or snapshot.get('ready') == 'loading':
+        _state.pop('stock_poll', None)
+        if _state.get('stock_wait') != snapshot['doc']:
+            _state['stock_wait'] = snapshot['doc']
+            util.create_debug_logger(config_dict, enabled=True).log('[IBON API] 等待網站頁面或瀏覽器驗證完成，暫不讀取票況或重整頁面。')
+        return True
+    _state.pop('stock_wait', None)
+    if snapshot.get('rows') and not retry_ticket or context['area_id'] and not retry_ticket:
+        return False
+    if retry_ticket and (not context['area_id'] or any(str(config_dict.get('ticket_number', 2)) in row.get('options', []) for row in snapshot['rows'])):
+        return False
+    key = (snapshot['doc'], context['performance_id'])
+    previous = _state.get('stock_poll', {})
+    if previous.get('key') == key and time.monotonic() < previous.get('next', 0):
+        return previous.get('valid', False)
+    try:
+        interval = float(config_dict.get('advanced', {}).get('auto_reload_page_interval', 1))
+    except (TypeError, ValueError):
+        interval = 1
+    if not math.isfinite(interval) or interval <= 0:
+        interval = 1
+    areas = await _ibon_stock_request(tab, context, config_dict, snapshot['doc'])
+    _state['stock_poll'] = {'key': key, 'next': time.monotonic() + interval, 'valid': areas is not None}
+    live = await _ibon_snapshot(tab)
+    if (not util.is_auto_refresh_enabled() or await _ibon_actions_paused(config_dict) or
+            not live or live['doc'] != snapshot['doc'] or _state.get('handoff_ready') or
+            await _ibon_submission_pending(tab, config_dict)):
+        return True
+    if live.get('verifying') or live.get('ready') == 'loading':
+        _state.pop('stock_poll', None)
+        return True
+    if areas is None:
+        if _state.get('stock_error') != key:
+            _state['stock_error'] = key
+            util.create_debug_logger(config_dict, enabled=True).log('[IBON API] 票況讀取失敗，改用網站畫面判斷；選票與下一步沿用原流程。')
+        return False
+    target = _ibon_stock_target(areas, config_dict)
+    detected_at = time.perf_counter()
+    notice = (context['performance_id'], tuple((row['area_id'], row['group_id'], row['remaining']) for row in areas),
+              None if target is None else (target['area_id'], target['group_id']))
+    if _state.get('stock_notice') != notice:
+        _state['stock_notice'] = notice
+        message = '沒有符合關鍵字、排除條件及指定張數的票區，持續讀取票況。'
+        if target:
+            remaining = '熱賣中，未提供精確餘票' if target['remaining'] is None else str(target['remaining']) + ' 張'
+            message = target['area_name'] + '，餘票：' + remaining + '，準備選票。'
+        util.create_debug_logger(config_dict, enabled=True).log('[IBON API] 場次 ' + context['performance_id'] + '：' + message)
+    if target:
+        # Stage 5: select the page; Stage 6/10 performs the guarded submission.
+        if await _ibon_actions_paused(config_dict) or not util.is_auto_refresh_enabled():
+            return True
+        await _ibon_timing_start(config_dict, (target['performance_id'], target['area_id']), 'stock', at=detected_at)
+        ticket_url = util.ibon_build_skip_url(target)
+        if config_dict.get('ocr_captcha', {}).get('force_submit') and _ibon_api_submit_supported({'url': ticket_url}):
+            if await _ibon_prefetched_ticket_api(tab, config_dict, live, ticket_url):
+                return True
+        await _ibon_timing_mark(config_dict, 'ticket_nav', '開始開啟選票頁')
+        await navigate_page_if_enabled(tab, ticket_url)
+        await _ibon_timing_mark(config_dict, 'ticket_nav_return', '選票頁開啟指令返回')
+    return True
+
+
 async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
     '''只接受指定張數與符合優先關鍵字的單一票種，原子核對後再填值。'''
     if await _ibon_actions_paused(config_dict) or await _ibon_submission_pending(tab, config_dict):
@@ -2299,6 +2607,7 @@ async def nodriver_ibon_ticket_number_auto_select(tab, config_dict):
             _state['selection_notice'] = notice
             util.create_debug_logger(config_dict, enabled=True).log(
                 '[IBON] 找不到符合區域／票種關鍵字、排除條件及指定張數的選項，等待票況或手動處理。')
+        await _ibon_stock_area_select(tab, snapshot['url'], config_dict, retry_ticket=True)
         return False
     _state.pop('selection_notice', None)
     if _ibon_selection_ok(snapshot, config_dict):
@@ -2457,6 +2766,411 @@ async def nodriver_ibon_captcha(tab, config_dict, ocr):
         tab, config_dict, ocr, bool(config_dict.get('ocr_captcha', {}).get('force_submit')), None)
     return sent
 
+def _ibon_api_submit_supported(snapshot):
+    from urllib.parse import urlsplit
+    context = _ibon_stock_context(snapshot.get('url'))
+    return bool(context and context['area_id'] and not snapshot.get('hasCaptcha') and
+                urlsplit(snapshot['url']).path.lower().endswith('/utk0201_001.aspx'))
+
+
+def _ibon_timing_ms(value):
+    import math
+    if type(value) in (int, float) and math.isfinite(value) and 0 <= value < 86400000:
+        return format(value/1000, '.3f') + ' 秒'
+    return '未記錄'
+
+
+def _ibon_page_timing(snapshot):
+    nav = snapshot.get('navigation') or {}
+    return ('首位元組 ' + _ibon_timing_ms(nav.get('first_byte_ms')) + '；HTML 回應 ' +
+            _ibon_timing_ms(nav.get('html_ms')) + '；DOM 就緒 ' + _ibon_timing_ms(nav.get('dom_ready_ms')))
+
+
+async def _ibon_timing_start(config_dict, context, origin, *, at=None):
+    sequence = _state.get('booking_timing_sequence', 0) + 1
+    _state['booking_timing_sequence'] = sequence
+    now = time.perf_counter() if at is None else at
+    _state['booking_timing'] = {'id': sequence, 'context': context, 'origin': origin,
+                                'start': now, 'last': now, 'marks': {}, 'browser': {}}
+    label = '偵測到符合條件票況' if origin == 'stock' else '從選票頁開始（未包含先前找票時間）'
+    await _ibon_timing_mark(config_dict, 'detected' if origin == 'stock' else 'form_start', label, at=now)
+
+
+async def _ibon_timing_mark(config_dict, event, label, *, at=None):
+    trace = _state.get('booking_timing')
+    if not trace or event in trace['marks']:
+        return
+    now = time.perf_counter() if at is None else at
+    trace['marks'][event] = now
+    elapsed, stage = max(0, now-trace['start']), max(0, now-trace['last'])
+    trace['last'] = now
+    util.create_debug_logger(config_dict, enabled=True).log(
+        '[IBON 耗時 #' + str(trace['id']) + '] ' + label +
+        '：累計 ' + format(elapsed, '.3f') + ' 秒；距前一階段 ' + format(stage, '.3f') + ' 秒。')
+
+
+async def _ibon_timing_form(config_dict, snapshot):
+    context = _ibon_stock_context(snapshot['url'])
+    if not context:
+        return
+    identity = (context['performance_id'], context['area_id'])
+    trace = _state.get('booking_timing')
+    if not trace or trace['context'] != identity:
+        await _ibon_timing_start(config_dict, identity, 'form')
+    label = '表單 HTML 可讀，未載入選票頁資源' if snapshot.get('detached') else '選票頁資料可讀'
+    await _ibon_timing_mark(config_dict, 'form_ready', label + '（' + _ibon_page_timing(snapshot) + '）')
+
+
+async def _ibon_timing_summary(config_dict):
+    trace = _state.get('booking_timing')
+    if not trace or trace.get('summarized') or 'api_dispatch' not in trace['marks'] or 'checkout_seen' not in trace['marks']:
+        return
+    trace['summarized'] = True
+    marks, browser = trace['marks'], trace['browser']
+    def span(start, end):
+        return _ibon_timing_ms((marks[end]-marks[start])*1000) if start in marks and end in marks else '未記錄'
+    origin = '偵測到票' if trace['origin'] == 'stock' else '選票頁起點（未含找票）'
+    values = [browser.get(key) for key in ('request_ms', 'parse_ms', 'build_ms')]
+    if 'response_seen' in marks and all(type(value) in (int, float) for value in values):
+        browser['bridge_ms'] = max(0, (marks['response_seen']-marks['api_dispatch'])*1000-sum(values))
+    notification = '回應→瀏覽器通知 ' + _ibon_timing_ms(browser.get('event_ms')) if browser.get('completion_mode') == 'event' else '回應→監控讀到 ' + _ibon_timing_ms(browser.get('monitor_ms'))
+    pieces = [origin + '→API 指令 ' + _ibon_timing_ms((marks['api_dispatch']-trace['start'])*1000),
+              '取得選票資料 ' + span('ticket_nav', 'form_ready'),
+              '表單讀取／導覽指令 ' + span('ticket_nav', 'ticket_nav_return'),
+              '指令返回→資料核對 ' + span('ticket_nav_return', 'form_ready'),
+              'API 指令往返 ' + span('api_dispatch', 'api_ack'),
+              '瀏覽器建立請求 ' + _ibon_timing_ms(browser.get('build_ms')),
+              'API 等待（網站處理＋網路＋讀取） ' + _ibon_timing_ms(browser.get('request_ms')),
+              'API 等待回應標頭 ' + _ibon_timing_ms(browser.get('headers_ms')),
+              'API 回應本文讀取 ' + _ibon_timing_ms(browser.get('body_ms')),
+              '回應解析 ' + _ibon_timing_ms(browser.get('parse_ms')),
+              notification,
+              '指令／回應傳遞與程式銜接 ' + _ibon_timing_ms(browser.get('bridge_ms')),
+              '監控→開啟結帳 ' + span('response_seen', 'checkout_nav'),
+              '開啟→確認結帳 ' + span('checkout_nav', 'checkout_seen'),
+              origin + '→確認結帳總計 ' + _ibon_timing_ms((marks['checkout_seen']-trace['start'])*1000)]
+    if trace.get('manual_wait'):
+        pieces.append('本輪曾等待人工確認，總計可能包含人工或暫停時間')
+    util.create_debug_logger(config_dict, enabled=True).log(
+        '[IBON 耗時摘要 #' + str(trace['id']) + '] ' + '；'.join(pieces) +
+        '。部分指標包含子階段或互相重疊，請以總計比較整體速度。')
+
+
+async def _ibon_prepare_submit(tab, config_dict, snapshot):
+    import uuid
+    slot = _ibon_flow_path(tab)
+    writing = _state.setdefault('receipt_writing', set())
+    if slot in writing:
+        return None
+    writing.add(slot)
+    try:
+        if await _ibon_actions_paused(config_dict):
+            return None
+        previous = _ibon_read_flow(tab)
+        tour_options = bool(re.search(r'/event/[^/]+/options/?(?:[?#]|$)', snapshot.get('url', '')))
+        if previous and previous.get('handoff') is not True and not tour_options:
+            return None
+        nonce = uuid.uuid4().hex
+        flow = {'nonce': nonce, 'origin': _ibon_origin(snapshot['url']), 'handoff': False,
+                'reset_token': _ibon_reset_token()}
+        task = asyncio.create_task(asyncio.to_thread(util.save_json, flow, slot))
+        try:
+            if not await asyncio.shield(task):
+                return None
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            await _ibon_restore_receipt(tab, (nonce, previous))
+            raise
+        except (OSError, ValueError):
+            return None
+        if await _ibon_actions_paused(config_dict):
+            await _ibon_restore_receipt(tab, (nonce, previous))
+            return None
+        return nonce, previous
+    finally:
+        writing.discard(slot)
+
+
+async def _ibon_restore_receipt(tab, receipt):
+    """Only an unsubmitted preparation owned by this nonce may be rolled back."""
+    if not receipt:
+        return
+    nonce, previous = receipt
+    current = _ibon_read_flow(tab)
+    if not current or current.get('nonce') != nonce:
+        return
+    if previous:
+        await asyncio.to_thread(util.save_json, previous, _ibon_flow_path(tab))
+    else:
+        _ibon_remove_flow(tab, nonce)
+
+
+async def _ibon_cleanup_uninvoked(tab, snapshot, nonce, previous):
+    try:
+        live = await _ibon_snapshot(tab)
+        stored = await tab.evaluate("sessionStorage.getItem('ticketsHunter.ibon.submit')")
+        saved = json.loads(stored) if stored else None
+        if live and live['doc'] == snapshot['doc'] and (not saved or saved.get('nonce') != nonce):
+            if previous:
+                util.save_json(previous, _ibon_flow_path(tab))
+            else:
+                _ibon_remove_flow(tab, nonce)
+    except Exception:
+        pass
+
+
+async def _ibon_fetch_ticket_form(tab, config_dict, source, url):
+    import math
+    try:
+        timeout = float(config_dict.get('advanced', {}).get('ibon_stock_api_timeout', 3))
+    except (TypeError, ValueError):
+        timeout = 3
+    if not math.isfinite(timeout) or not 0.2 <= timeout <= 30:
+        timeout = 3
+    script = _ibon_render(CONST_IBON_FORM_FETCH_JS, ENDPOINT=url, EXPECTED=source['doc'], TIMEOUT=timeout*1000)
+    task = asyncio.create_task(tab.evaluate(script, await_promise=True))
+    try:
+        while not task.done():
+            if not util.is_auto_refresh_enabled() or await _ibon_actions_paused(config_dict):
+                return None
+            await asyncio.wait({task}, timeout=0.05)
+        result = task.result()
+        return result if isinstance(result, dict) and (result.get('detached') is True or result.get('discarded') is True) else None
+    except Exception:
+        return {'discarded': True}
+    finally:
+        # Let CDP finish its read; cancelling its transaction can kill the zendriver listener.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+
+async def _ibon_prefetched_ticket_api(tab, config_dict, source, url):
+    preparing = _state.setdefault('api_preparing', {})
+    slot = _ibon_flow_path(tab)
+    previous = _ibon_read_flow(tab)
+    if slot in preparing or previous and previous.get('handoff') is not True:
+        return True
+    reservation = object()
+    preparing[slot] = reservation
+    receipt_task = None
+    submit_entered = False
+    try:
+        if await _ibon_actions_paused(config_dict) or not util.is_auto_refresh_enabled():
+            return True
+        receipt_task = asyncio.create_task(_ibon_prepare_submit(tab, config_dict, source))
+        await _ibon_timing_mark(config_dict, 'ticket_nav', '開始 GET 選票表單 HTML，並行準備防重送紀錄')
+        snapshot = await _ibon_fetch_ticket_form(tab, config_dict, source, url)
+        received_at = time.perf_counter()
+        receipt = await asyncio.shield(receipt_task)
+        if not receipt or await _ibon_actions_paused(config_dict) or not util.is_auto_refresh_enabled():
+            return True
+        current = _ibon_read_flow(tab)
+        if not current or current.get('nonce') != receipt[0] or current.get('reset_token') != _ibon_reset_token():
+            return True
+        if snapshot and snapshot.get('discarded'):
+            return True
+        if not snapshot or not snapshot.get('validForm') or not _ibon_api_submit_supported(snapshot):
+            util.create_debug_logger(config_dict, enabled=True).log('[IBON API 表單] 無法確認可直接送出的表單，改為開啟選票頁。')
+            return False
+        await _ibon_timing_mark(config_dict, 'ticket_nav_return', '選票表單 HTML 已取得', at=received_at)
+        await _ibon_timing_form(config_dict, snapshot)
+        candidates = _ibon_candidates(snapshot, config_dict)
+        if not candidates:
+            util.create_debug_logger(config_dict, enabled=True).log('[IBON API 表單] 本輪沒有符合票種、排除條件及完整張數的選項，繼續讀取票況。')
+            return True
+        target = util.get_target_item_from_matched_list(candidates, config_dict.get('area_auto_select', {}).get('mode', CONST_FROM_TOP_TO_BOTTOM))
+        if not target:
+            return True
+        await _ibon_timing_mark(config_dict, 'selection_ready', '票種與張數核對完成')
+        # Final document, cached form, native submission and exact quantity checks are atomic in browser JS.
+        submit_entered = True
+        if await _ibon_api_submit(tab, config_dict, snapshot, receipt, target=target):
+            return True
+        if await _ibon_submission_pending(tab, config_dict):
+            return True
+        notice = _state.get('api_preflight_notice')
+        return bool(notice and notice[0] == snapshot['doc'] and notice[1] in ('busy', 'not_ready'))
+    finally:
+        try:
+            if receipt_task is not None and not submit_entered:
+                receipt = await asyncio.shield(receipt_task)
+                await _ibon_restore_receipt(tab, receipt)
+        finally:
+            if preparing.get(slot) is reservation:
+                preparing.pop(slot, None)
+
+
+async def _ibon_wait_submit_result(tab, config_dict, snapshot, nonce, timeout):
+    script = _ibon_render(CONST_IBON_RESULT_WAIT_JS, NONCE=nonce, EXPECTED=snapshot['doc'], TIMEOUT=(timeout+.5)*1000)
+    task = asyncio.create_task(tab.evaluate(script, await_promise=True))
+    try:
+        while not task.done():
+            if await _ibon_actions_paused(config_dict):
+                return None
+            await asyncio.wait({task}, timeout=0.05)
+        result = task.result()
+        return result if isinstance(result, dict) and isinstance(result.get('saved'), dict) else None
+    except Exception:
+        return None
+    finally:
+        # Let CDP finish its read; cancelling its transaction can kill the zendriver listener.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+
+
+async def _ibon_api_submit(tab, config_dict, snapshot, receipt, target=None):
+    import math
+    nonce, previous = receipt
+    if await _ibon_actions_paused(config_dict):
+        await _ibon_cleanup_uninvoked(tab, snapshot, nonce, previous)
+        return False
+    candidates = _ibon_candidates(snapshot, config_dict)
+    if target is None:
+        target = next((row for row in candidates if row.get('value') == str(config_dict.get('ticket_number', 2))), None)
+    if not target or target not in candidates:
+        await _ibon_cleanup_uninvoked(tab, snapshot, nonce, previous)
+        return False
+    try:
+        timeout = float(config_dict.get('advanced', {}).get('ibon_submit_api_timeout', 10))
+    except (TypeError, ValueError):
+        timeout = 10
+    if not math.isfinite(timeout) or not 0.2 <= timeout <= 60:
+        timeout = 10
+    await _ibon_timing_form(config_dict, snapshot)
+    dispatch_started = time.perf_counter()
+    trace = _state.get('booking_timing')
+    if trace:
+        trace['nonce'] = nonce
+    try:
+        result = await tab.evaluate(_ibon_render(CONST_IBON_API_POST_JS, SNAPSHOT=snapshot,
+                                                 TARGET=target, AMOUNT=str(config_dict.get('ticket_number', 2)),
+                                                 ALLOW_SPLIT=bool(config_dict.get('advanced', {}).get('disable_adjacent_seat')),
+                                                 NONCE=nonce, TIMEOUT=timeout*1000))
+    except Exception:
+        await _ibon_timing_mark(config_dict, 'api_dispatch', 'API 指令已發出，回覆不明', at=dispatch_started)
+        util.create_debug_logger(config_dict, enabled=True).log('[IBON API 送出] 指令回覆不明，保留防重送狀態，請確認網站或購物車。')
+        return False
+    if isinstance(result, dict) and result.get('started') is True:
+        await _ibon_timing_mark(config_dict, 'api_dispatch', '開始送出 API 指令', at=dispatch_started)
+        if trace:
+            trace['browser'].update(result.get('timing') or {})
+        await _ibon_timing_mark(config_dict, 'api_ack', '瀏覽器已啟動 API 請求')
+        _state.pop('api_preflight_notice', None)
+        util.create_debug_logger(config_dict, enabled=True).log(
+            '[IBON API 送出] 已送出指定票種與 ' + str(config_dict.get('ticket_number', 2)) +
+            ' 張，等待網站確認；尚未確認訂單或付款完成。')
+        completed = await _ibon_wait_submit_result(tab, config_dict, snapshot, nonce, timeout)
+        if completed and completed['saved'].get('nonce') == nonce:
+            await _ibon_api_follow_up(tab, config_dict, completed['doc'], completed['saved'],
+                                      _ibon_read_flow(tab), completed.get('browser_now_ms'),
+                                      event_driven=bool(completed.get('event_driven')))
+        return True
+    if isinstance(result, dict) and result.get('started') is False:
+        await _ibon_cleanup_uninvoked(tab, snapshot, nonce, previous)
+        reason = result.get('reason')
+        notice = (snapshot['doc'], reason)
+        if _state.get('api_preflight_notice') != notice:
+            _state['api_preflight_notice'] = notice
+            messages = {'busy': '網站原生送出仍在進行，等待網站結果。', 'not_ready': '網站表單尚未就緒，等待載入。',
+                        'state': '缺少目前頁面的必要表單狀態，請重新確認頁面。',
+                        'changed': '頁面或張數已改變，本次未送出。'}
+            util.create_debug_logger(config_dict, enabled=True).log(
+                '[IBON API 送出] ' + messages.get(reason, '表單未通過核對，本次未送出，請確認頁面。'))
+    return False
+
+
+async def _ibon_direct_ticket_api(tab, config_dict, snapshot):
+    if await _ibon_actions_paused(config_dict):
+        return
+    if not snapshot.get('validForm') or snapshot.get('verifying') or snapshot.get('ready') == 'loading':
+        return
+    if not config_dict.get('ocr_captcha', {}).get('force_submit'):
+        await nodriver_ibon_ticket_number_auto_select(tab, config_dict)
+        return
+    if snapshot.get('needsFreshForm'):
+        context = _ibon_stock_context(snapshot['url'])
+        if context:
+            await _ibon_timing_start(config_dict, (context['performance_id'], context['area_id']), 'form')
+        handled = await _ibon_prefetched_ticket_api(tab, config_dict, snapshot, snapshot['url'])
+        if not handled:
+            util.create_debug_logger(config_dict, enabled=True).log(
+                '[IBON 自動恢復] 無法確認新的選票表單，本次未送出，請確認網站頁面。')
+        return
+    candidates = _ibon_candidates(snapshot, config_dict)
+    if not candidates:
+        await nodriver_ibon_ticket_number_auto_select(tab, config_dict)
+        return
+    target = util.get_target_item_from_matched_list(candidates, config_dict.get('area_auto_select', {}).get('mode', CONST_FROM_TOP_TO_BOTTOM))
+    if not target:
+        return
+    await _ibon_timing_form(config_dict, snapshot)
+    await _ibon_timing_mark(config_dict, 'selection_ready', '票種與張數核對完成')
+    receipt = await _ibon_prepare_submit(tab, config_dict, snapshot)
+    if receipt:
+        await _ibon_api_submit(tab, config_dict, snapshot, receipt, target=target)
+
+
+async def _ibon_api_follow_up(tab, config_dict, current_doc, saved, flow, browser_now=None, *, event_driven=False):
+    if await _ibon_actions_paused(config_dict):
+        return True
+    result = saved.get('apiResult')
+    if not isinstance(result, dict):
+        return True
+    nonce = saved['nonce']
+    kind = result.get('kind')
+    status = result.get('status')
+    status_text = str(status) if type(status) is int and 0 <= status <= 599 else '未知'
+    notice = (nonce, kind, status_text)
+    debug = util.create_debug_logger(config_dict, enabled=True)
+    trace = _state.get('booking_timing')
+    if trace and trace.get('nonce') == nonce and 'response_seen' not in trace['marks']:
+        for key in ('request_ms', 'headers_ms', 'body_ms', 'parse_ms'):
+            trace['browser'][key] = result.get(key)
+        completed = result.get('completed_at_ms')
+        if type(browser_now) in (int, float) and type(completed) in (int, float):
+            trace['browser']['event_ms' if event_driven else 'monitor_ms'] = max(0, browser_now-completed)
+        trace['browser']['completion_mode'] = 'event' if event_driven else 'poll'
+        await _ibon_timing_mark(config_dict, 'response_seen', '程式監控讀到 API 回應')
+    owned = bool(flow and flow.get('nonce') == nonce and flow.get('origin') == _ibon_origin(saved.get('route')))
+    if owned and kind == 'rejected' and status == 200 and result.get('reason') == 'stock' and result.get('format') == 'aspnet_delta':
+        if await _ibon_recover_api_rejection(tab, config_dict, saved, flow):
+            return True
+        if _state.get('recovery_limit_notice') == nonce:
+            return True
+    path = result.get('path', '')
+    confirmed = (owned and saved.get('doc') == current_doc and kind == 'checkout' and status == 200 and isinstance(path, str) and
+                 re.fullmatch(r'/application/UTK02/UTK0206_\.aspx', path, re.I))
+    if _state.get('api_result_notice') != notice:
+        _state['api_result_notice'] = notice
+        elapsed = result.get('elapsed_ms')
+        duration = '；耗時 ' + format(elapsed/1000, '.3f') + ' 秒' if type(elapsed) in (int, float) and 0 <= elapsed < 3600000 else ''
+        if confirmed:
+            debug.log('[IBON API 送出] 回應 HTTP ' + status_text + duration + '，網站要求進入結帳頁。')
+        else:
+            if trace:
+                trace['manual_wait'] = True
+            message = 'API 已送出但結果尚未確認，停止重送；請手動查看網站或購物車。'
+            formats = {'aspnet_delta': 'ASP.NET 部分更新', 'html': '完整 HTML'}
+            categories = {'captcha': '驗證碼或網站驗證', 'form_state': '表單狀態驗證',
+                          'session': '登入或連線狀態', 'stock': '票況或數量不足',
+                          'quantity': '張數或限購條件', 'site_message': '網站提示訊息',
+                          'cloudflare': 'Cloudflare 驗證'}
+            diagnostic = '；回應格式 ' + formats.get(result.get('format'), '未辨識')
+            if result.get('message_class') in categories:
+                diagnostic += '；網站提示分類：' + categories[result['message_class']]
+            debug.log('[IBON API 送出] 回應 HTTP ' + status_text + duration + diagnostic + '；' + message)
+            util.write_instance_status('waiting_manual', message)
+    if confirmed and _state.get('api_following_nonce') != nonce:
+        if await _ibon_actions_paused(config_dict):
+            return True
+        _state['api_following_nonce'] = nonce
+        await _ibon_timing_mark(config_dict, 'checkout_nav', '開始開啟結帳頁')
+        try:
+            await navigate_page_if_enabled(tab, flow['origin'] + path)
+            await _ibon_timing_mark(config_dict, 'checkout_nav_return', '結帳頁開啟指令返回')
+        except Exception:
+            debug.log('[IBON API 送出] 開啟結帳頁的結果不明，保留防重送狀態，請手動確認。')
+    return True
+
+
 async def nodriver_ibon_purchase_button_press(tab, config_dict):
     '''同一分頁送出前檢查總張數，持續保存未知結果的鎖定。'''
     if not config_dict.get('ocr_captcha', {}).get('force_submit') or await _ibon_actions_paused(config_dict):
@@ -2475,20 +3189,12 @@ async def nodriver_ibon_purchase_button_press(tab, config_dict):
         if not frame or not filled or (frame['doc'], frame['hash']) != (filled['doc'], filled['hash']):
             return False
         fingerprint = frame['hash']
-    if await _ibon_actions_paused(config_dict):
+    receipt = await _ibon_prepare_submit(tab, config_dict, snapshot)
+    if not receipt:
         return False
-    import uuid
-    nonce = uuid.uuid4().hex
-    flow = {'nonce': nonce, 'origin': _ibon_origin(snapshot['url']), 'handoff': False}
-    previous_flow = _ibon_read_flow(tab)
-    try:
-        if not util.save_json(flow, _ibon_flow_path(tab)):
-            return False
-    except (OSError, ValueError):
-        return False
-    if await _ibon_actions_paused(config_dict):
-        _ibon_remove_flow(tab, nonce)
-        return False
+    if _ibon_api_submit_supported(snapshot):
+        return await _ibon_api_submit(tab, config_dict, snapshot, receipt)
+    nonce, previous_flow = receipt
     script = r'''((expected,captcha,nonce) => {
         FORM
         const previous=JSON.parse(sessionStorage.getItem(key)||'null');
@@ -2516,14 +3222,7 @@ async def nodriver_ibon_purchase_button_press(tab, config_dict):
     try:
         invoked = bool(await tab.evaluate(_ibon_render(script, SNAPSHOT=snapshot, CAPTCHA=fingerprint, NONCE=nonce)))
         if not invoked:
-            live = await _ibon_snapshot(tab)
-            stored = await tab.evaluate("sessionStorage.getItem('ticketsHunter.ibon.submit')")
-            saved = json.loads(stored) if stored else None
-            if live and live['doc'] == snapshot['doc'] and (not saved or saved.get('nonce') != nonce):
-                if previous_flow:
-                    util.save_json(previous_flow, _ibon_flow_path(tab))
-                else:
-                    _ibon_remove_flow(tab, nonce)
+            await _ibon_cleanup_uninvoked(tab, snapshot, nonce, previous_flow)
         return invoked
     except Exception:
         return False
@@ -3279,6 +3978,11 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
     await register_ibon_alert_handler(tab, config_dict)
     if await _ibon_submission_pending(tab, config_dict):
         return False
+    if config_dict.get('area_auto_select', {}).get('enable') and _ibon_api_submit_supported({'url': url}):
+        snapshot = await _ibon_snapshot(tab)
+        if snapshot and _ibon_api_submit_supported(snapshot):
+            await _ibon_direct_ticket_api(tab, config_dict, snapshot)
+            return False
     ocr = await _ibon_cached_ocr(config_dict, ocr)
 
     # Check if kicked to login page (Cookie/Session expired)
@@ -3510,80 +4214,9 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                 is_match_target_feature = True
                 area_keyword = config_dict["area_auto_select"]["area_keyword"].strip()
 
-                # === live.map fast-path: skip DOM parsing by fetching area data from CDN ===
-                # Python requests bypasses browser network layer, unaffected by CDP blocking rules.
-                # NOTE: CDN remaining data can be stale (sold-out areas may show remaining > 0).
-                # A failed-area blacklist prevents infinite loops when CDN data is wrong.
-                try:
-                    from urllib.parse import urlparse, parse_qs
-                    parsed_url = urlparse(url)
-                    qs_params = parse_qs(parsed_url.query, keep_blank_values=True)
-                    perf_id = None
-                    for key in qs_params:
-                        if key.upper() == 'PERFORMANCE_ID':
-                            perf_id = qs_params[key][0]
-                            break
-
-                    if perf_id:
-                        livemap_debug = util.create_debug_logger(config_dict)
-
-                        # Check if last fast-path attempt failed (we're back on area selection)
-                        last_attempt = _state.get("livemap_last_attempt")
-                        if last_attempt and last_attempt.get("perf_id") == perf_id:
-                            failed_area_id = last_attempt["area_id"]
-                            failed_area_name = last_attempt.get("area_name", "")
-                            failed_set = _state["livemap_failed_areas"].setdefault(perf_id, set())
-                            failed_set.add(failed_area_id)
-                            _state["livemap_last_attempt"] = None
-                            livemap_debug.log(f"[IBON LIVEMAP] Area '{failed_area_name}' (id={failed_area_id}) sold out, added to blacklist ({len(failed_set)} total)")
-
-                        livemap_areas = await asyncio.to_thread(util.ibon_fetch_and_parse_livemap, perf_id, livemap_debug)
-
-                        if livemap_areas:
-                            # Filter out previously failed areas (stale CDN data)
-                            failed_set = _state["livemap_failed_areas"].get(perf_id, set())
-                            if failed_set:
-                                livemap_areas = [a for a in livemap_areas if a['area_id'] not in failed_set]
-                                livemap_debug.log(f"[IBON LIVEMAP] Filtered {len(failed_set)} failed areas, {len(livemap_areas)} remaining")
-
-                            livemap_selected = None
-
-                            if livemap_areas:
-                                if len(area_keyword) > 0:
-                                    livemap_kw_array = []
-                                    try:
-                                        import json as _json
-                                        livemap_kw_array = _json.loads("[" + area_keyword + "]")
-                                    except Exception:
-                                        livemap_kw_array = []
-
-                                    for livemap_kw_item in livemap_kw_array:
-                                        livemap_selected = util.ibon_livemap_select_area(livemap_areas, config_dict, livemap_kw_item, debug=livemap_debug)
-                                        if livemap_selected:
-                                            break
-                                else:
-                                    livemap_selected = util.ibon_livemap_select_area(livemap_areas, config_dict, area_keyword, debug=livemap_debug)
-
-                            if livemap_selected:
-                                skip_url = util.ibon_build_skip_url(livemap_selected)
-                                remaining_text = '熱賣中（未提供精確餘票）' if livemap_selected['remaining'] is None else livemap_selected['remaining']
-                                livemap_debug.log(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} (remaining: {remaining_text}) -> {skip_url}")
-                                debug.log(f"[IBON LIVEMAP] Fast-path: {livemap_selected['area_name']} -> skip to next step")
-                                # Track this attempt so we can blacklist if it fails
-                                _state["livemap_last_attempt"] = {
-                                    "perf_id": perf_id,
-                                    "area_id": livemap_selected['area_id'],
-                                    "area_name": livemap_selected['area_name'],
-                                }
-                                await navigate_page_if_enabled(tab, skip_url)
-                                return False
-                            else:
-                                livemap_debug.log("[IBON LIVEMAP] No matching area after filtering, falling back to DOM flow")
-                        else:
-                            livemap_debug.log("[IBON LIVEMAP] No areas parsed, falling back to DOM flow")
-                except Exception as exc:
-                    livemap_debug.log(f"[IBON LIVEMAP] Fast-path error: {exc}")
-                # === end live.map fast-path ===
+                # Stage 5: poll the site's stock endpoint without reloading the area page.
+                if await _ibon_stock_area_select(tab, url, config_dict):
+                    return False
 
                 is_need_refresh = False
                 is_price_assign_by_bot = False
@@ -3679,7 +4312,6 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         return False  # Return to main loop to continue monitoring
 
                     # Livemap fast-path area verified: has tickets, clear the attempt tracker
-                    _state["livemap_last_attempt"] = None
 
                     # Step 1: Handle non-adjacent seat checkbox
                     if config_dict["advanced"]["disable_adjacent_seat"]:
@@ -3789,7 +4421,6 @@ async def nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser):
                         return False  # Return to main loop to continue monitoring
 
                     # Livemap fast-path area verified: has tickets, clear the attempt tracker
-                    _state["livemap_last_attempt"] = None
 
                     # Step 1: Handle non-adjacent seat checkbox
                     if config_dict["advanced"]["disable_adjacent_seat"]:
