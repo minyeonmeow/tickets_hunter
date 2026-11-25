@@ -18,6 +18,9 @@
 重整間隔熱更新會以最近一次讀取完成時間重新計算下一輪期限；已進行的 GET 不取消，也不平行發送下一筆。
 HTTP 403 每次以 `random.randint` 在 `advanced.tixcraft_http_forbidden_retry_interval`（預設 5 秒）與 `advanced.tixcraft_http_forbidden_retry_interval_max`（預設 10 秒）之間取整數秒，等待後重試讀取；一般重整間隔熱更新不縮短該次等待。HTTP 401／429 仍停止輪詢。暫停／斷開與關閉自動重整優先，送出鎖不因 403 解除。
 根 frame 網址監聽與網路／對話框事件回呼統一使用非同步函式，避免 zendriver 同步回呼的背景執行緒讀取到已變動的非同步 callback，導致事件遺失與 coroutine 未 await。
+API 實驗模式以 `asyncio.gather(return_exceptions=True)` 並行 OCR 與原表單前置處理（`submit=false`），兩條工作都完成才檢查結果，避免取消未完成的 CDP 指令。最終沿用完整送出檢查與持久鎖，重新取得執行期限；準備階段不送出 POST。圖片缺少時依 `advanced.tixcraft_http_image_retry_interval`（預設 0.2 秒）再次讀取，不交由手動處理。各階段以 monotonic 記錄，不改動排隊查詢與等待。
+驗證碼錯誤回應允許 script 開頭的直接 literal `alert` 後面接其他程式碼或省略分號；不辨識未執行函式或條件區塊中的 alert，也不執行回應 HTML。明確拒絕只要求換圖，不同時導航重載整頁。未知回覆保留送出鎖，以狀態／HTTP／回覆分類記錄一次；不輸出回應原文、Cookie 或驗證碼。
+區域條件以實際啟動的設定檔時間戳與大小重新讀取，並於 OCR 後、送出前再次確認。選票頁以 `.select-area span` 或同 URL 的票區來源紀錄確認身分；不能只因頁面只有一種票就略過區域條件。條件變更後回票區列表重新套用關鍵字優先順序；未知送出／排隊狀態先由持久鎖攔截，不為重選清除送出紀錄。原本按鈕模式也在選張數與送出前套用設定更新。
 日期補零會正規化，熱賣中不推算精確張數。關閉自動重整時以 frame loader 識別手動 F5，直接讀取目前 DOM，不額外 GET 同一票區。
 HTTP 讀取不複製 Cookie 到 Python；網址監控使用根 frame 導航事件及 frame tree，避免頁面 JavaScript 等候。
 兩種模式都只到結帳頁，付款保持手動。Ticketmaster／Indievox 保留既有流程。

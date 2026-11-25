@@ -713,7 +713,7 @@ async def reload_config(config_dict, last_mtime, config_filepath):
 
     try:
         current_mtime = os.path.getmtime(config_filepath)
-        if current_mtime > last_mtime:
+        if current_mtime != last_mtime:
             await asyncio.sleep(0.1)
             new_config = await asyncio.to_thread(util.load_json_file, config_filepath)
 
@@ -736,6 +736,7 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                     "tixcraft_soft_block_delay",
                     "tixcraft_http_forbidden_retry_interval",
                     "tixcraft_http_forbidden_retry_interval_max",
+                    "tixcraft_http_image_retry_interval",
                     "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
                     "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
                     "discount_code", "ticketplus_stock_api", "ticketplus_stock_api_timeout", "ticketplus_direct_flow",
@@ -1004,6 +1005,7 @@ async def _run_bot(args, session):
     if args and getattr(args, "input", None):
         config_filepath = args.input
     config_mtime = 0
+    config_dict['_runtime_config_path'] = config_filepath
     if os.path.exists(config_filepath):
         config_mtime = os.path.getmtime(config_filepath)
 

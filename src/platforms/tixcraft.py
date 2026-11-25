@@ -2344,7 +2344,8 @@ async def _tixcraft_ticket_snapshot(tab):
                         !o.disabled&&!o.closest('optgroup')?.disabled&&/^\d+$/.test(o.value)&&Number(o.value)>0&&
                         !sold.includes((o.textContent||'').trim())).map(o=>Number(o.value))};
             });
-            return {document_id:location.href+'|'+performance.timeOrigin,rows};
+            return {document_id:location.href+'|'+performance.timeOrigin,rows,
+                area_name:(document.querySelector('.select-area span')?.textContent||'').trim()};
         })()''')
         return result if isinstance(result, dict) and isinstance(result.get('rows'), list) else None
     except Exception:
@@ -2518,6 +2519,9 @@ async def nodriver_tixcraft_assign_ticket_number(tab, config_dict):
     snapshot = await _tixcraft_ticket_snapshot(tab)
     if not snapshot or not snapshot['rows']:
         return False, None, None
+    if urlsplit(snapshot['document_id'].split('|', 1)[0]).hostname in ('tixcraft.com', 'www.tixcraft.com'):
+        if not await _tixcraft_apply_area_update(config_dict) or not await _tixcraft_verify_current_area(tab, config_dict, snapshot):
+            return False, None, None
     try:
         eligible, candidates = _tixcraft_ticket_candidates(snapshot, config_dict)
         chosen = _tixcraft_pick_ticket_candidate(eligible, candidates, config_dict)
@@ -2834,6 +2838,8 @@ async def _tixcraft_http_catalog(tab, url, config):
             _state.pop('http_catalog', None)
             return True
         _tixcraft_http_time(config, '偵測到有票，直接進入選票頁')
+        _state.update(http_ticket_navigation_started=time.monotonic(), http_ticket_navigation_url=chosen['url'])
+        _state['http_selected_area'] = {'url': chosen['url'], 'row': dict(chosen), 'preferences': _tixcraft_area_preferences(config)}
         await tab.get(chosen['url'])
         _state.pop('http_catalog', None)
         return True
@@ -2907,22 +2913,95 @@ async def _tixcraft_http_pending(tab, config, snapshot):
             if api['state'] == 'posting' and api.get('active'):
                 return True
             if api['state'] == 'rejected':
-                if not await _tixcraft_submission_pending(tab, config):
-                    return True
                 if _state.get('http_rejected_nonce') != api['nonce']:
                     _state['http_rejected_nonce'] = api['nonce']
                     failures = _state.get('http_captcha_failures', 0) + 1
                     _state['http_captcha_failures'] = failures
-                    limit = max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15)))
-                    if failures >= limit:
-                        util.write_instance_status('waiting_manual', '驗證碼已達重試上限，請手動處理。')
-                    elif util.is_auto_refresh_enabled() and not await _tixcraft_actions_paused(config):
-                        await tab.get(route)
+                limit = max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15)))
+                if _state.get('http_captcha_failures', 0) >= limit:
+                    _tixcraft_http_wait(config, snapshot, '驗證碼已達重試上限，請手動處理。', 'waiting_manual')
+                    return True
+                await _tixcraft_submission_pending(tab, config)
                 return True
     if not await _tixcraft_submission_pending(tab, config):
         return True
-    _tixcraft_pending_notice(config, ('button_pending', snapshot['document_id']))
+    if api:
+        _tixcraft_http_response_notice(config, api)
     return True
+
+
+def _tixcraft_http_response_notice(config, api):
+    identity = tuple(api.get(key) for key in ('nonce', 'state', 'status', 'response_reason', 'response_path'))
+    if _state.get('http_response_notice') == identity:
+        return
+    _state['http_response_notice'] = identity
+    reasons = {'login_redirect': '回應導向登入頁，請確認登入狀態',
+               'same_ticket_page': '回應仍是選票頁，尚未確認原因', 'http_error': '網站拒絕或處理失敗',
+               'network_error': '網路或回應讀取失敗', 'unexpected_redirect': '回應不是預期的排隊或結帳頁'}
+    reason = reasons.get(api.get('response_reason'), '送出結果尚未確認')
+    message = 'API 送出回應：狀態 %s，HTTP %s，%s；保留防重送，請檢查瀏覽器與訂單。' % (api.get('state', 'unknown'), api.get('status', '未知'), reason)
+    _tixcraft_http_log(config, message)
+    util.write_instance_status('waiting_manual', message)
+
+
+def _tixcraft_area_preferences(config):
+    return json.dumps({key: config.get(key) for key in ('area_auto_select', 'area_auto_fallback', 'keyword_exclude', 'ticket_number')}, sort_keys=True)
+
+
+async def _tixcraft_apply_area_update(config):
+    path = config.get('_runtime_config_path')
+    if path:
+        try:
+            stat = os.stat(path)
+            stamp = (path, stat.st_mtime_ns, stat.st_size)
+            if _state.get('http_area_config_stamp') != stamp:
+                fresh = await asyncio.to_thread(util.load_json_file, path)
+                if not isinstance(fresh, dict):
+                    raise ValueError('invalid settings')
+                for key in ('area_auto_select', 'area_auto_fallback', 'keyword_exclude', 'ticket_number'):
+                    if key in fresh:
+                        config[key] = fresh[key]
+                _state['http_area_config_stamp'] = stamp
+        except Exception:
+            _tixcraft_http_wait(config, None, '設定更新尚未讀取完成，暫不選票或送出；稍後重新確認。')
+            return False
+    signature = _tixcraft_area_preferences(config)
+    if _state.get('http_area_preferences_notice') != signature:
+        _state['http_area_preferences_notice'] = signature
+        _tixcraft_http_log(config, '區域設定已套用：關鍵字 %s；自動回退 %s。' % (
+            config.get('area_auto_select', {}).get('area_keyword', '') or '不限', '開啟' if config.get('area_auto_fallback', False) else '關閉'))
+    return True
+
+
+async def _tixcraft_verify_current_area(tab, config, snapshot):
+    if not config.get('area_auto_select', {}).get('enable', True):
+        return True
+    route = snapshot['document_id'].split('|', 1)[0]
+    selected = _state.get('http_selected_area', {})
+    known = selected.get('url') == route
+    signature = _tixcraft_area_preferences(config)
+    if known and selected.get('preferences') == signature:
+        return True  # The catalog already checked all keyword priorities.
+    name = snapshot.get('area_name', '').strip()
+    labels = [r.get('name', '') for r in snapshot['rows'] if not r.get('disabled') and
+              not util.reset_row_text_if_match_keyword_exclude(config, r.get('name', ''))]
+    row = {'name': name + ' ' + ' '.join(labels), 'url': route, 'count': None, 'sold': False}
+    strict = dict(config, area_auto_fallback=False)
+    raw = config.get('area_auto_select', {}).get('area_keyword', '').strip()
+    if not known and name and (not raw or _tixcraft_http_choose([row], strict)):
+        _state['http_selected_area'] = {'url': route, 'row': row, 'preferences': signature}
+        return True
+    if await _tixcraft_actions_paused(config) or await _tixcraft_submission_pending(tab, config):
+        return False
+    if (await ticket_http.page_identity(tab))[0] != route:
+        return False
+    _tixcraft_http_log(config, '重新核對票區：%s；目前票區不符或區域設定已更新，返回票區列表依新設定重選。' % (name or selected.get('row', {}).get('name', '無法確認')))
+    _state.pop('http_catalog', None)
+    _state.pop('http_ocr', None)
+    _state.pop('http_image_retry_due', None)
+    parts = urlsplit(route).path.strip('/').split('/')
+    await tab.get(urljoin(route, '/ticket/area/' + parts[2] + '/' + parts[3]))
+    return False
 
 
 def _tixcraft_http_wait(config, snapshot, reason, state='running'):
@@ -2933,8 +3012,112 @@ def _tixcraft_http_wait(config, snapshot, reason, state='running'):
         util.write_instance_status(state, reason)
 
 
+async def _tixcraft_refresh_unreadable_captcha(tab, config, snapshot):
+    """Refresh an invalid OCR challenge once; never submit or clear order guards."""
+    if await _tixcraft_actions_paused(config):
+        return
+    identity = (snapshot['document_id'], snapshot['captcha'])
+    refresh = _state.get('http_invalid_refresh')
+    if not refresh or refresh['identity'] != identity:
+        refresh = {'identity': identity, 'requested': False}
+        _state['http_invalid_refresh'] = refresh
+        _state['http_captcha_failures'] = _state.get('http_captcha_failures', 0) + 1
+    limit = max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15)))
+    if _state['http_captcha_failures'] >= limit:
+        _tixcraft_http_wait(config, snapshot, '驗證碼辨識已達重試上限，尚未送出；請手動輸入或換圖。', 'waiting_manual')
+        return
+    if refresh['requested']:
+        return
+    parameters = {'document': snapshot['document_id'], 'captcha': snapshot['captcha'], 'expires': _tixcraft_http_expiry(config)}
+    result = await tab.evaluate(r'''(() => {
+        CAPTCHA_LOGIC
+        const p=PARAMETERS,key='ticketsHunter.tixcraft.submit';
+        if(Date.now()>p.expires||location.href+'|'+performance.timeOrigin!==p.document||captchaId()!==p.captcha)return 'changed';
+        if(window[Symbol.for(key)]||sessionStorage.getItem(key))return 'pending';
+        const verify=document.querySelector('#TicketForm_verifyCode');
+        if(verify?.value)return 'manual';
+        if(typeof jQuery==='undefined')return 'manual';
+        const img=jQuery('#TicketForm_verifyCode-image');
+        if(!img.length||typeof img.yiiCaptcha!=='function')return 'manual';
+        img.yiiCaptcha('refresh');return 'requested';
+    })()'''.replace('CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('PARAMETERS', json.dumps(parameters)))
+    if result in ('requested', 'manual', 'pending'):
+        refresh['requested'] = True
+    if result == 'requested':
+        _tixcraft_http_wait(config, snapshot, 'OCR 結果不是四碼，已要求更新驗證碼；等待新圖後重新辨識，尚未送出。')
+    elif result == 'manual':
+        _tixcraft_http_wait(config, snapshot, 'OCR 結果不是四碼，目前無法自動換圖或已有手動輸入；請手動處理，尚未送出。', 'waiting_manual')
+
+
+def _tixcraft_http_phase(config, snapshot, stage):
+    identity = (snapshot['document_id'], snapshot.get('captcha'))
+    timing = _state.get('http_detail_timing')
+    if not timing or timing['identity'] != identity:
+        start = _state.get('http_ticket_navigation_started', time.monotonic()) if snapshot['document_id'].split('|', 1)[0] == _state.get('http_ticket_navigation_url') else time.monotonic()
+        timing = {'identity': identity, 'start': start, 'marks': {}}
+        _state['http_detail_timing'] = timing
+    if stage not in timing['marks']:
+        timing['marks'][stage] = now = time.monotonic()
+        _tixcraft_http_log(config, '細部計時：%s，距進入選票頁指令 %.3f 秒。' % (stage, now - timing['start']))
+
+
+def _tixcraft_http_form_parameters(config, snapshot, chosen, answer, submit):
+    return {'document': snapshot['document_id'], 'captcha': snapshot['captcha'], 'id': chosen['id'],
+            'count': chosen['count'], 'target': int(config.get('ticket_number', 1)),
+            'allow_less': bool(config.get('tixcraft', {}).get('allow_less_tickets', False)),
+            'answer': answer, 'require_captcha': snapshot['has_captcha'], 'submit': submit,
+            'generation': util.get_browser_session_generation(), 'instance': util.get_instance_id(),
+            'expires': _tixcraft_http_expiry(config)}
+
+
+async def _tixcraft_parallel_ocr(tab, config, snapshot, chosen, ocr):
+    async def recognize():
+        _tixcraft_http_phase(config, snapshot, 'OCR 開始')
+        value = await asyncio.to_thread(ocr.classification, base64.b64decode(snapshot['image']))
+        _tixcraft_http_phase(config, snapshot, 'OCR 返回')
+        return value
+    async def prepare():
+        if await _tixcraft_actions_paused(config):
+            return {'state': 'paused'}
+        _tixcraft_http_phase(config, snapshot, '張數與條款準備開始')
+        parameters = _tixcraft_http_form_parameters(config, snapshot, chosen, None, False)
+        script = (ticket_http.CONST_FORM_PREPARE_JS + '\n})()').replace(
+            'CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('PARAMETERS', json.dumps(parameters))
+        result = await tab.evaluate(script)
+        _tixcraft_http_phase(config, snapshot, '張數與條款準備返回')
+        return result
+    # Drain both operations even if one fails; never cancel an in-flight CDP command.
+    value, prepared = await asyncio.gather(recognize(), prepare(), return_exceptions=True)
+    for result in (value, prepared):
+        if isinstance(result, BaseException):
+            raise result
+    return value, isinstance(prepared, dict) and prepared.get('state') == 'prepared'
+
+
+async def _tixcraft_http_recognize(tab, config, snapshot, chosen, ocr, experiment):
+    cached = _state.get('http_ocr')
+    identity = (snapshot['document_id'], snapshot['captcha'])
+    if cached and cached[0] == identity:
+        return cached[1], True
+    started = time.monotonic()
+    _tixcraft_http_log(config, '驗證碼圖片已就緒，開始 OCR 辨識。')
+    if experiment:
+        value, prepared = await _tixcraft_parallel_ocr(tab, config, snapshot, chosen, ocr)
+    else:
+        _tixcraft_http_phase(config, snapshot, 'OCR 開始')
+        value = await asyncio.to_thread(ocr.classification, base64.b64decode(snapshot['image']))
+        _tixcraft_http_phase(config, snapshot, 'OCR 返回')
+        prepared = True
+    answer = value.strip() if isinstance(value, str) else ''
+    _state['http_ocr'] = (identity, answer)
+    _tixcraft_http_log(config, 'OCR 與必要準備已返回，耗時 %.3f 秒；取得 %s 碼，需要 4 碼。' % (time.monotonic()-started, len(answer)))
+    return answer, prepared
+
+
 async def _tixcraft_http_ticket(tab, config, ocr):
     experiment = _state.setdefault('http_submit_experiment', config.get('advanced', {}).get('tixcraft_api_submit_experiment') is True)
+    if time.monotonic() < _state.get('http_image_retry_due', 0):
+        return True
     snapshot = await _tixcraft_http_snapshot(tab, config, ocr)
     if not snapshot:
         _tixcraft_http_wait(config, snapshot, '等待選票頁可讀取，尚未送出。')
@@ -2952,9 +3135,15 @@ async def _tixcraft_http_ticket(tab, config, ocr):
     if not snapshot.get('supported') or not snapshot.get('rows'):
         _tixcraft_http_wait(config, snapshot, '等待選票表單載入，尚未送出。')
         return True
+    if not await _tixcraft_verify_current_area(tab, config, snapshot):
+        return True
+    preferences = _tixcraft_area_preferences(config)
+    _tixcraft_http_phase(config, snapshot, '選票表單已讀取')
     if not snapshot.get('captcha_ready'):
+        _state['http_image_retry_due'] = time.monotonic() + max(.01, float(config.get('advanced', {}).get('tixcraft_http_image_retry_interval', .2)))
         _tixcraft_http_wait(config, snapshot, '等待驗證碼圖片載入完成，尚未辨識或送出。')
         return True  # Partial document/unfinished captcha is not sold out; never F5 here.
+    _tixcraft_http_phase(config, snapshot, '驗證碼圖片已載入')
     eligible, candidates = _tixcraft_ticket_candidates(snapshot, config)
     chosen = _tixcraft_pick_ticket_candidate(eligible, candidates, config)
     if chosen is None:
@@ -2970,39 +3159,32 @@ async def _tixcraft_http_ticket(tab, config, ocr):
     manual_only = _state.get('http_captcha_failures', 0) >= max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15)))
     if snapshot['has_captcha'] and not manual_only and not snapshot.get('captcha_filled') and config.get('ocr_captcha', {}).get('enable') and ocr is not None:
         if not snapshot.get('image'):
+            _state['http_image_retry_due'] = time.monotonic() + max(.01, float(config.get('advanced', {}).get('tixcraft_http_image_retry_interval', .2)))
             _tixcraft_http_wait(config, snapshot, '驗證碼圖片已載入但無法取得辨識影像，持續重新確認；尚未送出。')
             return True
-        # Cache inference for the unchanged image in this document, not across challenges.
-        cached = _state.get('http_ocr')
-        identity = (snapshot['document_id'], snapshot['captcha'])
-        if not cached or cached[0] != identity:
-            started = time.monotonic()
-            _tixcraft_http_log(config, '驗證碼圖片已就緒，開始 OCR 辨識。')
-            value = await asyncio.to_thread(ocr.classification, base64.b64decode(snapshot['image']))
-            cached = (identity, value.strip() if isinstance(value, str) else '')
-            _state['http_ocr'] = cached
-            _tixcraft_http_log(config, 'OCR 辨識已返回，耗時 %.3f 秒；取得 %s 碼，需要 4 碼。' % (time.monotonic() - started, len(cached[1])))
-        answer = cached[1]
+        answer, prepared = await _tixcraft_http_recognize(tab, config, snapshot, chosen, ocr, experiment)
         if len(answer) != 4:
-            _tixcraft_http_wait(config, snapshot, 'OCR 已完成，但辨識結果為 %s 碼（需要 4 碼）；尚未送出，請手動輸入或換圖。' % len(answer), 'waiting_manual')
+            await _tixcraft_refresh_unreadable_captcha(tab, config, snapshot)
+            return True
+        if not prepared:
+            _tixcraft_http_wait(config, snapshot, '表單準備尚未完成，重新確認張數與條款；尚未送出。')
             return True
     elif snapshot['has_captcha'] and not snapshot.get('captcha_filled'):
         _tixcraft_http_wait(config, snapshot, '等待手動輸入驗證碼：自動辨識未啟用、不可用或已達重試上限；尚未送出。')
+    if not await _tixcraft_apply_area_update(config) or preferences != _tixcraft_area_preferences(config):
+        return True
     if await _tixcraft_actions_paused(config):
         return True
-    parameters = {'document': snapshot['document_id'], 'captcha': snapshot['captcha'], 'id': chosen['id'],
-                  'count': chosen['count'], 'target': int(config.get('ticket_number', 1)),
-                  'allow_less': bool(config.get('tixcraft', {}).get('allow_less_tickets', False)),
-                  'answer': answer, 'require_captcha': snapshot['has_captcha'],
-                  'submit': bool(config.get('ocr_captcha', {}).get('force_submit', False)) and not manual_only,
-                  'generation': util.get_browser_session_generation(), 'instance': util.get_instance_id()}
-    parameters['expires'] = _tixcraft_http_expiry(config)
+    parameters = _tixcraft_http_form_parameters(config, snapshot, chosen, answer,
+        bool(config.get('ocr_captcha', {}).get('force_submit', False)) and not manual_only)
     if parameters['submit']:
         _state['tixcraft_submit_pending'] = snapshot['document_id']
         _state['tixcraft_submit_generation'] = parameters['generation']
     template = ticket_http.CONST_EXPERIMENTAL_SEND_JS if experiment else ticket_http.CONST_SEND_JS
     script = template.replace('CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('PARAMETERS', json.dumps(parameters))
+    _tixcraft_http_phase(config, snapshot, '最終核對與送出開始')
     result = await tab.evaluate(script)
+    _tixcraft_http_phase(config, snapshot, '最終核對與送出指令返回')
     stage = result.get('state') if isinstance(result, dict) else 'unknown'
     if stage in ('changed', 'not_ready', 'prepared', 'unsupported', 'expired'):
         _state.pop('tixcraft_submit_pending', None)
@@ -3024,6 +3206,8 @@ async def _tixcraft_http_main(tab, url, config, ocr):
     parsed = urlsplit(url)
     if parsed.hostname not in ('tixcraft.com', 'www.tixcraft.com') or not config.get('advanced', {}).get('tixcraft_http_api', True):
         return False
+    if not await _tixcraft_apply_area_update(config):
+        return True
     _state.setdefault('http_submit_experiment', config.get('advanced', {}).get('tixcraft_api_submit_experiment') is True)
     _state.setdefault('http_timing', {'start': time.monotonic(), 'last': time.monotonic()})
     if parsed.path.startswith('/ticket/ticket/'):
@@ -3282,6 +3466,9 @@ async def _tixcraft_submit_form(tab, config_dict, require_captcha=False, expecte
     document_id = await _tixcraft_document_id(tab)
     if not document_id:
         return False
+    if urlsplit(document_id.split('|', 1)[0]).hostname in ('tixcraft.com', 'www.tixcraft.com'):
+        if not await _tixcraft_apply_area_update(config_dict):
+            return False
     is_ticketmaster = 'ticketmaster.' in document_id.split('|', 1)[0]
     if not is_ticketmaster and not await _tixcraft_ticket_selection_valid(tab, config_dict):
         _forget_ticket_assigned(document_id.split('|', 1)[0])

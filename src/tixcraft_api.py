@@ -207,7 +207,7 @@ CONST_SNAPSHOT_JS = r'''(() => {
         pending_state:pending?.state,pending_nonce:pending?.nonce,
         api:pending?.transport==='http'?{nonce:pending.nonce,state:pending.state,route:pending.route,
             instance_id:pending.instanceId,
-            request_ms:pending.request_ms,status:pending.status,check:pending.check,check_ms:pending.check_ms,
+            request_ms:pending.request_ms,status:pending.status,response_path:pending.response_path,response_reason:pending.response_reason,check:pending.check,check_ms:pending.check_ms,
             active:!!active,check_inflight:!!pending.check_inflight,check_seq:pending.check_seq||0,check_due_ms:pending.check_due_ms||0,
             browser_now_ms:performance.timeOrigin+performance.now()}:null};
     const form=document.querySelector('#form-ticket-ticket');
@@ -231,7 +231,8 @@ CONST_SNAPSHOT_JS = r'''(() => {
         try{const c=document.createElement('canvas');c.width=image.naturalWidth;c.height=image.naturalHeight;
             c.getContext('2d').drawImage(image,0,0);imageData=c.toDataURL('image/png').split(',')[1];}catch(_){}
     }
-    return {supported:true,document_id:doc,rows,ready:document.readyState,has_captcha:!!verify,captcha:captchaId(),image:imageData,
+    const areaName=(document.querySelector('.select-area span')?.textContent||'').trim();
+    return {supported:true,document_id:doc,rows,area_name:areaName,ready:document.readyState,has_captcha:!!verify,captcha:captchaId(),image:imageData,
         captcha_filled:!!verify&&verify.value.length===4,captcha_ready:!verify||!!image?.complete&&!!image.naturalWidth,released:reset.cleared};
 })()'''
 
@@ -325,7 +326,8 @@ CONST_EXPERIMENTAL_SEND_JS = CONST_FORM_PREPARE_JS + r'''
     const record={documentId:doc,route:location.href,nonce,state:'posting',transport:'http',captcha:p.captcha,
         resetToken:p.generation,instanceId:p.instance};
     const save=()=>{if(window[slot]===record)sessionStorage.setItem(key,JSON.stringify({documentId:doc,route:record.route,nonce,
-        state:record.state,transport:'http',resetToken:p.generation,instanceId:p.instance,request_ms:record.request_ms,status:record.status}));};
+        state:record.state,transport:'http',resetToken:p.generation,instanceId:p.instance,request_ms:record.request_ms,status:record.status,
+        response_path:record.response_path,response_reason:record.response_reason}));};
     try{sessionStorage.setItem(key,JSON.stringify(record));}catch(_){return {state:'not_ready'};}
     window[slot]=record;
     if(!form[Symbol.for(key+'.httpGuard')]){
@@ -342,19 +344,25 @@ CONST_EXPERIMENTAL_SEND_JS = CONST_FORM_PREPARE_JS + r'''
             if(window[slot]!==record||location.href+'|'+performance.timeOrigin!==doc)return;
             record.status=response.status;record.request_ms=performance.now()-started;
             const target=new URL(response.url);
+            record.response_path=target.origin===location.origin?target.pathname:'external';
+            record.response_reason=response.status!==200?'http_error':
+                /(?:^|\/)(?:login|signin)(?:\/|$)/i.test(target.pathname)?'login_redirect':
+                target.origin===location.origin&&target.pathname===action.pathname?'same_ticket_page':'unexpected_redirect';
             if(response.status===200&&target.origin===location.origin&&target.pathname==='/ticket/order')record.state='queued';
             else if(response.status===200&&target.origin===location.origin&&target.pathname==='/ticket/checkout')record.state='checkout';
             else {
                 record.state='unknown';
                 if(response.status===200&&target.origin===location.origin&&target.pathname===action.pathname){
                     const parsed=new DOMParser().parseFromString(html,'text/html');
-                    const errors=Array.from(parsed.querySelectorAll('script')).map(s=>s.textContent.match(/^\s*(?:window\.)?alert\(\s*(["'])([\s\S]*?)\1\s*\)\s*;?\s*$/)).filter(Boolean).map(m=>
+                    const errors=Array.from(parsed.querySelectorAll('script')).map(s=>s.textContent.match(/^\s*(?:window\.)?alert\(\s*(["'])([\s\S]*?)\1\s*\)/)).filter(Boolean).map(m=>
                         m[2].replace(/\\u([0-9a-f]{4})/gi,(_,n)=>String.fromCharCode(parseInt(n,16)))).join(' ');
-                    if(/(?:驗證碼(?:錯誤|不正確|輸入錯誤)|(?:incorrect|invalid|wrong)\s+(?:verification code|captcha))/i.test(errors))record.state='rejected';
+                    if(/(?:驗證碼(?:錯誤|不正確|輸入錯誤)|(?:incorrect|invalid|wrong)\s+(?:verification code|captcha))/i.test(errors)){
+                        record.state='rejected';record.response_reason='captcha_rejected';
+                    }
                 }
             }
             save();
-        }catch(_){if(window[slot]===record){record.state='unknown';save();}}
+        }catch(_){if(window[slot]===record){record.state='unknown';record.response_reason='network_error';save();}}
     })();
     return {state:'invoked',nonce,count:p.count};
 })()'''
