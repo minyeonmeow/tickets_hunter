@@ -1259,13 +1259,13 @@ function isTixcraftSoftBlockScope(url) {
 
 // Platform detection map
 const PLATFORM_MAP = [
+    { key: 'kham',        httpsHost: 'kham.com.tw' },
+    { key: 'ticket',      httpsHost: 'ticket.com.tw' },
+    { key: 'udn',         httpsHost: 'tickets.udnfunlife.com' },
     { key: 'tixcraft',    domains: ['tixcraft.com', 'teamear.com', 'indievox.com', 'ticketmaster.'] },
     { key: 'kktix',       domains: ['kktix.com', 'kktix.cc'] },
     { key: 'ibon',        domains: ['ibon.com'] },
     { key: 'famiticket',  domains: ['famiticket.com'] },
-    { key: 'kham',        domains: ['kham.com.tw'] },
-    { key: 'ticket',      domains: ['ticket.com.tw'] },
-    { key: 'udn',         domains: ['udnfunlife.com'] },
     { key: 'ticketplus',  domains: ['ticketplus.com'] },
     { key: 'cityline',    domains: ['cityline.com'] },
     { key: 'hkticketing', domains: ['hkticketing.com', 'galaxymacau.com', 'ticketek.com'] },
@@ -1276,8 +1276,19 @@ const PLATFORM_MAP = [
 
 function detectPlatform(url) {
     if (!url) return null;
+
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(url);
+    } catch {
+        // Preserve legacy matching for platforms without an exact host rule.
+    }
+
     for (const platform of PLATFORM_MAP) {
-        if (platform.domains.some(d => url.includes(d))) {
+        const matches = platform.httpsHost
+            ? parsedUrl?.protocol === 'https:' && !parsedUrl.port && parsedUrl.hostname === platform.httpsHost
+            : platform.domains.some(domain => url.includes(domain));
+        if (matches) {
             return platform.key;
         }
     }

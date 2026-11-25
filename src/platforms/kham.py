@@ -15,6 +15,7 @@ import re
 import time
 import traceback
 import webbrowser
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 from zendriver import cdp
 
@@ -24,6 +25,7 @@ from nodriver_common import navigate_page_if_enabled, reload_page_if_enabled, sl
 from nodriver_common import (
     asyncio_sleep_with_pause_check,
     check_and_handle_pause,
+    CONST_NATIVE_INPUT_SETTER_JS,
     nodriver_check_checkbox,
     nodriver_force_check_checkbox,
     nodriver_check_modal_dialog_popup,
@@ -91,10 +93,11 @@ def _parse_remaining_seats(row_text):
     return int(candidate) if candidate.isdigit() else None
 
 
-# The only reply meaning the order reached the cart; anything else (bad or empty
-# captcha, no seat chosen) is a failure. An allowlist, since the exact
-# wrong-captcha wording is unknown.
-CONST_KHAM_CART_SUCCESS_KEYWORDS = ("加入購物車",)
+CONST_KHAM_CART_SUCCESS_PREFIX = "加入購物車完成"
+CONST_KHAM_CART_BUTTONS = (
+    'button[onclick="addShoppingCart();return false;"]',
+    '#addcart button.red',
+)
 
 
 def _is_cart_success_message(dialog_text):
@@ -105,7 +108,9 @@ def _is_cart_success_message(dialog_text):
     """
     if not dialog_text:
         return False
-    return any(kw in dialog_text for kw in CONST_KHAM_CART_SUCCESS_KEYWORDS)
+    text = dialog_text.strip()
+    prefix = CONST_KHAM_CART_SUCCESS_PREFIX
+    return text == prefix or any(text.startswith(prefix + mark) for mark in ("，", ",", "。", "！", "!"))
 
 
 # Module-level state (replaces global kham_dict)
@@ -155,14 +160,15 @@ async def nodriver_kham_login(tab, account, password, ocr=None, config_dict=None
 
     # Input password
     is_password_sent = False
+    is_password_ready = False
     if el_pass:
         try:
             inputed_text = await tab.evaluate('document.querySelector("table.login > tbody > tr > td > input[type=password]").value')
-            if not inputed_text or len(inputed_text) == 0:
+            if not inputed_text and password:
                 await el_pass.click()
-                if len(password) > 0:
-                    await el_pass.send_keys(password)
-                    is_password_sent = True
+                await el_pass.send_keys(password)
+                is_password_sent = True
+            is_password_ready = is_password_sent or bool(password and inputed_text == password)
         except Exception as exc:
             debug.log("Input password fail:", exc)
 
@@ -235,11 +241,21 @@ async def nodriver_kham_login(tab, account, password, ocr=None, config_dict=None
             debug.log("[KHAM LOGIN] Captcha processing exception:", exc)
 
     # Click login button
-    if is_password_sent:
+    if is_password_ready:
         try:
             # Wait a bit for captcha to be filled
             if is_captcha_sent:
                 await tab.sleep(0.3)
+
+            is_form_ready = await tab.evaluate('''
+                (() => {
+                    const captcha = document.querySelector('#CHK');
+                    return !captcha || captcha.getClientRects().length === 0 ||
+                        Boolean(captcha.value.trim() && captcha.value.trim() !== '驗證碼');
+                })()
+            ''')
+            if not is_form_ready:
+                return ret
 
             el_btn = await tab.query_selector('div.memberContent > p > a > button.red')
             if el_btn:
@@ -306,67 +322,101 @@ async def nodriver_kham_go_buy_redirect(tab, domain_name):
 
     return is_button_clicked
 
-async def nodriver_kham_check_realname_dialog(tab, config_dict):
-    """
-    Check and handle realname notification dialog
-    Reference: chrome_tixcraft.py kham_check_realname_dialog (line 9592-9621)
-    """
-    debug = util.create_debug_logger(config_dict)
-    is_realname_dialog_found = False
+async def _find_visible_kham_dialog(tab, matches):
+    messages = await tab.query_selector_all('div.ui-dialog > #dialog-message.ui-dialog-content')
+    for message in messages or []:
+        text = await message.apply('''el => {
+            const wrapper = el.closest('.ui-dialog');
+            return wrapper && wrapper.getClientRects().length
+                && getComputedStyle(wrapper).visibility === 'visible'
+                ? el.textContent.trim() : null;
+        }''')
+        if text and matches(text):
+            return message
+    return None
 
+
+async def _acknowledge_kham_dialog(message):
+    return await message.apply('''el => {
+        const wrapper = el.closest('.ui-dialog');
+        const button = wrapper?.querySelector('.ui-dialog-buttonset > button.ui-button');
+        if (!button || button.disabled || !button.getClientRects().length) return false;
+        button.click();
+        return true;
+    }''')
+
+
+CONST_KHAM_SOLD_OUT_NOTICE_PATHS = (
+    "/application/utk02/utk0201_000.aspx",
+    "/application/utk02/utk0201_001.aspx",
+)
+
+
+def _is_kham_sold_out_notice(text):
+    return text.strip().rstrip("!！。").rstrip() in (
+        "該票區已售完",
+        "該票區已售完，請選擇其它票區",
+        "該票區已售完，請選擇其他票區",
+    )
+
+
+def _register_kham_sold_out_alert(tab, config_dict):
+    event_type = cdp.page.JavascriptDialogOpening
+    previous = _state.get("sold_out_alert_callback")
+    if _state.get("sold_out_alert_tab") is tab and previous in tab.handlers.get(event_type, []):
+        return
+
+    async def handle_alert(event, *_unused):
+        if event.type_ != cdp.page.DialogType.ALERT or not _is_kham_sold_out_notice(event.message):
+            return
+        try:
+            page = urlsplit(event.url)
+            if (
+                page.scheme == "https"
+                and page.hostname == "kham.com.tw"
+                and page.port in (None, 443)
+                and page.path.lower() in CONST_KHAM_SOLD_OUT_NOTICE_PATHS
+                and not await check_and_handle_pause(config_dict)
+            ):
+                await tab.send(cdp.page.handle_java_script_dialog(accept=True))
+        except Exception:
+            util.create_debug_logger(config_dict).log("[KHAM] Native sold-out alert could not be dismissed")
+
+    tab.add_handler(event_type, handle_alert)
+    _state.update(sold_out_alert_tab=tab, sold_out_alert_callback=handle_alert)
+
+
+async def _close_kham_sold_out_notice(tab, config_dict):
     try:
-        el_message_text = await tab.evaluate('''
-            (function() {
-                const el = document.querySelector('div.ui-dialog > div#dialog-message.ui-dialog-content');
-                return el ? el.textContent : null;
-            })();
-        ''')
+        message = await _find_visible_kham_dialog(tab, _is_kham_sold_out_notice)
+        if message is None:
+            return False
+        # Recheck the text on the same element in case the site has changed
+        # the current dialog between reading it and clicking its button.
+        return await message.apply(r'''el => {
+            if (!/^該票區已售完(?:，請選擇其[它他]票區)?\s*[!！。]*$/.test(el.textContent.trim())) return false;
+            const wrapper = el.closest('.ui-dialog');
+            if (!wrapper || getComputedStyle(wrapper).visibility !== 'visible') return false;
+            const buttons = wrapper.querySelectorAll('.ui-dialog-buttonset > button.ui-button');
+            if (buttons.length !== 1) return false;
+            const button = buttons[0];
+            if (button.disabled || !button.getClientRects().length) return false;
+            button.click();
+            return true;
+        }''') is True
+    except Exception:
+        util.create_debug_logger(config_dict).log("[KHAM] Sold-out notice could not be dismissed")
+        return False
 
-        if el_message_text:
-            debug.log("Dialog message:", el_message_text)
 
-            # Check if it's realname notification
-            if "個人實名制入場" in el_message_text or "實名制" in el_message_text:
-                debug.log("Found realname dialog, clicking OK button...")
+async def nodriver_kham_check_realname_dialog(tab, config_dict):
+    try:
+        message = await _find_visible_kham_dialog(tab, lambda text: "實名制" in text)
+        return message is not None and await _acknowledge_kham_dialog(message) is True
+    except Exception:
+        util.create_debug_logger(config_dict).log("[KHAM] Real-name dialog could not be verified")
+        return False
 
-                # Click OK button using JavaScript for reliable jQuery UI event triggering
-                click_result = await tab.evaluate('''
-                    (function() {
-                        const btn = document.querySelector('div.ui-dialog-buttonset > button.ui-button');
-                        if (btn) {
-                            btn.click();
-                            return true;
-                        }
-                        return false;
-                    })();
-                ''')
-
-                if click_result:
-                    is_realname_dialog_found = True
-
-                    # Wait for dialog to close (jQuery UI dialog animation)
-                    await tab.sleep(0.5)
-
-                    # Verify dialog is closed to prevent infinite loop
-                    try:
-                        for _ in range(10):
-                            dialog_visible = await tab.evaluate('''
-                                (function() {
-                                    const dialog = document.querySelector('div.ui-dialog');
-                                    if (!dialog) return false;
-                                    const style = window.getComputedStyle(dialog);
-                                    return style.display !== 'none';
-                                })();
-                            ''')
-                            if not dialog_visible:
-                                break
-                            await tab.sleep(0.1)
-                    except:
-                        pass
-    except Exception as exc:
-        debug.log("Check realname dialog exception:", exc)
-
-    return is_realname_dialog_found
 
 async def nodriver_kham_allow_not_adjacent_seat(tab, config_dict):
     """
@@ -422,6 +472,157 @@ async def nodriver_kham_switch_to_auto_seat(tab):
 
     return is_switch_to_auto_seat
 
+async def _observe_kham_cart(tab, url, config_dict):
+    attempt = _state.get("kham_cart_attempt")
+    if not attempt:
+        return False
+    target_id = getattr(tab.target, "target_id", tab)
+    if attempt["target_id"] != target_id or attempt["url"] != url.split("#", 1)[0]:
+        _state.pop("kham_cart_attempt", None)
+        return False
+    now = time.monotonic()
+    if attempt["acknowledged"] or now < attempt["next_check"]:
+        return True
+
+    attempt["next_check"] = now + (0.15 if now < attempt["fast_until"] else 0.5)
+    debug = util.create_debug_logger(config_dict)
+    try:
+        message = await _find_visible_kham_dialog(tab, _is_cart_success_message)
+        if message is not None:
+            attempt["acknowledged"] = True
+            debug.log("[KHAM SUBMIT] Added to cart, waiting for checkout")
+            if config_dict["ocr_captcha"].get("force_submit"):
+                await _acknowledge_kham_dialog(message)
+    except Exception:
+        debug.log("[KHAM SUBMIT] Cart response unavailable, waiting for confirmation")
+    return True
+
+
+async def _submit_kham_cart(tab, config_dict, expected_url, *, selectors=CONST_KHAM_CART_BUTTONS):
+    ocr_settings = config_dict["ocr_captcha"]
+    if not (ocr_settings.get("enable") and ocr_settings.get("force_submit")):
+        return False
+    if await check_and_handle_pause(config_dict) or _state.get("kham_cart_attempt"):
+        return False
+
+    if tab.target.url != expected_url:
+        return False
+    for selector in selectors:
+        try:
+            button = await tab.query_selector(selector)
+            usable = button is not None and await button.apply(
+                "el => !el.matches(':disabled') && el.getClientRects().length > 0"
+            )
+        except Exception:
+            return False
+        if not usable:
+            continue
+        # Record the attempt before clicking. An exception does not establish
+        # whether the browser already sent the request.
+        if tab.target.url != expected_url or _state.get("kham_cart_attempt"):
+            return False
+        _state["kham_cart_attempt"] = {
+            "target_id": getattr(tab.target, "target_id", tab),
+            "url": expected_url.split("#", 1)[0],
+            "acknowledged": False,
+            "next_check": 0.0,
+            "fast_until": time.monotonic() + 1.0,
+        }
+        try:
+            await button.click()
+        except Exception:
+            util.create_debug_logger(config_dict).log(
+                "[KHAM SUBMIT] Click result unavailable, waiting for confirmation"
+            )
+        return True
+    return False
+
+
+async def _set_kham_ticket_quantity(tab, config_dict):
+    quantity = int(config_dict["ticket_number"])
+    if quantity < 1:
+        return False
+    if await check_and_handle_pause(config_dict):
+        return False
+
+    try:
+        controls = await tab.query_selector_all('input[id="AMOUNT"]')
+        candidates = []
+        occupied = []
+        for control in controls or []:
+            details = await control.apply('''el => {
+                if (el.matches(':disabled') || !el.getClientRects().length) return null;
+                const key = el.getAttribute('key');
+                return {
+                    name: key ? document.getElementById(key + '_NAME')?.value : null,
+                    quantity: Number(el.value)
+                };
+            }''')
+            if not isinstance(details, dict):
+                continue
+            if details["quantity"] != 0:
+                occupied.append(control)
+            if config_dict.get("keyword_exclude") and (
+                not details.get("name") or
+                util.reset_row_text_if_match_keyword_exclude(config_dict, details["name"])
+            ):
+                continue
+            candidates.append(control)
+
+        if occupied:
+            if len(occupied) != 1 or occupied[0] not in candidates:
+                return False
+            target = occupied[0]
+        elif candidates:
+            target = candidates[0]
+        else:
+            return False
+
+        result = await target.apply(f'''el => {{
+            {CONST_NATIVE_INPUT_SETTER_JS}
+            const quantity = {quantity};
+            if (Number(el.value) > quantity) return false;
+            const plus = el.nextElementSibling;
+            if (plus?.matches('button.plus, button[onclick*="opera1"][onclick*="true"]')) {{
+                while (Number(el.value) < quantity && !plus.matches(':disabled')) {{
+                    const before = Number(el.value);
+                    plus.click();
+                    if (Number(el.value) <= before) break;
+                }}
+            }} else if (Number(el.value) < quantity) {{
+                if (el.readOnly || !setNativeInputValue(el, String(quantity))) return false;
+            }}
+            return el.isConnected && el.checkValidity() && Number(el.value) === quantity;
+        }}''')
+        return result is True
+    except Exception:
+        util.create_debug_logger(config_dict).log("[KHAM TICKET] Ticket quantity could not be confirmed")
+        return False
+
+
+async def _handle_kham_quantity_page(tab, config_dict, ocr, model_name):
+    url = tab.target.url
+    if config_dict["advanced"].get("disable_adjacent_seat"):
+        await nodriver_kham_allow_not_adjacent_seat(tab, config_dict)
+    input_ready = config_dict["ocr_captcha"].get("enable") and await nodriver_kham_captcha(
+        tab, config_dict, ocr, model_name
+    )
+    if tab.target.url != url or not await _set_kham_ticket_quantity(tab, config_dict):
+        return
+    if not input_ready or not config_dict["ocr_captcha"].get("force_submit"):
+        return
+    try:
+        login_required = await tab.evaluate('''(() => {
+            const login = document.querySelector('#LOGIN_ID');
+            const password = document.querySelector('#LOGIN_PWD');
+            return Boolean(login?.getClientRects().length && password?.getClientRects().length);
+        })()''')
+    except Exception:
+        return
+    if login_required is False:
+        await _submit_kham_cart(tab, config_dict, url)
+
+
 async def _handle_post_submit_dialog(tab, config_dict):
     """
     After clicking submit, wait for dialog, classify as success/error/none.
@@ -454,7 +655,7 @@ async def _handle_post_submit_dialog(tab, config_dict):
             ''')
 
             if dialog_text is not None:
-                is_success = _is_cart_success_message(dialog_text)
+                is_success = "加入購物車" in dialog_text
 
                 el_btn = await tab.query_selector('div.ui-dialog-buttonset > button.ui-button')
                 if el_btn:
@@ -476,37 +677,17 @@ async def _handle_post_submit_dialog(tab, config_dict):
     return "none"
 
 async def nodriver_kham_check_captcha_text_error(tab, config_dict):
-    """
-    Check captcha error message dialog
-    Reference: chrome_tixcraft.py kham_check_captcha_text_error (line 9565-9590)
-    """
-    debug = util.create_debug_logger(config_dict)
-    is_reset_password_text = False
-
     try:
-        el_message_text = await tab.evaluate('''
-            (function() {
-                const el = document.querySelector('div.ui-dialog > div#dialog-message.ui-dialog-content');
-                return el ? el.textContent : null;
-            })();
-        ''')
+        message = await _find_visible_kham_dialog(
+            tab, lambda text: "驗證碼輸入錯誤" in text or "【驗證碼】輸入錯誤" in text
+        )
+        if message is not None and await _acknowledge_kham_dialog(message) is True:
+            await nodriver_kham_keyin_captcha_code(tab, "")
+            return True
+    except Exception:
+        util.create_debug_logger(config_dict).log("[KHAM] Verification error dialog could not be verified")
+    return False
 
-        if el_message_text:
-            debug.log("Dialog message:", el_message_text)
-
-            if "驗證碼輸入錯誤" in el_message_text or "【驗證碼】輸入錯誤" in el_message_text:
-                # Click OK button to dismiss dialog
-                el_btn = await tab.query_selector('div.ui-dialog-buttonset > button.ui-button')
-                if el_btn:
-                    await el_btn.click()
-                    is_reset_password_text = True
-
-                # Clear captcha input and wait for re-input
-                await nodriver_kham_keyin_captcha_code(tab, "")
-    except Exception as exc:
-        debug.log("Check captcha error exception:", exc)
-
-    return is_reset_password_text
 
 async def nodriver_kham_product(tab, domain_name, config_dict):
     """
@@ -520,13 +701,39 @@ async def nodriver_kham_product(tab, domain_name, config_dict):
     if not is_date_assign_by_bot:
         # Click "not on sale now" dialog button if exists
         try:
-            el_btn = await tab.query_selector('div.ui-dialog-buttonset > button.ui-button')
-            if el_btn:
-                await el_btn.click()
+            message = await _find_visible_kham_dialog(tab, lambda text: "尚未開賣" in text)
+            if message is not None:
+                await _acknowledge_kham_dialog(message)
         except:
             pass
 
     return is_date_assign_by_bot
+
+def _kham_keyword_groups(keyword):
+    """Read saved keyword groups or the plain-text form used by the CLI."""
+    if not keyword or keyword == '""':
+        return []
+    if '"' not in keyword and not keyword.startswith(('[', '{')):
+        groups = keyword.split(util.CONST_KEYWORD_DELIMITER)
+    else:
+        groups = util.parse_keyword_string_to_array(keyword)
+        if not groups:
+            return None
+
+    cleaned = []
+    for group in groups:
+        if isinstance(group, list) and all(isinstance(item, str) for item in group):
+            group = ' '.join(group)
+        if not isinstance(group, str) or not group.strip():
+            return None
+        cleaned.append(' '.join(group.split()))
+    return cleaned
+
+
+def _kham_keyword_group_matches(group, row_text):
+    row_text = util.format_keyword_string(row_text)
+    return util.is_text_match_keyword(json.dumps(group), row_text)
+
 
 async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
     """
@@ -536,11 +743,25 @@ async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
     """
     debug = util.create_debug_logger(config_dict)
 
-    # Wait for page to load
-    await tab.sleep(0.6)
-
     auto_select_mode = config_dict["date_auto_select"]["mode"]
     date_keyword = config_dict["date_auto_select"]["date_keyword"].strip()
+    keyword_groups = _kham_keyword_groups(date_keyword)
+    if keyword_groups is None:
+        debug.log("[KHAM DATE SELECT] Invalid date keywords")
+        return False
+
+    load_wait = 0.6
+    date_dom_ready = False
+    if domain_name == 'kham.com.tw':
+        try:
+            date_dom_ready = await tab.evaluate('''
+                (() => document.readyState !== 'loading' &&
+                       document.querySelector('table.eventTABLE > tbody > tr > td button') !== null)()
+            ''') is True
+        except Exception as exc:
+            debug.log("[KHAM DATE SELECT] Date list readiness check failed:", exc)
+    if not date_dom_ready:
+        await tab.sleep(load_wait)
     auto_reload_coming_soon_page_enable = (config_dict["tixcraft"]["auto_reload_coming_soon_page"]) and util.is_auto_refresh_enabled()
 
     # Feature 003: Safe access for conditional fallback switch
@@ -563,8 +784,8 @@ async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
         debug.log(f"query_selector_all error: {exc}")
 
     # Format area list with keyword filtering
-    formated_area_list = []
-    formated_area_list_text = []
+    available_rows = []
+    coming_soon_rows = []
 
     if area_list and len(area_list) > 0:
         for row in area_list:
@@ -574,15 +795,17 @@ async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
                 row_text = row_text.strip()
             except Exception as exc:
                 debug.log(f"get_html error: {exc}")
-                break
+                continue
 
             if not row_text or util.reset_row_text_if_match_keyword_exclude(config_dict, row_text):
                 continue
 
+            is_coming_soon = '尚未開賣' in row_html
+
             # Filter: exclude disabled buttons
             # Issue #188: Allow "尚未開賣" (coming soon) buttons even with CSS disabled class
             if ' disabled">' in row_html:
-                if '尚未開賣' not in row_html:
+                if not is_coming_soon:
                     continue
 
             # Filter: check if button exists (for kham/ticket)
@@ -621,176 +844,52 @@ async def nodriver_kham_date_auto_select(tab, domain_name, config_dict):
                             debug.log(f"Skipping row: all prices are disabled")
                             continue
 
-            formated_area_list.append(row)
-            formated_area_list_text.append(row_text)
-
-    if debug.enabled:
-        debug.log(f"Valid date rows count: {len(formated_area_list)}")
-        if formated_area_list and len(formated_area_list) > 0:
-            # Clean up whitespace for display
-            import re
-            display_text = re.sub(r'\s+', ' ', formated_area_list_text[0]).strip()
-            debug.log(f"First row text sample: {display_text[:80]}")
-
-    # Apply keyword matching (similar to TixCraft)
-    matched_blocks = None
-    if formated_area_list and len(formated_area_list) > 0:
-        if len(date_keyword) == 0:
-            matched_blocks = formated_area_list
-            debug.log(f"No keyword specified, using all {len(matched_blocks)} rows")
-        else:
-            # Match by keyword
-            matched_blocks = []
-            try:
-                import json
-                import re
-                keyword_array = json.loads("[" + date_keyword + "]")
-                debug.log(f"date_keyword array: {keyword_array}")
-
-                # Feature 003: Early return pattern - iterate keywords in priority order
-                target_row_found = False
-                keyword_matched_index = -1
-
-                for keyword_index, keyword_item_set in enumerate(keyword_array):
-                    debug.log(f"[KHAM DATE KEYWORD] Checking keyword #{keyword_index + 1}: {keyword_item_set}")
-
-                    # Check all rows for this keyword
-                    for i, row_text in enumerate(formated_area_list_text):
-                        normalized_row_text = re.sub(r'\s+', ' ', row_text)
-                        is_match = False
-
-                        if isinstance(keyword_item_set, str):
-                            # OR logic: single keyword
-                            normalized_keyword = re.sub(r'\s+', ' ', keyword_item_set)
-                            is_match = normalized_keyword in normalized_row_text
-                        elif isinstance(keyword_item_set, list):
-                            # AND logic: all keywords must match
-                            normalized_keywords = [re.sub(r'\s+', ' ', kw) for kw in keyword_item_set]
-                            match_results = [kw in normalized_row_text for kw in normalized_keywords]
-                            is_match = all(match_results)
-
-                        if is_match:
-                            # Keyword matched - IMMEDIATELY select and stop
-                            matched_blocks = [formated_area_list[i]]
-                            target_row_found = True
-                            keyword_matched_index = keyword_index
-                            if debug.enabled:
-                                debug.log(f"[KHAM DATE KEYWORD] Keyword #{keyword_index + 1} matched: '{keyword_item_set}'")
-                                # Clean up whitespace for display
-                                display_row_text = re.sub(r'\s+', ' ', row_text).strip()
-                                debug.log(f"[KHAM DATE SELECT] Selected date: {display_row_text[:80]} (keyword match)")
-                            break
-
-                    if target_row_found:
-                        # EARLY RETURN: Stop checking further keywords
-                        break
-
-                # All keywords failed log
-                if not target_row_found:
-                    debug.log(f"[KHAM DATE KEYWORD] All keywords failed to match")
-
-            except Exception as e:
-                debug.log(f"keyword parsing error: {e}")
-                matched_blocks = formated_area_list
-
-            if debug.enabled:
-                if matched_blocks:
-                    debug.log("After keyword match, found count:", len(matched_blocks))
-                else:
-                    debug.log("No matches found for keyword:", date_keyword)
-    else:
-        debug.log("No valid date rows found")
-
-    # Feature 003: Conditional fallback based on date_auto_fallback switch
-    if matched_blocks is not None and len(matched_blocks) == 0 and len(date_keyword) > 0:
-        if formated_area_list and len(formated_area_list) > 0:
-            if date_auto_fallback:
-                # Fallback enabled - use auto_select_mode
-                debug.log(f"[KHAM DATE FALLBACK] date_auto_fallback=true, triggering auto fallback")
-                debug.log(f"[KHAM DATE FALLBACK] Selecting available date based on date_select_order='{auto_select_mode}'")
-                matched_blocks = formated_area_list
+            if is_coming_soon:
+                coming_soon_rows.append(row_text)
             else:
-                # Fallback disabled - strict mode (no selection, will reload)
-                debug.log(f"[KHAM DATE FALLBACK] date_auto_fallback=false, fallback is disabled")
-                debug.log(f"[KHAM DATE SELECT] No date selected, will reload page and retry")
-                return False  # Return False to trigger reload logic in caller
+                available_rows.append((row, row_text))
 
-    # Handle case when formated_area_list is empty or None (all options excluded)
-    if formated_area_list is None or len(formated_area_list) == 0:
-        debug.log(f"[KHAM DATE FALLBACK] No available options after exclusion")
-        return False
+    candidates = [row for row, _ in available_rows]
+    if keyword_groups:
+        candidates = []
+        for group in keyword_groups:
+            candidates = [row for row, row_text in available_rows if _kham_keyword_group_matches(group, row_text)]
+            if candidates:
+                break
+        if not candidates and date_auto_fallback:
+            candidates = [row for row, _ in available_rows]
 
-    # Get target date using mode
-    target_row = util.get_target_item_from_matched_list(matched_blocks, auto_select_mode)
-
-    if debug.enabled:
-        if target_row:
-            # Get text for debug
-            try:
-                target_row_html = await target_row.get_html()
-                target_row_text = util.remove_html_tags(target_row_html)
-                # Clean up whitespace for display
-                import re
-                display_row_text = re.sub(r'\s+', ' ', target_row_text).strip()
-                debug.log(f"Target row selected (mode: {auto_select_mode}): {display_row_text[:80]}")
-            except:
-                debug.log(f"Target row selected (mode: {auto_select_mode})")
-        else:
-            debug.log(f"No target row selected from {len(matched_blocks) if matched_blocks else 0} matched blocks")
-
-    is_date_assign_by_bot = False
-    is_coming_soon = False
-
+    target_row = util.get_target_item_from_matched_list(candidates, auto_select_mode)
     if target_row:
-        # Issue #188: Check if target is "coming soon" button before clicking
         try:
-            target_row_html = await target_row.get_html()
-            if '尚未開賣' in target_row_html:
-                is_coming_soon = True
-                debug.log("[TICKET.COM] Coming soon button detected, skip clicking")
-        except:
-            pass
+            selector = 'div.goNext' if 'udnfunlife.com' in domain_name else 'button:not([disabled]):not(.disabled)'
+            button = await target_row.query_selector(selector)
+            if button:
+                await button.click()
+                return True
+        except Exception as exc:
+            debug.log("Click date button error:", exc)
 
-        if not is_coming_soon:
-            # Click the button in target row (similar to TixCraft)
-            try:
-                button_selector = 'button'
-                if 'udnfunlife.com' in domain_name:
-                    button_selector = 'div.goNext'
+    # Keep watching a matching upcoming date, even when other dates are on sale.
+    waiting_for_sale = any(
+        _kham_keyword_group_matches(group, row_text)
+        for group in keyword_groups for row_text in coming_soon_rows
+    )
+    if auto_reload_coming_soon_page_enable and (not available_rows or waiting_for_sale):
+        try:
+            reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.0)
+            reload_delay = reload_interval if reload_interval > 0 else 1.0
+            if date_dom_ready:
+                # Keep the original reload cadence when the initial load wait was skipped.
+                reload_delay += load_wait
+            await sleep_before_auto_refresh(reload_delay)
+            await reload_page_if_enabled(tab)
+            await sleep_before_auto_refresh(CONST_KHAM_RELOAD_SETTLE)
+        except Exception as exc:
+            debug.log("Auto reload exception:", exc)
 
-                btn = await target_row.query_selector(button_selector)
-                if btn:
-                    await btn.click()
-                    is_date_assign_by_bot = True
-                    debug.log("Date buy button clicked successfully")
-            except Exception as exc:
-                debug.log(f"Click button error: {exc}")
+    return False
 
-    # Auto reload if: no target found OR target is coming soon button
-    if not is_date_assign_by_bot and auto_reload_coming_soon_page_enable:
-        if is_coming_soon or formated_area_list is None or len(formated_area_list) == 0:
-            try:
-                if debug.enabled:
-                    if is_coming_soon:
-                        debug.log("[TICKET.COM] Waiting for sale time, will reload after delay...")
-                    else:
-                        debug.log("Date list empty, will auto reload after delay...")
-
-                # Wait before reload (use config interval)
-                reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.0)
-                if reload_interval > 0:
-                    await sleep_before_auto_refresh(reload_interval)
-                else:
-                    await tab.sleep(1.0)  # Default 1 second delay
-
-                await reload_page_if_enabled(tab)
-                await tab.sleep(0.5)  # Wait for page to start loading
-
-                debug.log("Page reloaded, waiting for content...")
-            except Exception as exc:
-                debug.log("Auto reload exception:", exc)
-
-    return is_date_assign_by_bot
 
 async def nodriver_kham_keyin_captcha_code(tab, answer="", auto_submit=False):
     """
@@ -905,13 +1004,14 @@ async def nodriver_kham_keyin_captcha_code(tab, answer="", auto_submit=False):
     return is_verifyCode_editing
 
 async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_keyword_item,
-                                         allow_fallback=True):
+                                         allow_fallback=True, *, table_cache=None):
     """
     Area/ticket type auto selection with table and dropdown support
     Reference: chrome_tixcraft.py kham_area_auto_select (line 8662-8925)
 
     allow_fallback=False keeps a missed keyword from falling back to any row,
     so a caller trying several keywords can defer the fallback to the last one.
+    table_cache reuses the same table snapshot between keywords in one pass.
     """
     # 函數開始時檢查暫停
     if await check_and_handle_pause(config_dict):
@@ -948,16 +1048,18 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
     # Try dropdown mode first using CDP DOM operations
     # Supports both ibon (id="PRICE") and ticket.com.tw (id="ctl00_ContentPlaceHolder1_PRICE")
     price_select = None
-    try:
-        # Try standard id="PRICE" first (ibon)
-        price_select = await tab.query_selector('select#PRICE')
-        if not price_select:
-            # Try ticket.com.tw selector
-            selects = await tab.query_selector_all('select[id$="_PRICE"]')
-            if selects and len(selects) > 0:
-                price_select = selects[0]
-    except Exception as exc:
-        debug.log(f"Error finding PRICE select: {exc}")
+    cached_rows = table_cache.get("rows") if table_cache is not None else None
+    if cached_rows is None:
+        try:
+            # Try standard id="PRICE" first (ibon)
+            price_select = await tab.query_selector('select#PRICE')
+            if not price_select:
+                # Try ticket.com.tw selector
+                selects = await tab.query_selector_all('select[id$="_PRICE"]')
+                if selects and len(selects) > 0:
+                    price_select = selects[0]
+        except Exception as exc:
+            debug.log(f"Error finding PRICE select: {exc}")
 
     # Handle dropdown mode using CDP
     if price_select:
@@ -991,7 +1093,8 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
                 except Exception as exc:
                     debug.log(f"Error processing option {i}: {exc}")
 
-            # Feature 003: Filter by keyword with early return pattern
+            # Keep every option that matches the current priority group so the
+            # configured selection mode can choose within that group.
             matched_options = []
             available_options = []  # Track all non-excluded options for fallback
 
@@ -1006,26 +1109,9 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
                 # Track available options for fallback
                 available_options.append(opt)
 
-                # Apply positive keyword matching with early return
-                if len(area_keyword_item) > 0:
-                    area_keyword_array = area_keyword_item.split(' ')
-                    row_text = util.format_keyword_string(option_text)
-                    is_match = True
-                    for keyword in area_keyword_array:
-                        formatted_keyword = util.format_keyword_string(keyword)
-                        if formatted_keyword not in row_text:
-                            is_match = False
-                            break
-                    if is_match:
-                        # EARLY RETURN: First match found
-                        matched_options.append(opt)
-                        is_keyword_matched = True  # True keyword match (not fallback)
-                        debug.log(f"[KHAM AREA KEYWORD] Keyword matched (dropdown): '{option_text}'")
-                        break  # Stop checking further options
-                else:
-                    # No positive keyword - match all (except excluded)
+                if not area_keyword_item or _kham_keyword_group_matches(area_keyword_item, option_text):
                     matched_options.append(opt)
-                    debug.log(f"[KHAM AREA SELECT] No keyword filter (dropdown): '{option_text}'")
+            is_keyword_matched = bool(area_keyword_item and matched_options)
 
             # Feature 003: Conditional fallback logic
             if len(matched_options) == 0 and len(area_keyword_item) > 0:
@@ -1149,6 +1235,10 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
     else:
         # Handle table mode - use DOM element operations (similar to date_auto_select)
         # Reference: chrome_tixcraft.py kham_area_auto_select (line 8781-8925)
+        recovery = None
+        if domain_name == 'kham.com.tw':
+            area_page_url = tab.target.url
+            recovery, _ = _kham_seat_recovery(tab)
 
         # Determine selector
         selector = "table#salesTable > tbody > tr[class='status_tr']"
@@ -1161,17 +1251,19 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
 
         # Get all area rows using query_selector_all
         area_list = None
-        try:
-            area_list = await tab.query_selector_all(selector)
-        except Exception as exc:
-            debug.log(f"query_selector_all error: {exc}")
+        if cached_rows is None:
+            try:
+                area_list = await tab.query_selector_all(selector)
+            except Exception as exc:
+                debug.log(f"query_selector_all error: {exc}")
 
         # Format area list with filtering
-        formated_area_list = []
-        formated_area_list_text = []
+        formated_area_list, formated_area_list_text = cached_rows if cached_rows is not None else ([], [])
 
         if area_list and len(area_list) > 0:
             for row in area_list:
+                if recovery is not None and (row.attrs or {}).get('id') in recovery['exhausted']:
+                    continue
                 try:
                     row_html = await row.get_html()
                     row_text = util.remove_html_tags(row_html)
@@ -1194,6 +1286,9 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
 
                 formated_area_list.append(row)
                 formated_area_list_text.append(row_text)
+
+        if table_cache is not None and area_list is not None:
+            table_cache["rows"] = (formated_area_list, formated_area_list_text)
 
         if debug.enabled:
             debug.log(f"Valid area rows count: {len(formated_area_list)}")
@@ -1220,47 +1315,18 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
             ticket_number = config_dict["ticket_number"]
             for i, row_text in enumerate(filtered_rows_text):
                 if 'udnfunlife' not in domain_name:
-                    if ticket_number > 1:
+                    if ticket_number > 1 or recovery is not None:
                         remaining = _parse_remaining_seats(row_text)
                         if remaining is not None and remaining < ticket_number:
                             continue
                 final_rows.append(filtered_rows[i])
                 final_rows_text.append(row_text)
 
-            # Feature 003: Match by keyword with early return pattern
-            matched_blocks = []
-            if len(area_keyword_item) > 0:
-                # Use keyword matching on text, but keep DOM elements
-                area_keyword_array = area_keyword_item.split(' ')
-                area_found = False
-
-                for i, row_text in enumerate(final_rows_text):
-                    formatted_row_text = util.format_keyword_string(row_text)
-                    is_match = True
-                    for keyword in area_keyword_array:
-                        formatted_keyword = util.format_keyword_string(keyword)
-                        if formatted_keyword not in formatted_row_text:
-                            is_match = False
-                            break
-                    if is_match:
-                        # EARLY RETURN: First match found
-                        matched_blocks.append(final_rows[i])
-                        area_found = True
-                        is_keyword_matched = True  # True keyword match (not fallback)
-                        if debug.enabled:
-                            # Clean up whitespace for display
-                            import re
-                            display_row_text = re.sub(r'\s+', ' ', row_text).strip()
-                            debug.log(f"[KHAM AREA KEYWORD] Keyword matched (table): {display_row_text[:60]}")
-                        break  # Stop checking further rows
-
-                # All keywords failed log
-                if not area_found:
-                    debug.log(f"[KHAM AREA KEYWORD] All keywords failed to match (table)")
-            else:
-                # No keyword filter - use all available rows
-                matched_blocks = final_rows
-                debug.log(f"[KHAM AREA SELECT] No keyword filter (table): using {len(final_rows)} available rows")
+            matched_blocks = [
+                row for row, row_text in zip(final_rows, final_rows_text)
+                if not area_keyword_item or _kham_keyword_group_matches(area_keyword_item, row_text)
+            ]
+            is_keyword_matched = bool(area_keyword_item and matched_blocks)
 
             if matched_blocks:
                 debug.log("Matched area blocks:", len(matched_blocks))
@@ -1299,8 +1365,12 @@ async def nodriver_kham_area_auto_select(tab, domain_name, config_dict, area_key
             # Click target row directly (like Chrome version line 8891)
             # For Kham, the entire row is clickable
             try:
+                if recovery is not None and tab.target.url != area_page_url:
+                    return False, False, False
                 debug.log(f"Clicking target area row...")
                 await target_row.click()
+                if recovery is not None:
+                    recovery['area_page_url'] = area_page_url
                 is_price_assign_by_bot = True
                 debug.log("Area row clicked successfully")
             except Exception as exc:
@@ -1446,6 +1516,136 @@ async def nodriver_kham_captcha(tab, config_dict, ocr, model_name):
 
     return is_captcha_sent
 
+async def _wait_for_kham_navigation_or_pause(tab, original_url, config_dict, timeout):
+    """Check the tab's cached URL without issuing any page requests."""
+    deadline = time.monotonic() + timeout
+    while tab.target.url == original_url:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if await asyncio_sleep_with_pause_check(min(0.1, remaining), config_dict):
+            return True
+    return True
+
+
+async def _check_kham_area_inventory(tab, config_dict, url, keyword_groups):
+    """Return the current document and preferred area IDs when tickets are found."""
+    page = urlsplit(url)
+    if page.path.lower() != "/application/utk02/utk0201_000.aspx":
+        return None
+
+    monitor = _state.get("kham_area_monitor")
+    target_id = getattr(tab.target, "target_id", tab)
+    if not monitor or (monitor["target_id"], monitor["url"]) != (target_id, url):
+        monitor = {"target_id": target_id, "url": url, "next_check": 0.0}
+        _state["kham_area_monitor"] = monitor
+
+    if time.monotonic() < monitor["next_check"]:
+        return None
+
+    try:
+        result = await tab.evaluate(f'''(async () => {{
+            const url = {json.dumps(url)};
+            if (location.href !== url) return null;
+            const response = await fetch(url, {{
+                method: 'GET', cache: 'no-store', credentials: 'same-origin',
+                mode: 'same-origin', redirect: 'manual', signal: AbortSignal.timeout(5000)
+            }});
+            if (!response.ok) return null;
+            const html = document.createElement('template');
+            html.innerHTML = await response.text();
+            const table = html.content.querySelector('table#salesTable');
+            if (!table) return null;
+            const rows = Array.from(table.querySelectorAll('tbody > tr.status_tr:not(.Soldout)')).map(row => [
+                row.id,
+                Array.from(row.cells, cell => cell.textContent.trim()).join(' '),
+                row.cells[row.cells.length - 1]?.textContent.trim() || ''
+            ]);
+            return {{documentId: performance.timeOrigin, rows}};
+        }})()''', await_promise=True, return_by_value=True)
+    except Exception:
+        result = None
+
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("rows"), list)
+        or not isinstance(result.get("documentId"), (int, float))
+    ):
+        # An unavailable response is not evidence that tickets are available.
+        return None
+
+    candidates = []
+    for area_id, text, availability in result["rows"]:
+        remaining = _parse_remaining_seats(availability)
+        if (
+            re.fullmatch(r"[A-Za-z0-9_-]+", area_id)
+            and remaining is not None
+            and remaining >= config_dict["ticket_number"]
+            and not util.reset_row_text_if_match_keyword_exclude(config_dict, text)
+        ):
+            candidates.append((area_id, text))
+    matches = candidates if not keyword_groups else []
+    for group in keyword_groups:
+        matches = [(area_id, text) for area_id, text in candidates if _kham_keyword_group_matches(group, text)]
+        if matches:
+            break
+    if not matches and config_dict.get("area_auto_fallback", False):
+        matches = candidates
+    target = util.get_target_item_from_matched_list(matches, config_dict["area_auto_select"]["mode"])
+    return (result["documentId"], target[0]) if target else None
+
+
+async def _wait_for_kham_area_document(tab, url, previous_document, config_dict):
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and tab.target.url == url:
+        if await check_and_handle_pause(config_dict) or not util.is_auto_refresh_enabled():
+            return False
+        try:
+            ready = await tab.evaluate(f'''(() =>
+                performance.timeOrigin !== {json.dumps(previous_document)}
+                && document.readyState !== 'loading'
+                && (!window.jQuery || window.jQuery.isReady)
+                && Boolean(document.querySelector('table#salesTable'))
+            )()''')
+            if ready is True:
+                return True
+        except Exception:
+            # The old execution context may be destroyed during navigation.
+            pass
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def _click_kham_area_by_id(tab, url, area_id, config_dict):
+    if tab.target.url != url or await check_and_handle_pause(config_dict):
+        return False
+    try:
+        row = await tab.query_selector(f'table#salesTable > tbody > tr.status_tr:not(.Soldout)[id="{area_id}"]')
+        if row is None:
+            return False
+        details = await row.apply('''el => {
+            if (!el.getClientRects().length || el.classList.contains('Soldout')) return null;
+            const cells = Array.from(el.cells, cell => cell.textContent.trim());
+            return {text: cells.join(' '), availability: cells.at(-1) || ''};
+        }''')
+        if not details:
+            return False
+        remaining = _parse_remaining_seats(details["availability"])
+        if (
+            remaining is None
+            or remaining < config_dict["ticket_number"]
+            or util.reset_row_text_if_match_keyword_exclude(config_dict, details["text"])
+            or tab.target.url != url
+        ):
+            return False
+        await row.click()
+        recovery, _ = _kham_seat_recovery(tab)
+        recovery["area_page_url"] = url
+        return True
+    except Exception:
+        return False
+
+
 async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_name):
     """
     Performance page processing - integrate area selection, captcha, and ticket number
@@ -1466,13 +1666,26 @@ async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_na
     # top.location.href to the next page, and we use this baseline below to detect
     # that navigation.
     pre_select_url = tab.target.url
+    monitor = _state.get("kham_area_monitor", {})
+    if (
+        domain_name == "kham.com.tw"
+        and monitor.get("url") == pre_select_url
+        and monitor.get("target_id") == getattr(tab.target, "target_id", tab)
+        and time.monotonic() < monitor.get("click_until", 0.0)
+    ):
+        return False, False
 
-    if len(area_keyword) > 0:
-        # Parse JSON array keyword
-        area_keyword_array = util.parse_keyword_string_to_array(area_keyword)
+    area_keyword_array = _kham_keyword_groups(area_keyword)
+    if area_keyword_array is None:
+        debug.log("[KHAM AREA SELECT] Invalid area keywords")
+        return False, False
 
+    if area_keyword_array:
         # Feature 003: Enhanced fallback logic with early return
+        cache_options = {"table_cache": {}} if domain_name == "kham.com.tw" and len(area_keyword_array) > 1 else {}
         for keyword_index, area_keyword_item in enumerate(area_keyword_array):
+            if tab.target.url != pre_select_url:
+                return False, False
             is_last_keyword = (keyword_index == len(area_keyword_array) - 1)
 
             # Fallback only on the last keyword: a fallback clicks a row and
@@ -1480,7 +1693,7 @@ async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_na
             # area before the later keywords were ever tried.
             is_need_refresh, is_price_assign_by_bot, is_keyword_matched = await nodriver_kham_area_auto_select(
                 tab, domain_name, config_dict, area_keyword_item,
-                allow_fallback=is_last_keyword
+                allow_fallback=is_last_keyword, **cache_options
             )
 
             # Case 1: True keyword match - stop trying
@@ -1524,16 +1737,44 @@ async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_na
 
     if is_need_refresh:
         debug.log("is_need_refresh:", is_need_refresh)
-        # Stage 5: area sold out / keyword not matched -> reload and retry.
-        try:
-            await reload_page_if_enabled(tab)
-        except Exception as exc:
-            debug.log("Area reload exception:", exc)
-        # Wait AFTER the reload: a DOM read before the new document parses sees
-        # zero area rows and reloads forever. The same wait throttles the refresh
-        # rate (#322); the settle floor applies even when the interval is 0.
-        reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.0)
-        await sleep_before_auto_refresh(max(reload_interval, CONST_KHAM_RELOAD_SETTLE))
+        if not util.is_auto_refresh_enabled() or await check_and_handle_pause(config_dict):
+            return is_price_assign_by_bot, False
+        if tab.target.url != pre_select_url:
+            return is_price_assign_by_bot, False
+
+        use_background_check = (
+            domain_name == "kham.com.tw"
+            and urlsplit(pre_select_url).path.lower() == "/application/utk02/utk0201_000.aspx"
+        )
+        inventory_match = None
+        if use_background_check:
+            inventory_match = await _check_kham_area_inventory(tab, config_dict, pre_select_url, area_keyword_array)
+        interval = max(config_dict["advanced"].get("auto_reload_page_interval", 0.0), CONST_KHAM_RELOAD_SETTLE)
+        reloaded = False
+        if (
+            (inventory_match is not None or not use_background_check)
+            and tab.target.url == pre_select_url
+            and not await check_and_handle_pause(config_dict)
+        ):
+            try:
+                reloaded = await reload_page_if_enabled(tab)
+            except Exception as exc:
+                debug.log("Area reload exception:", exc)
+        area_ready = False
+        if reloaded and inventory_match is not None:
+            previous_document, area_id = inventory_match
+            _state["kham_area_monitor"]["next_check"] = time.monotonic() + interval
+            area_ready = await _wait_for_kham_area_document(tab, pre_select_url, previous_document, config_dict)
+        if not area_ready:
+            await sleep_before_auto_refresh(interval)
+        if reloaded and domain_name == 'kham.com.tw' and tab.target.url == pre_select_url:
+            # A new area-list pass can consider seats that have since opened up.
+            recovery, _ = _kham_seat_recovery(tab)
+            recovery['exhausted'].clear()
+            recovery['refreshed'].clear()
+        if area_ready and await _click_kham_area_by_id(tab, pre_select_url, area_id, config_dict):
+            _state["kham_area_monitor"]["click_until"] = time.monotonic() + 6.0
+            return True, False
         # The page is reloading and the current DOM is stale, so skip the
         # captcha/submit attempt this round. Returning is_captcha_sent=False
         # makes the caller skip the add-to-cart submit (avoids the wasted
@@ -1547,7 +1788,10 @@ async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_na
     # "please choose a seat" error and wastes an OCR + submit + retry round.
     # UDN keeps its seat map on the same UTK0204 page (no navigation) and skips
     # captcha entirely, so it is excluded and its flow stays unchanged.
-    if is_price_assign_by_bot and 'udnfunlife' not in domain_name:
+    if is_price_assign_by_bot and domain_name == 'kham.com.tw':
+        if await _wait_for_kham_navigation_or_pause(tab, pre_select_url, config_dict, 3.0):
+            return is_price_assign_by_bot, False
+    elif is_price_assign_by_bot and 'udnfunlife' not in domain_name:
         for _ in range(6):  # up to ~3s; exits as soon as the navigation is seen
             if tab.target.url != pre_select_url:
                 debug.log("[KHAM PERFORMANCE] Area click navigated to next page; handing off to main loop")
@@ -1555,7 +1799,9 @@ async def nodriver_kham_performance(tab, config_dict, ocr, domain_name, model_na
             await tab.sleep(0.5)
 
     # udn uses reCaptcha, skip for now
-    if 'udnfunlife' not in domain_name:
+    if 'udnfunlife' not in domain_name and (
+        domain_name != "kham.com.tw" or config_dict["ocr_captcha"].get("enable")
+    ):
         is_captcha_sent = await nodriver_kham_captcha(tab, config_dict, ocr, model_name)
 
     return is_price_assign_by_bot, is_captcha_sent
@@ -1567,16 +1813,50 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
     """
     # 函數開始時檢查暫停
     if await check_and_handle_pause(config_dict):
-        return False
-    if not _state:
-        _state.update({
-            "is_popup_checkout": False,
-            "played_sound_order": False,
-            "shown_checkout_message": False,
-            "udn_quick_buy_submitted": False,
-        })
+        return tab
 
-    domain_name = url.split('/')[2]
+    page = urlsplit(url)
+    domain_name = page.hostname or ""
+    page_path = page.path.lower()
+    if page_path != "/application/utk02/utk0201_000.aspx":
+        _state.pop("kham_area_monitor", None)
+    page_name = page_path.rsplit('/', 1)[-1]
+    query_params = {key.lower(): values for key, values in parse_qs(page.query).items()}
+    if domain_name == "kham.com.tw" and page_path in CONST_KHAM_SOLD_OUT_NOTICE_PATHS:
+        _register_kham_sold_out_alert(tab, config_dict)
+        if await _close_kham_sold_out_notice(tab, config_dict):
+            monitor = _state.get("kham_area_monitor")
+            if monitor is not None and monitor["url"] == url:
+                monitor.pop("click_until", None)
+            return tab
+    if await _observe_kham_cart(tab, url, config_dict):
+        return tab
+    platform_name = {
+        'kham.com.tw': 'KHAM',
+        'ticket.com.tw': '年代售票',
+        'tickets.udnfunlife.com': 'UDN售票',
+    }.get(domain_name)
+    if page.scheme == 'https' and platform_name and page_path == '/application/utk02/utk0206_.aspx':
+        _state["udn_quick_buy_submitted"] = False
+        checkout_key = (domain_name, page_path, page.query)
+        if _state.get("checkout_url") != checkout_key:
+            _state["checkout_url"] = checkout_key
+            message = f"[{platform_name}] 已進入結帳頁，請手動確認資料與付款。"
+            print(message)
+            advanced = dict(config_dict.get('advanced', {}))
+            notification_config = dict(config_dict, advanced=advanced)
+            for key in ('discord_message', 'telegram_message'):
+                custom_message = advanced.get(key, '').strip()
+                advanced[key] = message + ('\n' + custom_message if custom_message else '')
+            if advanced.get('play_sound', {}).get('order'):
+                play_sound_while_ordering(config_dict)
+            send_discord_notification(notification_config, 'order', platform_name)
+            send_telegram_notification(notification_config, 'order', platform_name)
+            if advanced.get('headless'):
+                webbrowser.open_new(url)
+        return tab
+
+    _state.pop("checkout_url", None)
     debug = util.create_debug_logger(config_dict)
 
     # Home page handling
@@ -1749,14 +2029,9 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
 
     # KHAM UTK0205 seat selection page (graphical seat map with ticket type buttons)
     # Reference: ticket.com.tw logic (line 13561) adapted for KHAM
-    if "kham.com.tw" in url and 'utk0205' in url.lower():
+    if domain_name == "kham.com.tw" and page_path == '/application/utk02/utk0205_.aspx':
         debug.log("Detected KHAM UTK0205 seat selection page")
-
-        is_seat_selection_success = await nodriver_kham_seat_main(tab, config_dict, ocr, domain_name)
-
-        debug.log(f"KHAM seat selection result: {is_seat_selection_success}")
-
-        # Return to avoid double processing by UTK0202/UTK0205 logic below
+        await nodriver_kham_seat_main(tab, config_dict, ocr, domain_name)
         return tab
 
     # UDN UTK0205 seat selection page (Feature 010: UDN seat auto select)
@@ -1777,7 +2052,7 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
 
     # Activity Group page (UTK0201_040.aspx?AGID=)
     # This is a special page format for activity groups with realname requirements
-    if 'utk0201_040.aspx?agid=' in url.lower():
+    if page_path == '/application/utk02/utk0201_040.aspx' and 'agid' in query_params:
         debug.log("Detected KHAM Activity Group page (UTK0201_040)")
 
         # Check realname dialog
@@ -1796,7 +2071,8 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
     # and clicked buttons[0], ignoring both selection mode and keyword_exclude.
     # Reuse date_auto_select, which filters eventTABLE rows (keyword_exclude),
     # applies the selection mode, and clicks the button inside the chosen row.
-    if 'utk0201_041.aspx?agid=' in url.lower():
+    if (page_path == '/application/utk02/utk0201_041.aspx' and 'agid' in query_params
+            and config_dict["date_auto_select"]["enable"]):
         debug.log("Detected KHAM Activity Group Item page (UTK0201_041)")
 
         # Check realname dialog first
@@ -1805,25 +2081,47 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
         # Stage 4: select the correct performance row (keyword_exclude + mode aware)
         await nodriver_kham_date_auto_select(tab, domain_name, config_dict)
 
+    # KHAM computer seating (UTK0201_001) and older quantity/voucher pages.
+    if (
+        domain_name == "kham.com.tw"
+        and "performance_id" in query_params
+        and page_path.startswith("/application/utk02/")
+    ):
+        computer_seating = page_name == "utk0201_001.aspx" and "performance_price_area_id" in query_params
+        older_quantity = (
+            page_name.startswith("utk0202") and page_name.endswith(".aspx")
+            and bool(query_params.keys() & {"performance_price_area_id", "activity_group_id"})
+        )
+        if computer_seating or older_quantity:
+            await _handle_kham_quantity_page(tab, config_dict, ocr, page_name[:7].upper())
+            return tab
+
     # Product page (UTK0201_.aspx?product_id=)
-    if 'utk0201_.aspx?product_id=' in url.lower():
-        is_event_page = len(url.split('/')) == 6
+    if page_name == 'utk0201_.aspx' and 'product_id' in query_params:
+        is_event_page = page_path == '/application/utk02/utk0201_.aspx'
 
         if is_event_page:
             # Check realname dialog
             await nodriver_kham_check_realname_dialog(tab, config_dict)
 
             # Click buy button
-            await nodriver_kham_go_buy_redirect(tab, domain_name)
-            await tab.sleep(1.0)
+            clicked_buy = await nodriver_kham_go_buy_redirect(tab, domain_name)
+            if domain_name == "kham.com.tw":
+                if clicked_buy and await _wait_for_kham_navigation_or_pause(tab, url, config_dict, 1.0):
+                    return tab
+            else:
+                await tab.sleep(1.0)
 
             # Check if page changed after clicking buy button
             current_url = tab.target.url
-            if 'utk0201_.aspx?product_id=' in current_url.lower():
+            if current_url == url:
                 # Still on product page - check realname dialog and handle captcha
                 await nodriver_kham_check_realname_dialog(tab, config_dict)
 
                 # Handle captcha if enabled
+                if domain_name == "kham.com.tw":
+                    await _handle_kham_quantity_page(tab, config_dict, ocr, "UTK0201")
+                    return tab
                 is_captcha_sent = False
                 if config_dict["ocr_captcha"]["enable"]:
                     debug.log("Starting captcha processing for purchase page...")
@@ -1865,11 +2163,9 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
                         pass
 
     # Date selection page (UTK0201_00.aspx?product_id=)
-    if 'utk0201_00.aspx?product_id=' in url.lower():
-        is_event_page = len(url.split('/')) == 6
-
-        if is_event_page and config_dict["date_auto_select"]["enable"]:
-            await nodriver_kham_product(tab, domain_name, config_dict)
+    if (page_path == '/application/utk02/utk0201_00.aspx' and 'product_id' in query_params
+            and config_dict["date_auto_select"]["enable"]):
+        await nodriver_kham_product(tab, domain_name, config_dict)
 
     # UDN specific handling
     if 'udnfunlife' in domain_name:
@@ -2410,7 +2706,10 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
         # activity_group_id) as the UTK0202 voucher page below. Distinguish by
         # FILE NAME, not activity_group_id: anything that is not UTK0202 is an
         # area page (salesTable) and must run the area + sold-out handler.
-        if '.aspx?performance_id=' in url.lower() and 'product_id=' in url.lower() and 'utk0202' not in url.lower():
+        if (page_path.startswith('/application/utk02/') and page_name.endswith('.aspx')
+                and not page_name.startswith(('utk0202', 'utk0205'))
+                and {'performance_id', 'product_id'} <= query_params.keys()
+                and 'performance_price_area_id' not in query_params):
             model_name = url.split('/')[5] if len(url.split('/')) > 5 else "UTK0204"
             if len(model_name) > 7:
                 model_name = model_name[:7]
@@ -2425,15 +2724,8 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
                     await nodriver_kham_captcha(tab, config_dict, ocr, model_name)
 
             # Close dialog buttons (ticket.com.tw uses retry mechanism)
-            if "ticket.com.tw" in url:
+            if domain_name == "ticket.com.tw":
                 await nodriver_ticket_close_dialog_with_retry(tab, config_dict)
-            else:
-                try:
-                    el_btn = await tab.query_selector('div.ui-dialog-buttonset > button.ui-button')
-                    if el_btn:
-                        await el_btn.click()
-                except:
-                    pass
 
             if config_dict["area_auto_select"]["enable"]:
                 # Switch to auto seat
@@ -2466,6 +2758,14 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
                 is_price_assign_by_bot, is_captcha_sent = await nodriver_kham_performance(
                     tab, config_dict, ocr, domain_name, model_name
                 )
+
+                if domain_name == "kham.com.tw":
+                    if tab.target.url == url and await _set_kham_ticket_quantity(tab, config_dict):
+                        if config_dict["advanced"].get("disable_adjacent_seat"):
+                            await nodriver_kham_allow_not_adjacent_seat(tab, config_dict)
+                        if is_captcha_sent:
+                            await _submit_kham_cart(tab, config_dict, url)
+                    return tab
 
                 # Set ticket number
                 if "ticket.com.tw" in url:
@@ -2580,7 +2880,7 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
         # Issue #357: must match the UTK0202 file name explicitly, otherwise the
         # physical-ticket UTK0201_000 area page (identical query string) is
         # wrongly treated as a captcha page and spins forever on empty OCR.
-        if 'utk0202' in url.lower() and '.aspx?performance_id=' in url.lower() and 'activity_group_id=' in url.lower():
+        if domain_name != "kham.com.tw" and 'utk0202' in url.lower() and '.aspx?performance_id=' in url.lower() and 'activity_group_id=' in url.lower():
             model_name = url.split('/')[5] if len(url.split('/')) > 5 else "UTK0202"
             if len(model_name) > 7:
                 model_name = model_name[:7]
@@ -2663,7 +2963,7 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
         # UTK0202/UTK0205 page - Ticket number selection page
         # URL: UTK0202_.aspx?PERFORMANCE_ID=xxx&PERFORMANCE_PRICE_AREA_ID=xxx
         # Reference: chrome_tixcraft.py line 9895-9941
-        if '.aspx?performance_id=' in url.lower() and 'performance_price_area_id=' in url.lower():
+        if domain_name != "kham.com.tw" and '.aspx?performance_id=' in url.lower() and 'performance_price_area_id=' in url.lower():
             model_name = url.split('/')[5] if len(url.split('/')) > 5 else "UTK0202"
             if len(model_name) > 7:
                 model_name = model_name[:7]
@@ -2981,7 +3281,11 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
                             traceback.print_exc()
 
         # Login page handling (UTK1306)
-        if '/utk13/utk1306_.aspx' in url.lower():
+        if (
+            page.scheme == 'https'
+            and domain_name in {'kham.com.tw', 'ticket.com.tw'}
+            and page_path == '/application/utk13/utk1306_.aspx'
+        ):
             # Close dialog buttons
             try:
                 el_btn = await tab.query_selector('div.ui-dialog-buttonset > button.ui-button')
@@ -2991,61 +3295,22 @@ async def nodriver_kham_main(tab, url, config_dict, ocr):
                 pass
 
             if config_dict["ocr_captcha"]["enable"]:
-                model_name = url.split('/')[5] if len(url.split('/')) > 5 else "UTK1306"
-                if len(model_name) > 7:
-                    model_name = model_name[:7]
-
-                # Handle captcha
-                await nodriver_kham_captcha(tab, config_dict, ocr, model_name)
-
-                # UDN login (Feature 010: uses same UTK backend as KHAM)
-                if 'udnfunlife' in domain_name:
-                    udn_account = config_dict["accounts"]["udn_account"]
-                    udn_password = config_dict["accounts"]["udn_password"].strip()
-                    if len(udn_account) > 4:
-                        debug.log(f"[UDN LOGIN] Attempting login with account: {udn_account[:3]}***")
-                        await nodriver_kham_login(tab, udn_account, udn_password, ocr, config_dict=config_dict)
-
-                # Kham login
-                kham_account = config_dict["accounts"]["kham_account"]
-                kham_password = config_dict["accounts"]["kham_password"].strip()
-                if len(kham_account) > 4:
-                    await nodriver_kham_login(tab, kham_account, kham_password, ocr, config_dict=config_dict)
-
-                # Ticket.com.tw login
-                ticket_account = config_dict["accounts"]["ticket_account"]
-                ticket_password = config_dict["accounts"]["ticket_password"].strip()
-                if len(ticket_account) > 4:
-                    # Use dedicated ticket login function (different selectors)
-                    await nodriver_ticket_login(tab, ticket_account, ticket_password, config_dict)
-
-    # Check if reached checkout page (ticket purchase successful)
-    if '/utk02/utk0206_.aspx' in url.lower():
-        # Reset quick buy flag since we've reached checkout
-        _state["udn_quick_buy_submitted"] = False
-
-        # Show success message (only once)
-        if debug.enabled:
-            if not _state["shown_checkout_message"]:
-                debug.log("[SUCCESS] Reached checkout page - ticket purchase successful!")
-        _state["shown_checkout_message"] = True
-
-        # Play sound notification (only once)
-        if not _state["played_sound_order"]:
-            if config_dict["advanced"]["play_sound"]["order"]:
-                play_sound_while_ordering(config_dict)
-            send_discord_notification(config_dict, "order", "KHAM")
-            send_telegram_notification(config_dict, "order", "KHAM")
-        _state["played_sound_order"] = True
-
-        # If headless mode, open browser to show checkout page (only once)
-        if config_dict["advanced"]["headless"]:
-            if not _state["is_popup_checkout"]:
-                import webbrowser
-                checkout_url = url
-                print(f"搶票成功，請前往該帳號訂單查看: {checkout_url}")
-                webbrowser.open_new(checkout_url)
-                _state["is_popup_checkout"] = True
+                account_prefix = 'kham' if domain_name == 'kham.com.tw' else 'ticket'
+                accounts = config_dict.get('accounts', {})
+                account = accounts.get(f'{account_prefix}_account', '').strip()
+                password = accounts.get(f'{account_prefix}_password', '')
+                if account and password:
+                    await nodriver_kham_captcha(tab, config_dict, ocr, 'UTK1306')
+                    live_page = urlsplit(tab.target.url)
+                    if (
+                        live_page.scheme == page.scheme
+                        and live_page.netloc.lower() == page.netloc.lower()
+                        and live_page.path.lower() == page_path
+                    ):
+                        if account_prefix == 'kham':
+                            await nodriver_kham_login(tab, account, password, ocr, config_dict=config_dict)
+                        else:
+                            await nodriver_ticket_login(tab, account, password, config_dict)
 
     return tab
 
@@ -3466,516 +3731,162 @@ async def nodriver_kham_seat_type_auto_select(tab, config_dict, area_keyword_ite
     return is_seat_type_assigned
 
 async def nodriver_kham_seat_auto_select(tab, config_dict):
-    """
-    寬宏售票 - 自動選擇座位，優化策略：舞台方向智慧選座
-    HTML structure:
-    - Stage direction: <div class="stageDirection topright/topleft/downright/downleft/top/down/left/right">
-    - Available seats: <table id="TBL"><td class="empty up/down/left/right" title="2樓黃2D區-3排-14號">
-    - Sold seats: <td class="people up/down/left/right">
-
-    舞台方向邏輯：
-    - up: 排數越小越前，每排選中間座位
-    - down: 排數越大越前，每排選中間座位
-    - left: 座位號越小越前，每列選中間排
-    - right: 座位號越大越前，每列選中間排
-    - topright/topleft/downright/downleft: 組合方向，優先處理主要方向
-    """
-    is_seat_assigned = False
+    """Select exactly the requested seats after checking the map's layout."""
+    debug = util.create_debug_logger(config_dict)
     ticket_number = config_dict["ticket_number"]
     allow_non_adjacent = config_dict["advanced"]["disable_adjacent_seat"]
-    show_debug = config_dict["advanced"].get("verbose", False)
-    debug = util.create_debug_logger(enabled=show_debug)
 
     try:
-        # 使用純 JavaScript 執行全部邏輯：偵測方向 -> 分組 -> 排序 -> 選擇 -> 點擊
-        import json
-        result = await tab.evaluate(f'''
-            (function() {{
-                const ticketNumber = {ticket_number};
+        result = await tab.evaluate(rf'''
+            (() => {{
+                const count = {json.dumps(ticket_number)};
                 const allowNonAdjacent = {json.dumps(allow_non_adjacent)};
-                const showDebug = {json.dumps(show_debug)};
+                const selectedMarker = 'td[style*="icon_chair_select"]';
+                const selectedCount = () => document.querySelectorAll('#TBL ' + selectedMarker).length;
+                if (!Number.isInteger(count) || count < 1 || selectedCount() !== 0) return false;
 
-                // Step 0: Detect stage direction
-                const stageDiv = document.querySelector('.stageDirection');
-                let stageDirection = 'up'; // default: stage at top
-                if (stageDiv) {{
-                    const classList = stageDiv.classList;
-                    if (classList.contains('topright')) stageDirection = 'up';       // topright -> up (主要方向)
-                    else if (classList.contains('topleft')) stageDirection = 'up';   // topleft -> up (主要方向)
-                    else if (classList.contains('downright')) stageDirection = 'down';
-                    else if (classList.contains('downleft')) stageDirection = 'down';
-                    else if (classList.contains('top')) stageDirection = 'up';
-                    else if (classList.contains('down')) stageDirection = 'down';
-                    else if (classList.contains('left')) stageDirection = 'left';
-                    else if (classList.contains('right')) stageDirection = 'right';
+                const stage = document.querySelector('.stageDirection')?.classList;
+                const sideStage = stage?.contains('left') || stage?.contains('right');
+                const reversed = stage?.contains('right') || stage?.contains('down') ||
+                    stage?.contains('downleft') || stage?.contains('downright');
+                const direction = reversed ? -1 : 1;
+                const rows = Array.from(document.querySelectorAll('table#TBL tr'));
+                const available = [];
+                const adjacent = [];
+
+                function compare(a, b) {{
+                    if (sideStage) return (a.column - b.column) * direction || a.row - b.row;
+                    return (a.rowOrder - b.rowOrder) * direction || a.centerOffset - b.centerOffset;
                 }}
 
-                if (showDebug) {{
-                    console.log('[KHAM SEAT] Stage direction: ' + stageDirection);
-                }}
+                for (const [row, tr] of rows.entries()) {{
+                    let column = 0;
+                    const seats = [];
+                    for (const cell of tr.cells) {{
+                        const position = column;
+                        column += cell.colSpan || 1;
+                        if (!cell.classList.contains('empty') || cell.colSpan > 1) continue;
 
-                // Row labels seen on kham: "17排", "H排", and "B31排" (a letter
-                // prefix on a numbered row, 6樓包廂 at 台北國際會議中心). Letter-only and
-                // number-only rows keep their old values (H -> 8, 17 -> 17); a
-                // prefixed row sorts as a block per letter (B31 -> 2031).
-                function parseRowNum(rowText) {{
-                    const m = rowText.match(/([A-Z]*)(\d*)排/);
-                    if (!m || (!m[1] && !m[2])) return NaN;
-                    let letters = 0;
-                    for (let i = 0; i < m[1].length; i++) {{
-                        letters = letters * 26 + (m[1].charCodeAt(i) - 64);
-                    }}
-                    return m[2] ? letters * 1000 + parseInt(m[2]) : letters;
-                }}
-
-                // Step 1: Find all available seats with REAL DOM positions
-                // Important: Use real TD column index, not filtered array index
-                // This correctly handles spacer TDs (<td>&nbsp;</td>) that represent aisles/separators
-                const allTableRows = document.querySelectorAll('table#TBL tr');
-                let totalAvailableSeats = 0;
-
-                // First pass: count available seats
-                Array.from(allTableRows).forEach(tr => {{
-                    const allTds = tr.children;
-                    for (let colIndex = 0; colIndex < allTds.length; colIndex++) {{
-                        if (allTds[colIndex].classList.contains('empty')) {{
-                            totalAvailableSeats++;
+                        // KHAM uses numeric, letter-only and prefixed row labels.
+                        const label = (cell.getAttribute('title') || '').trim().match(/^(.+)-([A-Z]*)(\d*)排-\d+號$/i);
+                        if (!label || (!label[2] && !label[3])) continue;
+                        let rowOrder = 0;
+                        for (const letter of label[2].toUpperCase()) {{
+                            rowOrder = rowOrder * 26 + letter.charCodeAt(0) - 64;
                         }}
-                    }}
-                }});
-
-                if (showDebug) {{
-                    console.log('[KHAM SEAT] Found ' + totalAvailableSeats + ' available seats');
-                }}
-
-                if (totalAvailableSeats < ticketNumber) {{
-                    return {{ success: false, found: totalAvailableSeats, selected: 0, direction: stageDirection }};
-                }}
-
-                const selectedSeats = [];
-                let usedFallback = false;
-
-                // Step 2-4: Group, sort and select based on stage direction
-                if (stageDirection === 'up' || stageDirection === 'down') {{
-                    // GROUP BY ROW: For top/bottom stages
-                    const rows = {{}};
-
-                    // Second pass: collect seats with REAL DOM column index
-                    Array.from(allTableRows).forEach(tr => {{
-                        const allTds = tr.children;
-                        for (let colIndex = 0; colIndex < allTds.length; colIndex++) {{
-                            const seat = allTds[colIndex];
-                            if (seat.classList.contains('empty')) {{
-                                const title = seat.getAttribute('title');
-                                if (title && title.includes('排') && title.includes('號')) {{
-                                    const parts = title.split('-');
-                                    if (parts.length >= 3) {{
-                                        const rowNum = parseRowNum(parts[1]); // e.g. "H排", "17排", "B31排"
-                                        const seatNum = parseInt(parts[2].replace('號', ''));
-                                        if (!isNaN(rowNum) && !isNaN(seatNum)) {{
-                                            if (!rows[rowNum]) rows[rowNum] = [];
-                                            // CRITICAL: Use REAL colIndex as domIndex, not filtered array index
-                                            rows[rowNum].push({{ elem: seat, num: seatNum, title: title, domIndex: colIndex }});
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                    }});
-
-                    // Helper function: calculate row quality score
-                    function calculateRowQuality(rowSeats) {{
-                        const totalSeats = rowSeats.length;
-
-                        // Find max continuous segment (based on DOM index, not seat number)
-                        let maxContinuous = 1;
-                        let currentContinuous = 1;
-                        for (let i = 0; i < rowSeats.length - 1; i++) {{
-                            const domGap = rowSeats[i + 1].domIndex - rowSeats[i].domIndex;
-                            if (domGap === 1) {{
-                                // Adjacent in DOM
-                                currentContinuous++;
-                                maxContinuous = Math.max(maxContinuous, currentContinuous);
-                            }} else {{
-                                // Gap found
-                                currentContinuous = 1;
-                            }}
-                        }}
-
-                        // Calculate middle seats ratio (seats in middle 50%)
-                        const middleStart = Math.floor(totalSeats * 0.25);
-                        const middleEnd = Math.floor(totalSeats * 0.75);
-                        let middleCount = 0;
-                        rowSeats.forEach((seat, idx) => {{
-                            if (idx >= middleStart && idx < middleEnd) middleCount++;
-                        }});
-                        const middleRatio = middleCount / Math.max(1, (middleEnd - middleStart));
-
-                        // Three-tier quality score:
-                        // 1. Priority: has enough continuous seats
-                        // 2. Priority: middle seat ratio
-                        // 3. Priority: stage direction preference
-                        return {{
-                            maxContinuous: maxContinuous,
-                            totalSeats: totalSeats,
-                            middleRatio: middleRatio,
-                            score: (maxContinuous >= ticketNumber) ? 100 + middleRatio : maxContinuous + middleRatio
-                        }};
+                        if (label[3]) rowOrder = rowOrder * 1000 + Number(label[3]);
+                        const rowKey = label[1] + '-' + label[2] + label[3];
+                        seats.push({{ cell, row, rowKey, rowOrder, column: position }});
                     }}
 
-                    // Sort rows by stage direction
-                    let sortedRows;
-                    if (stageDirection === 'up') {{
-                        // Stage at top: smaller row number = closer to stage
-                        sortedRows = Object.entries(rows).sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
-                    }} else {{
-                        // Stage at bottom: larger row number = closer to stage
-                        sortedRows = Object.entries(rows).sort((a, b) => parseInt(b[0]) - parseInt(a[0]));
-                    }}
-
-                    // Select seats from front rows
-                    for (const [rowNum, rowSeats] of sortedRows) {{
-                        // Sort by DOM order (domIndex) to maintain continuity
-                        rowSeats.sort((a, b) => a.domIndex - b.domIndex);
-                        const seatCount = rowSeats.length;
-
-                        if (allowNonAdjacent) {{
-                            // Non-adjacent mode: select from middle of row
-                            const startIdx = Math.max(0, Math.floor((seatCount - ticketNumber) / 2));
-                            for (let i = 0; i < Math.min(ticketNumber, seatCount); i++) {{
-                                if (startIdx + i < rowSeats.length) {{
-                                    selectedSeats.push(rowSeats[startIdx + i]);
-                                    if (selectedSeats.length >= ticketNumber) break;
-                                }}
-                            }}
-                        }} else {{
-                            // Adjacent mode: find continuous seats in DOM order
-                            for (let startIdx = 0; startIdx <= rowSeats.length - ticketNumber; startIdx++) {{
-                                let continuous = true;
-                                for (let i = 0; i < ticketNumber - 1; i++) {{
-                                    const currentDomIdx = rowSeats[startIdx + i].domIndex;
-                                    const nextDomIdx = rowSeats[startIdx + i + 1].domIndex;
-                                    const domGap = nextDomIdx - currentDomIdx;
-                                    if (domGap > 1) {{
-                                        // Seats are not adjacent in DOM
-                                        continuous = false;
-                                        break;
-                                    }}
-                                }}
-
-                                if (continuous) {{
-                                    for (let i = 0; i < ticketNumber; i++) {{
-                                        selectedSeats.push(rowSeats[startIdx + i]);
-                                    }}
-                                    break;
-                                }}
-                            }}
+                    const center = (column - 1) / 2;
+                    let runLength = 0;
+                    for (const [index, seat] of seats.entries()) {{
+                        seat.centerOffset = Math.abs(seat.column - center);
+                        available.push(seat);
+                        const previous = seats[index - 1];
+                        runLength = previous && previous.rowKey === seat.rowKey &&
+                            seat.column - previous.column === 1 ? runLength + 1 : 1;
+                        if (runLength >= count) {{
+                            const block = seats.slice(index - count + 1, index + 1);
+                            const first = block[0];
+                            adjacent.push({{
+                                seats: block,
+                                column: reversed ? seat.column : first.column,
+                                row,
+                                rowOrder: first.rowOrder,
+                                centerOffset: Math.abs((seat.column + first.column) / 2 - center),
+                            }});
                         }}
-
-                        if (selectedSeats.length >= ticketNumber) break;
-                    }}
-
-                    // Non-adjacent fallback: adjacent mode found 0 seats but seats exist
-                    if (!allowNonAdjacent && selectedSeats.length < ticketNumber) {{
-                        for (const [rowNum, rowSeats] of sortedRows) {{
-                            rowSeats.sort((a, b) => a.domIndex - b.domIndex);
-                            const seatCount = rowSeats.length;
-                            const startIdx = Math.max(0, Math.floor((seatCount - ticketNumber) / 2));
-                            for (let i = 0; i < seatCount; i++) {{
-                                if (startIdx + i < rowSeats.length) {{
-                                    selectedSeats.push(rowSeats[startIdx + i]);
-                                    if (selectedSeats.length >= ticketNumber) break;
-                                }}
-                            }}
-                            if (selectedSeats.length >= ticketNumber) break;
-                        }}
-                        if (selectedSeats.length >= ticketNumber) usedFallback = true;
-                    }}
-
-                }} else if (stageDirection === 'left' || stageDirection === 'right') {{
-                    // GROUP BY SEAT NUMBER (column): For left/right stages
-                    const columns = {{}};
-
-                    // Collect seats with REAL DOM row index (for vertical continuity check)
-                    let rowIndexInTable = 0;
-                    Array.from(allTableRows).forEach(tr => {{
-                        const allTds = tr.children;
-                        for (let colIndex = 0; colIndex < allTds.length; colIndex++) {{
-                            const seat = allTds[colIndex];
-                            if (seat.classList.contains('empty')) {{
-                                const title = seat.getAttribute('title');
-                                if (title && title.includes('排') && title.includes('號')) {{
-                                    const parts = title.split('-');
-                                    if (parts.length >= 3) {{
-                                        const rowNum = parseRowNum(parts[1]); // e.g. "H排", "17排", "B31排"
-                                        const seatNum = parseInt(parts[2].replace('號', ''));
-                                        if (!isNaN(rowNum) && !isNaN(seatNum)) {{
-                                            if (!columns[seatNum]) columns[seatNum] = [];
-                                            // CRITICAL: Use real rowIndexInTable as domIndex for vertical continuity
-                                            columns[seatNum].push({{ elem: seat, rowNum: rowNum, title: title, domIndex: rowIndexInTable }});
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }}
-                        rowIndexInTable++;
-                    }});
-
-                    // Sort columns by stage direction
-                    let sortedColumns;
-                    if (stageDirection === 'left') {{
-                        // Stage at left: smaller seat number = closer to stage
-                        sortedColumns = Object.entries(columns).sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
-                    }} else {{
-                        // Stage at right: larger seat number = closer to stage
-                        sortedColumns = Object.entries(columns).sort((a, b) => parseInt(b[0]) - parseInt(a[0]));
-                    }}
-
-                    // Select seats from front columns
-                    for (const [seatNum, columnSeats] of sortedColumns) {{
-                        // Sort by DOM order (domIndex) to maintain continuity
-                        columnSeats.sort((a, b) => a.domIndex - b.domIndex);
-                        const rowCount = columnSeats.length;
-
-                        if (allowNonAdjacent) {{
-                            // Non-adjacent mode: select from middle rows of column
-                            const startIdx = Math.max(0, Math.floor((rowCount - ticketNumber) / 2));
-                            for (let i = 0; i < Math.min(ticketNumber, rowCount); i++) {{
-                                if (startIdx + i < columnSeats.length) {{
-                                    selectedSeats.push(columnSeats[startIdx + i]);
-                                    if (selectedSeats.length >= ticketNumber) break;
-                                }}
-                            }}
-                        }} else {{
-                            // Adjacent mode: find continuous rows in DOM order (not by row number)
-                            for (let startIdx = 0; startIdx <= columnSeats.length - ticketNumber; startIdx++) {{
-                                let continuous = true;
-                                for (let i = 0; i < ticketNumber - 1; i++) {{
-                                    const currentDomIdx = columnSeats[startIdx + i].domIndex;
-                                    const nextDomIdx = columnSeats[startIdx + i + 1].domIndex;
-                                    const domGap = nextDomIdx - currentDomIdx;
-                                    if (domGap > 1) {{
-                                        // Seats are not adjacent in DOM
-                                        continuous = false;
-                                        break;
-                                    }}
-                                }}
-
-                                if (continuous) {{
-                                    for (let i = 0; i < ticketNumber; i++) {{
-                                        selectedSeats.push(columnSeats[startIdx + i]);
-                                    }}
-                                    break;
-                                }}
-                            }}
-                        }}
-
-                        if (selectedSeats.length >= ticketNumber) break;
-                    }}
-
-                    // Non-adjacent fallback: adjacent mode found 0 seats but seats exist
-                    if (!allowNonAdjacent && selectedSeats.length < ticketNumber) {{
-                        for (const [seatNum, columnSeats] of sortedColumns) {{
-                            columnSeats.sort((a, b) => a.domIndex - b.domIndex);
-                            const rowCount = columnSeats.length;
-                            const startIdx = Math.max(0, Math.floor((rowCount - ticketNumber) / 2));
-                            for (let i = 0; i < rowCount; i++) {{
-                                if (startIdx + i < columnSeats.length) {{
-                                    selectedSeats.push(columnSeats[startIdx + i]);
-                                    if (selectedSeats.length >= ticketNumber) break;
-                                }}
-                            }}
-                            if (selectedSeats.length >= ticketNumber) break;
-                        }}
-                        if (selectedSeats.length >= ticketNumber) usedFallback = true;
                     }}
                 }}
 
-                // Step 5: Click selected seats
-                let clickedCount = 0;
-                const clickedTitles = [];
-                for (const seat of selectedSeats.slice(0, ticketNumber)) {{
-                    // 寬宏座位點擊後會改變 class（empty -> 其他狀態）
-                    seat.elem.click();
-                    clickedCount++;
-                    clickedTitles.push(seat.title);
-                }}
+                adjacent.sort(compare);
+                const chosen = adjacent[0]?.seats ||
+                    (allowNonAdjacent ? available.sort(compare).slice(0, count) : []);
+                if (chosen.length !== count) return false;
 
-                return {{
-                    success: clickedCount > 0,
-                    found: totalAvailableSeats,
-                    selected: clickedCount,
-                    titles: clickedTitles,
-                    direction: stageDirection,
-                    usedFallback: usedFallback
-                }};
-            }})();
+                for (const seat of chosen) {{
+                    if (!seat.cell.isConnected || !seat.cell.classList.contains('empty')) return false;
+                    seat.cell.click();
+                }}
+                return selectedCount() === count && chosen.every(seat => seat.cell.matches(selectedMarker));
+            }})()
         ''')
-
-        # 轉換 CDP 格式為 Python dict
-        result_dict = {}
-        if isinstance(result, list):
-            for item in result:
-                if isinstance(item, list) and len(item) == 2:
-                    key = item[0]
-                    val_obj = item[1]
-                    if isinstance(val_obj, dict) and 'value' in val_obj:
-                        value = val_obj['value']
-                        # 處理陣列類型
-                        if val_obj.get('type') == 'array' and isinstance(value, list):
-                            result_dict[key] = [
-                                v.get('value') if isinstance(v, dict) else v
-                                for v in value
-                            ]
-                        else:
-                            result_dict[key] = value
-        elif isinstance(result, dict):
-            result_dict = result
-
-        is_seat_assigned = result_dict.get('success', False)
-
-        if result_dict.get('usedFallback'):
-            debug.log("[KHAM SEAT] Adjacent seats not available, used non-adjacent fallback")
-
-        if debug.enabled:
-            stage_dir = result_dict.get('direction', 'unknown')
-            debug.log(f"[KHAM SEAT] Stage direction: {stage_dir}")
-            debug.log(f"[KHAM SEAT] Found {result_dict.get('found', 0)} available seats")
-            debug.log(f"[KHAM SEAT] Selected {result_dict.get('selected', 0)}/{ticket_number} seats")
-            if result_dict.get('titles'):
-                for title in result_dict['titles']:
-                    debug.log(f"[SUCCESS] Selected seat: {title}")
-
+        debug.log(f"[KHAM SEAT] Selected all {ticket_number} seats: {result is True}")
+        return result is True
     except Exception as exc:
-        debug.log(f"[ERROR] KHAM seat selection error: {exc}")
-        import traceback
-        if debug.enabled:
-            traceback.print_exc()
-
-    return is_seat_assigned
-
-# 追蹤每個票區的刷新次數：{area_key: reload_count}
-KHAM_SEAT_RELOAD_TRACKER = {}
-
-def clear_kham_seat_reload_tracker(url):
-    """清除指定票區或網址的刷新次數記錄"""
-    global KHAM_SEAT_RELOAD_TRACKER
-    try:
-        import urllib.parse
-        parsed = urllib.parse.urlparse(str(url))
-        params = urllib.parse.parse_qs(parsed.query)
-        area_id = params.get("PERFORMANCE_PRICE_AREA_ID", [None])[0]
-        if area_id:
-            KHAM_SEAT_RELOAD_TRACKER.pop(area_id, None)
-        KHAM_SEAT_RELOAD_TRACKER.pop(str(url), None)
-    except Exception:
-        pass
-
-async def nodriver_kham_handle_seat_unavailable(tab, config_dict):
-    """
-    寬宏售票 UTK0205 座位頁面空位不足時的處理機制：
-    1. 首次發現無位時：最多點擊「更新座位」(.btn-update / top.location.reload) 刷新一次。
-    2. 刷新一次後仍無位時：返回票區列表（UTK0204）重新找其他位置。
-    """
-    if not util.is_auto_refresh_enabled():
+        debug.log(f"[KHAM SEAT] Seat selection error: {exc}")
         return False
 
-    global KHAM_SEAT_RELOAD_TRACKER
+
+def _kham_seat_recovery_key(url):
+    page = urlsplit(url)
+    params = {key.lower(): value for key, value in parse_qsl(page.query)}
+    scope = (page.hostname, params.get('performance_id'))
+    area = params.get('performance_price_area_id') or (page.path, tuple(sorted(params.items())))
+    return scope, area
+
+
+def _kham_seat_recovery(tab):
+    scope, area = _kham_seat_recovery_key(tab.target.url)
+    recovery = _state.get('kham_seat_recovery')
+    if not recovery or recovery['tab'] is not tab or recovery['scope'] != scope:
+        recovery = {'tab': tab, 'scope': scope, 'refreshed': set(), 'exhausted': set(), 'area_page_url': None}
+        _state['kham_seat_recovery'] = recovery
+    return recovery, area
+
+
+def clear_kham_seat_reload_tracker(url):
+    recovery = _state.get('kham_seat_recovery')
+    if recovery:
+        scope, area = _kham_seat_recovery_key(url)
+        if recovery['scope'] == scope:
+            recovery['refreshed'].discard(area)
+            recovery['exhausted'].discard(area)
+
+
+async def nodriver_kham_handle_seat_unavailable(tab, config_dict):
+    """Refresh the map once, then return to the area list selected in this tab."""
+    if not util.is_auto_refresh_enabled() or await check_and_handle_pause(config_dict):
+        return False
+
     debug = util.create_debug_logger(config_dict)
+    recovery, area = _kham_seat_recovery(tab)
+    if area in recovery['exhausted']:
+        return False
 
-    current_url = str(tab.target.url) if tab and tab.target else ""
-    area_key = current_url
+    if area in recovery['refreshed']:
+        recovery['exhausted'].add(area)
+        area_page_url = recovery['area_page_url']
+        if area_page_url and util.is_auto_refresh_enabled():
+            try:
+                await navigate_page_if_enabled(tab, area_page_url)
+                return True
+            except Exception as exc:
+                debug.log("[KHAM SEAT] Unable to return to the known area list:", exc)
+        return False
 
-    # 嘗試由網址取得 PERFORMANCE_PRICE_AREA_ID
-    import urllib.parse
+    recovery['refreshed'].add(area)
     try:
-        parsed_url = urllib.parse.urlparse(current_url)
-        params = urllib.parse.parse_qs(parsed_url.query)
-        area_id = params.get("PERFORMANCE_PRICE_AREA_ID", [None])[0]
-        if area_id:
-            area_key = area_id
-    except Exception:
-        pass
-
-    # 取得票區名稱以利記錄日誌
-    area_name = ""
-    try:
-        name_res = await tab.evaluate('''
+        refreshed = await evaluate_refresh_if_enabled(tab, '''
             (() => {
-                const el = document.querySelector('#AREA_NAME');
-                return el ? el.textContent.trim() : '';
+                const update = document.querySelector('.btn-update, div[onclick*="reload"]');
+                if (!update) return false;
+                update.click();
+                return true;
             })()
         ''')
-        parsed_name = util.parse_nodriver_result(name_res)
-        if isinstance(parsed_name, str):
-            area_name = parsed_name
-    except Exception:
-        pass
+        if refreshed is not True:
+            refreshed = await reload_page_if_enabled(tab)
+        if refreshed:
+            reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.0)
+            await asyncio_sleep_with_pause_check(max(reload_interval, CONST_KHAM_RELOAD_SETTLE))
+            return True
+    except Exception as exc:
+        debug.log("[KHAM SEAT] Seat map refresh failed:", exc)
+    return False
 
-    area_display = f"「{area_name}」({area_key})" if area_name else f"({area_key})"
-    reload_count = KHAM_SEAT_RELOAD_TRACKER.get(area_key, 0)
-
-    if reload_count == 0:
-        # 第一次發現空位不足：最多更新座位刷新一次
-        KHAM_SEAT_RELOAD_TRACKER[area_key] = 1
-        debug.log(f"[KHAM SEAT] 票區 {area_display} 可用空位不足，嘗試點擊「更新座位」刷新一次...")
-
-        try:
-            await evaluate_refresh_if_enabled(tab, '''
-                (() => {
-                    const btnUpdate = document.querySelector('.btn-update, div[onclick*="reload"]');
-                    if (btnUpdate) {
-                        btnUpdate.click();
-                        return { success: true, method: 'btn_click' };
-                    }
-                    if (typeof top !== 'undefined' && top.location) {
-                        top.location.reload();
-                        return { success: true, method: 'top_reload' };
-                    }
-                    window.location.reload();
-                    return { success: true, method: 'window_reload' };
-                })()
-            ''')
-        except Exception as exc:
-            debug.log(f"[KHAM SEAT] 更新座位失敗: {exc}")
-
-        # Floor the wait as the area page does: a seat map read before the
-        # reload finishes is empty and would abandon an area that has seats.
-        reload_interval = config_dict["advanced"].get("auto_reload_page_interval", 0.1)
-        wait_sec = max(reload_interval, CONST_KHAM_RELOAD_SETTLE)
-        await asyncio_sleep_with_pause_check(wait_sec)
-        return True
-
-    else:
-        # 刷新一次後依然無位：切換票區重新尋找其他位置
-        KHAM_SEAT_RELOAD_TRACKER.pop(area_key, None)
-        debug.log(f"[KHAM SEAT] 票區 {area_display} 刷新一次後仍無空位，返回票區列表重新找其他位置...")
-
-        try:
-            # The 切換票區 button calls showPic(), which only returns to the
-            # previous page on some events; elsewhere it just opens the area
-            # map over the same seat page, and the next round lands on the same
-            # area again (seen 2026-09-24, 6樓包廂). Go back to the area list
-            # (UTK0204) the way showPic does, so area selection picks again
-            # under the user's area keywords. Without history, fall back to it.
-            await tab.evaluate('''
-                (() => {
-                    if (window.history.length > 1) {
-                        top.history.back();
-                        return 'history_back';
-                    }
-                    if (typeof showPic === 'function') {
-                        showPic();
-                        return 'showPic';
-                    }
-                    return 'none';
-                })()
-            ''')
-        except Exception as exc:
-            debug.log(f"[KHAM SEAT] 點擊切換票區失敗: {exc}")
-
-        await asyncio_sleep_with_pause_check(0.8)
-        return True
 
 async def _kham_seat_map_loaded(tab):
     """True once #TBL has been parsed and holds seat cells.
@@ -3993,6 +3904,40 @@ async def _kham_seat_map_loaded(tab):
     except Exception:
         return False
 
+
+async def _select_kham_seat_type(tab, config_dict, area_keyword):
+    _state["kham_seat_types_exhausted"] = False
+    groups = _kham_keyword_groups(area_keyword)
+    if groups is None:
+        return False
+    candidates = []
+    try:
+        buttons = await tab.query_selector_all('button[onclick*="setType"]')
+        for button in buttons or []:
+            label = await button.apply('''el => {
+                if (el.matches(':disabled') || !el.getClientRects().length) return null;
+                return el.textContent.trim();
+            }''')
+            if not label:
+                continue
+            if not util.reset_row_text_if_match_keyword_exclude(config_dict, label):
+                candidates.append((button, label))
+        if not candidates:
+            _state["kham_seat_types_exhausted"] = bool(buttons)
+            return False
+        for group in groups:
+            match = next((button for button, label in candidates
+                          if _kham_keyword_group_matches(group, label)), None)
+            if match is not None:
+                await match.click()
+                return True
+        await candidates[0][0].click()
+        return True
+    except Exception:
+        util.create_debug_logger(config_dict).log("[KHAM SEAT] Ticket type selection unavailable")
+        return False
+
+
 async def nodriver_kham_seat_main(tab, config_dict, ocr, domain_name):
     """
     寬宏售票座位選擇主流程：票別選擇 -> 座位選擇 -> 驗證碼 -> 提交
@@ -4002,15 +3947,15 @@ async def nodriver_kham_seat_main(tab, config_dict, ocr, domain_name):
     debug = util.create_debug_logger(enabled=show_debug)
     ticket_number = config_dict["ticket_number"]
 
+    is_kham = domain_name == "kham.com.tw"
+    seat_url = tab.target.url
+    selected_seats_js = '''
+        (() => document.querySelectorAll('#TBL td[style*="icon_chair_select"]').length)()
+    '''
     # Step 0: Check if seats are already selected (avoid duplicate selection)
     already_selected_count = 0
     try:
-        check_result = await tab.evaluate('''
-            (() => {
-                const selectedSeats = document.querySelectorAll('#TBL td[style*="icon_chair_select"]');
-                return selectedSeats.length;
-            })()
-        ''')
+        check_result = await tab.evaluate(selected_seats_js)
         if isinstance(check_result, int):
             already_selected_count = check_result
         elif isinstance(check_result, dict):
@@ -4019,6 +3964,11 @@ async def nodriver_kham_seat_main(tab, config_dict, ocr, domain_name):
         debug.log(f"[KHAM SEAT] Already selected seats: {already_selected_count}")
     except Exception as exc:
         debug.log(f"[KHAM SEAT] Error checking selected seats: {exc}")
+        if is_kham:
+            return False
+
+    if is_kham and already_selected_count not in (0, ticket_number):
+        return False
 
     # If already selected enough seats, skip seat selection and go to submit
     if already_selected_count >= ticket_number:
@@ -4029,9 +3979,8 @@ async def nodriver_kham_seat_main(tab, config_dict, ocr, domain_name):
     else:
         # Step 1: Select seat type
         area_keyword = config_dict["area_auto_select"]["area_keyword"].strip()
-        is_seat_type_assigned = await nodriver_kham_seat_type_auto_select(
-            tab, config_dict, area_keyword
-        )
+        select_type = _select_kham_seat_type if is_kham else nodriver_kham_seat_type_auto_select
+        is_seat_type_assigned = await select_type(tab, config_dict, area_keyword)
 
         # Step 2: Select seats
         is_seat_assigned = False
@@ -4039,6 +3988,12 @@ async def nodriver_kham_seat_main(tab, config_dict, ocr, domain_name):
             is_seat_assigned = await nodriver_kham_seat_auto_select(tab, config_dict)
 
         if not is_seat_assigned:
+            if is_kham:
+                try:
+                    if await tab.evaluate(selected_seats_js) != 0:
+                        return False
+                except Exception:
+                    return False
             # Refresh-then-switch-area only for a loaded page whose area cannot
             # be bought; no seat type buttons or #TBL still parsing means
             # mid-load, so retry next pass. UDN is excluded: the handler's
@@ -4067,6 +4022,22 @@ async def nodriver_kham_seat_main(tab, config_dict, ocr, domain_name):
                 debug.log(f"[KHAM SEAT] is_captcha_sent: {is_captcha_sent}")
         except Exception as exc:
             debug.log(f"[ERROR] KHAM captcha processing error: {exc}")
+
+    if is_kham:
+        if not is_seat_assigned or not is_captcha_sent:
+            return False
+        try:
+            if await tab.evaluate(selected_seats_js) != ticket_number:
+                return False
+            await _submit_kham_cart(tab, config_dict, seat_url, selectors=(
+                *CONST_KHAM_CART_BUTTONS,
+                'a#addcart button',
+                'button[onclick*="addShoppingCart"]',
+                'button.sumitButton',
+            ))
+        except Exception:
+            debug.log("[KHAM SUBMIT] Seat selection could not be confirmed")
+        return False
 
     # Step 4: Submit order with improved dialog handling and URL tracking
     is_submit_success = False
@@ -4196,7 +4167,7 @@ async def nodriver_udn_seat_auto_select(tab, config_dict):
 
     try:
         import json
-        result = await tab.evaluate(f'''
+        result = await tab.evaluate(rf'''
             (function() {{
                 const ticketNumber = {ticket_number};
                 const showDebug = {json.dumps(show_debug)};

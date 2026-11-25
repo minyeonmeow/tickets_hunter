@@ -61,6 +61,11 @@ CONST_KKTIX_SIGN_IN_URL = "https://kktix.com/users/sign_in?back_to=%s"
 CONST_TICKET_SIGN_IN_URL = "https://ticket.com.tw/application/utk13/utk1306_.aspx"
 CONST_UDN_SIGN_IN_URL = "https://tickets.udnfunlife.com/application/UTK01/UTK0101_.aspx"
 CONST_URBTIX_SIGN_IN_URL = "https://www.urbtix.hk/member-login"
+CONST_KHAM_FAMILY_LOGINS = {
+    "kham.com.tw": ("kham_account", CONST_KHAM_SIGN_IN_URL),
+    "ticket.com.tw": ("ticket_account", CONST_TICKET_SIGN_IN_URL),
+    "tickets.udnfunlife.com": ("udn_account", CONST_UDN_SIGN_IN_URL),
+}
 
 warnings.simplefilter('ignore',InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -68,10 +73,38 @@ logging.basicConfig()
 logger = logging.getLogger('logger')
 
 
+def _get_kham_family_login(url):
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme == "https" and parsed.port in (None, 443):
+            return CONST_KHAM_FAMILY_LOGINS.get(parsed.hostname)
+    except ValueError:
+        pass
+    return None
+
+
+async def _load_startup_homepage(driver, homepage, tab=None):
+    try:
+        tab = await driver.get(homepage)
+        await asyncio.sleep(random.uniform(1.0, 2.5))
+    except Exception as e:
+        print(f"[ERROR] Failed to navigate to homepage: {e}")
+    return tab
+
+
 async def nodriver_goto_homepage(driver, config_dict):
     debug = util.create_debug_logger(config_dict)
     tab = None
     homepage = config_dict["homepage"]
+    kham_login = _get_kham_family_login(homepage)
+    if kham_login:
+        account_key, sign_in_url = kham_login
+        accounts = config_dict.get("accounts", {})
+        password_key = account_key.replace("_account", "_password")
+        if accounts.get(account_key, "").strip() and accounts.get(password_key, ""):
+            homepage = sign_in_url
+        return await _load_startup_homepage(driver, homepage)
+
     if 'kktix.c' in homepage:
         # for like human.
         try:
@@ -89,18 +122,6 @@ async def nodriver_goto_homepage(driver, config_dict):
     if 'famiticket.com' in homepage:
         if len(config_dict["accounts"]["fami_account"])>0:
             homepage = CONST_FAMI_SIGN_IN_URL
-
-    if 'kham.com' in homepage:
-        if len(config_dict["accounts"]["kham_account"])>0:
-            homepage = CONST_KHAM_SIGN_IN_URL
-
-    if 'ticket.com.tw' in homepage:
-        if len(config_dict["accounts"]["ticket_account"])>0:
-            homepage = CONST_TICKET_SIGN_IN_URL
-
-    if 'udnfunlife.com' in homepage:
-        if len(config_dict["accounts"]["udn_account"])>0:
-            homepage = CONST_UDN_SIGN_IN_URL
 
     if 'urbtix.hk' in homepage:
         if len(config_dict["accounts"]["urbtix_account"])>0:
@@ -131,11 +152,7 @@ async def nodriver_goto_homepage(driver, config_dict):
         if len(config_dict["accounts"]["ticketplus_account"]) > 1:
             homepage = "https://ticketplus.com.tw/"
 
-    try:
-        tab = await driver.get(homepage)
-        await asyncio.sleep(random.uniform(1.0, 2.5))
-    except Exception as e:
-        print(f"[ERROR] Failed to navigate to homepage: {e}")
+    tab = await _load_startup_homepage(driver, homepage, tab)
 
     tixcraft_family = False
     if 'tixcraft.com' in homepage:
@@ -547,22 +564,19 @@ async def _inject_clarity_stub_for_ticketplus(tab):
 
 
 def parse_refresh_datetime(target_str, now=None):
-    # Parse refresh_datetime setting to a datetime object.
-    # Supports: "YYYY/MM/DD HH:MM:SS" | "HH:MM:SS" (today) | "" (disabled)
-    # Returns: datetime or None
-    if not target_str or not target_str.strip():
+    """Parse the scheduled start, with optional seconds."""
+    if not isinstance(target_str, str) or not target_str.strip():
         return None
     target_str = target_str.strip()
-    try:
-        if '/' in target_str:
-            return datetime.strptime(target_str, '%Y/%m/%d %H:%M:%S')
-        else:
-            # Stage 0: legacy HH:MM:SS format, treat as today
-            today = (now or datetime.now()).date()
-            t = datetime.strptime(target_str, '%H:%M:%S').time()
-            return datetime.combine(today, t)
-    except ValueError:
-        return None
+    for pattern in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%H:%M:%S", "%H:%M"):
+        try:
+            parsed = datetime.strptime(target_str, pattern)
+        except ValueError:
+            continue
+        if pattern.startswith("%H"):
+            return datetime.combine((now or datetime.now()).date(), parsed.time())
+        return parsed
+    return None
 
 
 async def _release_scheduled_start(tab, target_dt, config_dict):
@@ -627,6 +641,7 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
         state["reached"] = False
         state["last_countdown_print"] = 0
         state.pop('target_dt', None)
+        state.pop('invalid_target_notified', None)
 
     # If already reached, no gating
     if state["reached"]:
@@ -647,9 +662,12 @@ async def check_refresh_datetime_gate(tab, config_dict, state):
         target_dt = parse_refresh_datetime(current_str, now=now)
         state['target_dt'] = target_dt
     if target_dt is None:
-        # Empty or invalid = no waiting
-        state["reached"] = True
-        return False
+        if not state.get("invalid_target_notified"):
+            message = "指定開始時間格式無效，請輸入 YYYY/MM/DD HH:MM[:SS] 或 HH:MM[:SS]。已暫停自動購票流程。"
+            util.create_debug_logger(enabled=True).log("[指定開始時間] " + message)
+            util.write_instance_status("running", message)
+            state["invalid_target_notified"] = True
+        return True
 
     # Already past target time (covers "bot starts after target" case)
     if now >= target_dt:
@@ -1139,6 +1157,10 @@ async def _run_bot(args, session):
                     if cloudflare_fail_count >= 3:
                         print("[CLOUDFLARE] Max failures reached, waiting for URL change to retry")
 
+        if _get_kham_family_login(url):
+            tab = await nodriver_kham_main(tab, url, config_dict, ocr)
+            continue
+
         # for kktix.cc and kktix.com
         if 'kktix.c' in url:
             is_quit_bot = await nodriver_kktix_main(tab, url, config_dict)
@@ -1170,19 +1192,6 @@ async def _run_bot(args, session):
             ibon_result = await nodriver_ibon_main(tab, url, config_dict, ocr, Captcha_Browser)
             if ibon_result is True:
                 ibon_handoff_done = True
-
-        kham_family = False
-        if 'kham.com.tw' in url:
-            kham_family = True
-
-        if 'ticket.com.tw' in url:
-            kham_family = True
-
-        if 'tickets.udnfunlife.com' in url:
-            kham_family = True
-
-        if kham_family:
-            tab = await nodriver_kham_main(tab, url, config_dict, ocr)
 
         # https://ticketplus.com.tw/*
         if 'ticketplus.com' in url and not ticketplus_handoff_done:
