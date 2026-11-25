@@ -368,6 +368,51 @@ CONST_EXPERIMENTAL_SEND_JS = CONST_FORM_PREPARE_JS + r'''
 })()'''
 
 
+CONST_CAPTCHA_REFRESH_JS = r'''(() => {
+    CAPTCHA_LOGIC
+    const p=PARAMETERS,doc=location.href+'|'+performance.timeOrigin,key='ticketsHunter.tixcraft.submit';
+    if(Date.now()>p.expires||doc!==p.document)return {state:'stale'};
+    const order=window[Symbol.for(key)],saved=JSON.parse(sessionStorage.getItem(key)||'null');
+    if(p.nonce){
+        if(!order||order.documentId!==doc||order.nonce!==p.nonce||saved?.nonce!==p.nonce||
+            order.state!=='rejected'||saved.state!=='rejected')return {state:'pending'};
+    }else if(order||saved)return {state:'pending'};
+    const original=p.nonce?order.captcha:p.captcha,current=captchaId();
+    const slot=Symbol.for(key+'.captchaRefresh'),namespace='.ticketsHunterCaptchaRefresh';
+    if(current&&original&&current!==original){
+        if(typeof jQuery!=='undefined')jQuery(document).off(namespace);
+        delete window[slot];return {state:'changed'};
+    }
+    if(!original)return {state:'waiting'};
+    if(typeof jQuery==='undefined')return {state:'manual',reason:'unavailable'};
+    const img=jQuery('#TicketForm_verifyCode-image'),node=img[0],verify=document.querySelector('#TicketForm_verifyCode');
+    if(!node||typeof img.yiiCaptcha!=='function')return {state:'manual',reason:'unavailable'};
+    if(!p.nonce&&verify?.value)return {state:'manual',reason:'manual_input'};
+    let r=window[slot];
+    if(!r||r.document!==doc||r.original!==original||r.nonce!==p.nonce){
+        r={document:doc,original,nonce:p.nonce,attempts:0,requests:new Set(),seen:false};window[slot]=r;
+        const path=new URL(node.currentSrc||node.src,location.href).pathname;
+        jQuery(document).off(namespace).on('ajaxSend'+namespace,(_event,xhr,options)=>{
+            if(window[slot]!==r)return;
+            try{const u=new URL(options.url,location.href);if(u.origin===location.origin&&u.pathname===path){r.requests.add(xhr);r.seen=true;}}catch(_){}
+        }).on('ajaxComplete'+namespace,(_event,xhr)=>{r.requests.delete(xhr);});
+    }
+    if(r.stopped)return {state:'manual',reason:r.stopped,attempts:r.attempts};
+    if(r.attempts){
+        if(performance.now()-r.started<p.timeout_ms)return {state:'waiting',attempts:r.attempts};
+        // A timeout never authorizes a second request while the first may still run.
+        if(r.requests.size||!node.complete)r.stopped='inflight';
+        else if(!r.seen)r.stopped='unconfirmed';
+        else if(r.attempts>=p.max_attempts)r.stopped='limit';
+        if(r.stopped)return {state:'manual',reason:r.stopped,attempts:r.attempts};
+    }
+    if(p.nonce&&verify)verify.value='';
+    r.started=performance.now();r.attempts++;r.seen=false;
+    try{img.yiiCaptcha('refresh');}catch(_){r.stopped='unavailable';return {state:'manual',reason:r.stopped,attempts:r.attempts};}
+    return {state:'requested',attempts:r.attempts};
+})()'''
+
+
 CONST_CHECK_JS = r'''(() => {
     const p=PARAMETERS,key='ticketsHunter.tixcraft.submit',slot=Symbol.for(key);
     if(Date.now()>p.expires)return false;

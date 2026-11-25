@@ -737,6 +737,7 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                     "tixcraft_http_forbidden_retry_interval",
                     "tixcraft_http_forbidden_retry_interval_max",
                     "tixcraft_http_image_retry_interval",
+                    "tixcraft_captcha_refresh_timeout", "tixcraft_captcha_refresh_attempts",
                     "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
                     "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
                     "discount_code", "ticketplus_stock_api", "ticketplus_stock_api_timeout", "ticketplus_direct_flow",

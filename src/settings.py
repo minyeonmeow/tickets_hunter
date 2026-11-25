@@ -268,6 +268,8 @@ def get_default_config():
     config_dict["advanced"]["tixcraft_http_forbidden_retry_interval"] = 5
     config_dict["advanced"]["tixcraft_http_forbidden_retry_interval_max"] = 10
     config_dict["advanced"]["tixcraft_http_image_retry_interval"] = 0.2
+    config_dict["advanced"]["tixcraft_captcha_refresh_timeout"] = 5
+    config_dict["advanced"]["tixcraft_captcha_refresh_attempts"] = 3
     config_dict["advanced"]["tixcraft_http_dispatch_timeout"] = 1
     config_dict["advanced"]["ticketplus_queue_url_poll_interval"] = 0.05
     config_dict["advanced"]["ticketplus_queue_timing"] = True

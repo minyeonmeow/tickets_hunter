@@ -2987,8 +2987,7 @@ async def _tixcraft_verify_current_area(tab, config, snapshot):
               not util.reset_row_text_if_match_keyword_exclude(config, r.get('name', ''))]
     row = {'name': name + ' ' + ' '.join(labels), 'url': route, 'count': None, 'sold': False}
     strict = dict(config, area_auto_fallback=False)
-    raw = config.get('area_auto_select', {}).get('area_keyword', '').strip()
-    if not known and name and (not raw or _tixcraft_http_choose([row], strict)):
+    if not known and name and _tixcraft_http_choose([row], strict):
         _state['http_selected_area'] = {'url': route, 'row': row, 'preferences': signature}
         return True
     if await _tixcraft_actions_paused(config) or await _tixcraft_submission_pending(tab, config):
@@ -3013,7 +3012,7 @@ def _tixcraft_http_wait(config, snapshot, reason, state='running'):
 
 
 async def _tixcraft_refresh_unreadable_captcha(tab, config, snapshot):
-    """Refresh an invalid OCR challenge once; never submit or clear order guards."""
+    """Bound invalid OCR refresh attempts without submitting or clearing guards."""
     if await _tixcraft_actions_paused(config):
         return
     identity = (snapshot['document_id'], snapshot['captcha'])
@@ -3026,27 +3025,49 @@ async def _tixcraft_refresh_unreadable_captcha(tab, config, snapshot):
     if _state['http_captcha_failures'] >= limit:
         _tixcraft_http_wait(config, snapshot, '驗證碼辨識已達重試上限，尚未送出；請手動輸入或換圖。', 'waiting_manual')
         return
-    if refresh['requested']:
-        return
-    parameters = {'document': snapshot['document_id'], 'captcha': snapshot['captcha'], 'expires': _tixcraft_http_expiry(config)}
-    result = await tab.evaluate(r'''(() => {
-        CAPTCHA_LOGIC
-        const p=PARAMETERS,key='ticketsHunter.tixcraft.submit';
-        if(Date.now()>p.expires||location.href+'|'+performance.timeOrigin!==p.document||captchaId()!==p.captcha)return 'changed';
-        if(window[Symbol.for(key)]||sessionStorage.getItem(key))return 'pending';
-        const verify=document.querySelector('#TicketForm_verifyCode');
-        if(verify?.value)return 'manual';
-        if(typeof jQuery==='undefined')return 'manual';
-        const img=jQuery('#TicketForm_verifyCode-image');
-        if(!img.length||typeof img.yiiCaptcha!=='function')return 'manual';
-        img.yiiCaptcha('refresh');return 'requested';
-    })()'''.replace('CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('PARAMETERS', json.dumps(parameters)))
-    if result in ('requested', 'manual', 'pending'):
-        refresh['requested'] = True
-    if result == 'requested':
-        _tixcraft_http_wait(config, snapshot, 'OCR 結果不是四碼，已要求更新驗證碼；等待新圖後重新辨識，尚未送出。')
-    elif result == 'manual':
-        _tixcraft_http_wait(config, snapshot, 'OCR 結果不是四碼，目前無法自動換圖或已有手動輸入；請手動處理，尚未送出。', 'waiting_manual')
+    refresh['requested'] = True
+    await _tixcraft_poll_captcha_refresh(tab, config, snapshot['document_id'], snapshot['captcha'])
+
+
+async def _tixcraft_poll_captcha_refresh(tab, config, document_id, captcha=None, nonce=None):
+    if await _tixcraft_actions_paused(config):
+        return 'waiting'
+    if time.monotonic() < _state.get('captcha_refresh_poll_due', 0):
+        return 'waiting'
+    _state['captcha_refresh_poll_due'] = time.monotonic() + max(.01, float(
+        config.get('advanced', {}).get('tixcraft_http_image_retry_interval', .2)))
+    advanced = config.get('advanced', {})
+    parameters = {'document': document_id, 'captcha': captcha, 'nonce': nonce,
+                  'timeout_ms': max(.1, float(advanced.get('tixcraft_captcha_refresh_timeout', 5))) * 1000,
+                  'max_attempts': max(1, int(advanced.get('tixcraft_captcha_refresh_attempts', 3))),
+                  'expires': _tixcraft_http_expiry(config)}
+    script = ticket_http.CONST_CAPTCHA_REFRESH_JS.replace('CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('PARAMETERS', json.dumps(parameters))
+    result = await tab.evaluate(script)
+    if not isinstance(result, dict):
+        return 'waiting'
+    snapshot = {'document_id': document_id, 'captcha': captcha}
+    state = result.get('state', 'waiting')
+    if state == 'requested':
+        _tixcraft_http_wait(config, snapshot, '已要求更新驗證碼（第 %s/%s 次），等待新圖後重新辨識；尚未再次送出。' % (result.get('attempts'), parameters['max_attempts']))
+    elif state == 'manual':
+        reasons = {'inflight': '上一筆換圖請求或圖片載入逾時，為避免重疊，不再自動換圖',
+                   'unconfirmed': '無法確認上一筆換圖請求已結束', 'limit': '換圖已達重試上限',
+                   'unavailable': '網站換圖功能暫時不可用', 'manual_input': '偵測到手動輸入'}
+        _tixcraft_http_wait(config, snapshot, reasons.get(result.get('reason'), '無法自動換圖') + '；請手動確認或換圖，保留防重送。', 'waiting_manual')
+    return state
+
+
+async def _tixcraft_check_captcha_refresh(tab, config, snapshot):
+    refresh = _state.get('http_invalid_refresh')
+    if not refresh or not refresh.get('requested') or refresh['identity'][0] != snapshot['document_id']:
+        return True
+    if snapshot.get('captcha_filled'):
+        return True
+    state = await _tixcraft_poll_captcha_refresh(tab, config, snapshot['document_id'], refresh['identity'][1])
+    if state == 'changed':
+        _state.pop('http_invalid_refresh', None)
+        return True
+    return False
 
 
 def _tixcraft_http_phase(config, snapshot, stage):
@@ -3136,6 +3157,8 @@ async def _tixcraft_http_ticket(tab, config, ocr):
         _tixcraft_http_wait(config, snapshot, '等待選票表單載入，尚未送出。')
         return True
     if not await _tixcraft_verify_current_area(tab, config, snapshot):
+        return True
+    if not await _tixcraft_check_captcha_refresh(tab, config, snapshot):
         return True
     preferences = _tixcraft_area_preferences(config)
     _tixcraft_http_phase(config, snapshot, '選票表單已讀取')
@@ -3428,7 +3451,7 @@ async def _tixcraft_submission_pending(tab, config_dict=None):
 
 
 async def _tixcraft_refresh_rejected(tab, config_dict, document_id, nonce):
-    """已明確拒絕的同一筆只換圖一次；未知結果不能走此路徑。"""
+    """Only confirmed captcha rejection may enter bounded refresh recovery."""
     if await _tixcraft_actions_paused(config_dict):
         return
     ocr_settings = (config_dict or {}).get('ocr_captcha', {})
@@ -3436,20 +3459,8 @@ async def _tixcraft_refresh_rejected(tab, config_dict, document_id, nonce):
     state = 'manual'
     if force:
         try:
-            state = await tab.evaluate(r'''(() => {
-                CAPTCHA_ID
-                const key='ticketsHunter.tixcraft.submit',r=window[Symbol.for(key)];
-                const saved=JSON.parse(sessionStorage.getItem(key)||'null');
-                if(location.href+'|'+performance.timeOrigin!==EXPECTED||!r||r.documentId!==EXPECTED||
-                   r.nonce!==NONCE||saved?.nonce!==NONCE||saved.state!=='rejected'||r.state!=='rejected')return 'stale';
-                if(r.refreshRequested)return 'waiting';
-                if(!captchaId()||captchaId()!==r.captcha)return 'waiting';
-                if(typeof jQuery==='undefined')return 'manual';
-                const img=jQuery('#TicketForm_verifyCode-image');
-                if(!img.length||typeof img.yiiCaptcha!=='function')return 'manual';
-                r.refreshRequested=true;img.yiiCaptcha('refresh');return 'started';
-            })()'''.replace('CAPTCHA_ID', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace(
-                'EXPECTED', json.dumps(document_id)).replace('NONCE', json.dumps(nonce)))
+            await _tixcraft_poll_captcha_refresh(tab, config_dict, document_id, nonce=nonce)
+            return
         except Exception:
             state = 'manual'
     if state == 'manual' and _state.get('captcha_rejected_notice') != nonce:
