@@ -1428,6 +1428,7 @@ function load_settins_to_form(settings)
         browser_connection_mode.value = settings.advanced.browser_connection_mode || 'attach';
         document.getElementById('ticketplus_direct_flow').checked = settings.advanced.ticketplus_direct_flow === true;
         document.getElementById('ticketplus_enqueue_retry_experiment').checked = settings.advanced.ticketplus_enqueue_retry_experiment === true;
+        document.getElementById('tixcraft_api_submit_experiment').checked = settings.advanced.tixcraft_api_submit_experiment === true;
         document.getElementById('ticketplus_enqueue_retry_interval').value = settings.advanced.ticketplus_enqueue_retry_interval ?? 1;
         browser_port.value = settings.advanced.browser_port ?? 19327;
         proxy_server_port.value  = settings.advanced.proxy_server_port;
@@ -1773,6 +1774,7 @@ function save_changes_to_dict(silent_flag)
             settings.advanced.browser_connection_mode = browser_connection_mode.value;
             settings.advanced.ticketplus_direct_flow = document.getElementById('ticketplus_direct_flow').checked;
             settings.advanced.ticketplus_enqueue_retry_experiment = retryEnabled;
+            settings.advanced.tixcraft_api_submit_experiment = document.getElementById('tixcraft_api_submit_experiment').checked;
             settings.advanced.ticketplus_enqueue_retry_interval = validRetryInterval ? retryInterval : 1;
             settings.advanced.browser_port = browserPortValue;
             settings.advanced.proxy_server_port = proxy_server_port.value;
@@ -2160,6 +2162,7 @@ function render_instances(rows) {
             ? $('<span class="badge text-bg-secondary"></span>').text(it.paused ? (currentLanguage === 'en' ? 'Standby' : '保留待命') : uiText('instance_alive'))
             : $('<span class="badge text-bg-secondary"></span>').text(uiText('instance_offline'));
         if (!it.alive && it.worker_alive) live_badge.text(it.worker_ready ? (currentLanguage === 'en' ? 'Ready' : '程序待命') : (currentLanguage === 'en' ? 'Preparing' : '準備中'));
+        if (!it.alive && it.worker_alive && it.worker_ocr_loading) live_badge.text(currentLanguage === 'en' ? 'Loading OCR' : 'OCR 載入中');
         tr.append($('<td></td>').append(live_badge));
         const state = it.state || (!it.alive ? 'idle' : it.paused ? 'paused' : 'running');
         const color = state === 'running' ? 'success' : state === 'error' ? 'danger' : 'secondary';

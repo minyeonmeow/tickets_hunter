@@ -261,6 +261,13 @@ def get_default_config():
     config_dict["advanced"]["browser_connection_mode"] = "attach"
     config_dict["advanced"]["browser_port"] = 19327
     config_dict["advanced"]["warm_ticketplus_worker"] = True
+    config_dict["advanced"]["warm_tixcraft_worker"] = True
+    config_dict["advanced"]["tixcraft_http_api"] = True
+    config_dict["advanced"]["tixcraft_api_submit_experiment"] = False
+    config_dict["advanced"]["tixcraft_http_captcha_retries"] = 15
+    config_dict["advanced"]["tixcraft_http_forbidden_retry_interval"] = 5
+    config_dict["advanced"]["tixcraft_http_forbidden_retry_interval_max"] = 10
+    config_dict["advanced"]["tixcraft_http_dispatch_timeout"] = 1
     config_dict["advanced"]["ticketplus_queue_url_poll_interval"] = 0.05
     config_dict["advanced"]["ticketplus_queue_timing"] = True
     config_dict["advanced"]["ticketplus_stock_api"] = True
@@ -930,7 +937,7 @@ class RunHandler(tornado.web.RequestHandler):
 
     async def start_worker(self, instance, profile):
         try:
-            worker = self.application.workers.prepare(instance)
+            worker = self.application.workers.prepare(instance, get_profile_filepath(profile))
             await asyncio.to_thread(worker.request, 'start', config_path=get_profile_filepath(profile))
         except (ValueError, OSError) as exc:
             self.set_status(409)
@@ -947,7 +954,7 @@ class LoadJsonHandler(tornado.web.RequestHandler):
             return
         config_filepath, config_dict = load_json(profile_name)
         if self.application.warm_enabled and supports_warm_worker(config_dict):
-            self.application.workers.prepare(profile_name)
+            self.application.workers.prepare(profile_name, config_filepath)
 
         # Dynamically generate remote_url based on server_port (Issue #156)
         server_port = config_dict.get("advanced", {}).get("server_port", CONST_SERVER_PORT)
@@ -1026,7 +1033,7 @@ class SaveJsonHandler(tornado.web.RequestHandler):
                 self.write({"error": {"message": "設定儲存失敗，原設定已保留；請稍後重試。", "code": 1005}})
                 return
             if self.application.warm_enabled and supports_warm_worker(config_dict):
-                self.application.workers.prepare(profile_name)
+                self.application.workers.prepare(profile_name, config_filepath)
 
         if not is_pass_check:
             self.set_status(401)
@@ -1389,7 +1396,7 @@ async def main_server():
     app.warm_enabled = True
 
     # Get server_port from config, fallback to default (Issue #156)
-    _, config_dict = load_json()
+    config_filepath, config_dict = load_json()
     server_port = config_dict.get("advanced", {}).get("server_port", CONST_SERVER_PORT)
 
     # Validate port range
@@ -1402,7 +1409,7 @@ async def main_server():
 
     open_settings_page(server_port)
     if supports_warm_worker(config_dict):
-        app.workers.prepare(CONST_DEFAULT_PROFILE)
+        app.workers.prepare(CONST_DEFAULT_PROFILE, config_filepath)
     try:
         await asyncio.Event().wait()
     finally:

@@ -8,12 +8,15 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
+CONST_RUN_CONTROL_FILES = ('MAXBOT_INT28_IDLE.txt', 'MAXBOT_INT28_QUIT.txt', 'MAXBOT_BROWSER_DISCONNECT.txt')
+
 
 def supports_warm_worker(config):
-    return (not getattr(sys, 'frozen', False) and
-            config.get('advanced', {}).get('warm_ticketplus_worker', True) and
-            urlsplit(config.get('homepage', '')).hostname in ('ticketplus.com.tw', 'www.ticketplus.com.tw') and
-            config.get('advanced', {}).get('browser_connection_mode', 'attach') == 'attach')
+    advanced = config.get('advanced', {})
+    host = urlsplit(config.get('homepage', '')).hostname
+    enabled = (host in ('ticketplus.com.tw', 'www.ticketplus.com.tw') and advanced.get('warm_ticketplus_worker', True) or
+               host in ('tixcraft.com', 'www.tixcraft.com') and advanced.get('warm_tixcraft_worker', True))
+    return bool(not getattr(sys, 'frozen', False) and enabled and advanced.get('browser_connection_mode', 'attach') == 'attach')
 
 
 class Worker:
@@ -28,6 +31,12 @@ class Worker:
         self.run_id = None
         self.cancelled = None
         self.expected_exit = False
+        self.ocr_ready = False
+        self.ocr_loading = False
+        self.ocr_loads = 0
+        self.ocr_hits = 0
+        self.prepared_stamp = None
+        self.preparing_stamp = None
         env = dict(os.environ, PYTHONUTF8='1')
         env.pop('PYTHONHOME', None)
         script = str(Path(__file__).with_name('ticketplus_worker.py'))
@@ -47,6 +56,11 @@ class Worker:
                 with self.lock:
                     if event.get('type') == 'ready':
                         self.ready.set()
+                    if event.get('type') in ('ocr_loading', 'ocr_ready', 'ocr_error'):
+                        self.ocr_ready = event['type'] == 'ocr_ready'
+                        self.ocr_loading = event['type'] == 'ocr_loading'
+                        self.ocr_loads = event.get('loads', self.ocr_loads)
+                        self.ocr_hits = event.get('hits', self.ocr_hits)
                     if event.get('type') == 'stopped' and event.get('run_id') == self.run_id:
                         self.busy = False
                     waiter = self.pending.get(event.get('seq'))
@@ -71,20 +85,51 @@ class Worker:
     def snapshot(self):
         alive = self.process.poll() is None
         return {'worker_alive': alive, 'worker_ready': alive and self.ready.is_set(),
-                'worker_busy': alive and self.busy, 'run_id': self.run_id}
+                'worker_busy': alive and self.busy, 'run_id': self.run_id,
+                'worker_ocr_ready': alive and self.ocr_ready, 'worker_ocr_loading': alive and self.ocr_loading,
+                'ocr_loads': self.ocr_loads, 'ocr_hits': self.ocr_hits}
+
+    def preload(self, config_path):
+        try:
+            info = os.stat(config_path)
+            stamp = (os.path.abspath(config_path), info.st_mtime_ns, info.st_size)
+        except OSError:
+            return
+        with self.lock:
+            if self.busy or stamp in (self.prepared_stamp, self.preparing_stamp):
+                return
+            self.preparing_stamp = stamp
+        def prepare():
+            try:
+                self.request('prepare', config_path=config_path)
+                with self.lock:
+                    self.prepared_stamp = stamp
+            except (OSError, ValueError):
+                pass
+            finally:
+                with self.lock:
+                    if self.preparing_stamp == stamp:
+                        self.preparing_stamp = None
+        threading.Thread(target=prepare, daemon=True).start()
 
     def request(self, command, wait_timeout=10, **payload):
         with self.lock:
             if command == 'start':
                 if self.busy:
                     raise ValueError('此實例已有任務或正在停止，請稍候。')
+                # Clear old flags now, before waiting for process readiness. A
+                # pause/disconnect requested during startup must remain visible.
+                base = Path(self.root) if self.instance == 'default' else Path(self.root) / 'instances' / self.instance
+                for filename in CONST_RUN_CONTROL_FILES:
+                    (base / filename).unlink(missing_ok=True)
                 self.run_id = uuid.uuid4().hex
                 self.busy = True
             elif command in ('disconnect', 'shutdown'):
                 self.cancelled = self.run_id
             run_id = self.run_id
         if not self.ready.wait(30) or self.process.poll() is not None:
-            self.busy = False
+            if command == 'start':
+                self.busy = False
             raise ValueError('工作程序尚未就緒或已退出，請重新開始。')
         with self.lock:
             if command == 'start' and self.cancelled == run_id:
@@ -144,7 +189,7 @@ class WorkerManager:
             worker = self.workers.get(instance or 'default')
             return worker if worker and worker.process.poll() is None else None
 
-    def prepare(self, instance):
+    def prepare(self, instance, config_path=None):
         instance = instance or 'default'
         with self.lock:
             if self.closed:
@@ -157,6 +202,8 @@ class WorkerManager:
                     previous.close()
                 worker = Worker(self.root, instance)
                 self.workers[instance] = worker
+            if config_path:
+                worker.preload(config_path)
             return worker
 
     def close(self):

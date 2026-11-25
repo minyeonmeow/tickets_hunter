@@ -18,9 +18,10 @@
 - **`util.py`** — 純跨平台工具：文字比對、關鍵字解析、字串正規化、檔案 I/O、DebugLogger、CAPTCHA 數學猜測。禁止：平台選擇器／URL、業務邏輯、import `settings` 或 `nodriver_tixcraft`。此檔為所有平台共用，修改前務必評估跨平台影響。
 - **`standard_time.py`** — 僅用標準庫的低層校時基礎設施：背景官方 NTP／HTTPS 取樣、單調時間錨點與時效狀態；不匯入專案模組、不更改 OS 時間、不包含平台購票邏輯。其他模組可單向使用此時間來源。
 - **`ocr_baidu.py`** — 可選的百度通用文字辨識介接：授權、到期快取、圖片辨識與去識別化錯誤；只使用標準庫和既有 requests，不匯入專案或平台模組，不執行瀏覽器操作。
+- **`tixcraft_api.py`** — 拓元 HTTP 傳輸與回應解析：只使用標準庫與 zendriver CDP，提供 HTML 場次／票區解析、原按鈕送出與可選的同瀏覽器 API 實驗腳本；不保存執行狀態、不匯入平台或主迴圈、不執行回應內的腳本。
 - **`settings.py`** — 設定 CRUD 與 Tornado Web Server。禁止：搶票邏輯、import `nodriver_tixcraft`。允許匯入 `util`、`runtime_manager`，透過本機管道控制獨立工作程序。
 - **`runtime_manager.py`** — 管理工作程序的建立、指令、回應與生命週期；不得匯入瀏覽器、主迴圈或平台模組，不處理售票網站請求。
-- **`ticketplus_worker.py`** — TicketPlus 常駐程序入口，載入主迴圈後待命，收到開始指令才執行任務。每個實例同時只允許一個任務；斷開釋放鎖定與 CDP 連線，保留 Chrome。
+- **`ticketplus_worker.py`** — TicketPlus／拓元常駐入口，預載主迴圈與拓元 OCR，收到開始指令才連 Chrome。每個實例同時只允許一個任務；斷開釋放鎖定與 CDP 連線並清理當輪平台狀態，保留 Chrome 與 OCR 模型。模型設定或檔案變動後重建快取；OCR 不保存辨識結果、圖片或瀏覽器 Cookie。
 
 ---
 
@@ -32,7 +33,9 @@ platforms/*        -->  nodriver_common, util
 nodriver_common    -->  util, settings
 settings           -->  util, runtime_manager
 runtime_manager    -->  util
-ticketplus_worker  -->  nodriver_tixcraft, platforms/ticketplus, util
+ticketplus_worker  -->  nodriver_tixcraft, platforms/ticketplus, platforms/tixcraft, util
+platforms/tixcraft -->  tixcraft_api
+tixcraft_api       -->  (Python 標準庫、zendriver CDP，無專案內部匯入)
 nodriver_tixcraft, platforms/*, settings  -->  standard_time
 standard_time     -->  (僅 Python 標準庫，無專案內部匯入)
 nodriver_common   -->  ocr_baidu

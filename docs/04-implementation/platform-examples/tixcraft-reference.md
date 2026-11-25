@@ -3,6 +3,25 @@
 **文件說明**：TixCraft 平台的完整實作參考，包含平台特性分析、技術實作指南、常見問題與已驗證的解決方案。
 **最後更新**：2025-12-02
 
+### 2026-11：HTTP 票況、原按鈕送出與 API 實驗
+
+預設 `advanced.tixcraft_http_api=true` 保留同瀏覽器的 HTTP 場次、票區讀取及快速表單準備；`advanced.tixcraft_api_submit_experiment=false` 表示最後送出使用網站原本的按鈕。
+原按鈕在 OCR 前提前定位，文件／表單／按鈕被替換時重新取得；設定張數與驗證碼會發出欄位事件，條款使用原 checkbox 的 click。
+送出前核對當前文件、驗證碼圖片、全表有效張數、欄位有效性與按鈕狀態，再取得同分頁持久防重送鎖並只點一次按鈕。
+一般模式沒有程式自己的 POST fetch 或排隊查詢；正常載入 order 頁，網站自己的腳本負責 `/ticket/check`，程式只監控導航與結帳交接。
+
+實驗開關開啟時改用同源 `fetch POST`，只在確認 order 回應後啟動程式的 `/ticket/check`，依回傳 `time` 等待；不執行 order HTML 的腳本，因此不會與網站計時器同時查詢。
+兩種方式共用單次送出保護；當輪送出方式鎖定，修改開關後必須明確斷開再開始。未知回覆、重連與 F5 不會觸發重送；明確斷開沿用既有重設規則。
+
+場次來源為 `/activity/game/{activity}` 的 `#gameList`，票況來源為 `/ticket/area/{activity}/{performance}` 的 HTML 及 `areaUrlList`；保持日期／區域關鍵字群組優先順序、AND 條件與排除字。
+先以場次連結定位並點擊原本入口；具有連結的停用／倒數按鈕也可先選定，實際點擊仍檢查可用狀態，不依賴按鈕文字。入口導航的 document 回應由 Network 事件擷取，票區載入與回應讀取重疊，不重複 GET 同一頁。
+重整間隔熱更新會以最近一次讀取完成時間重新計算下一輪期限；已進行的 GET 不取消，也不平行發送下一筆。
+HTTP 403 每次以 `random.randint` 在 `advanced.tixcraft_http_forbidden_retry_interval`（預設 5 秒）與 `advanced.tixcraft_http_forbidden_retry_interval_max`（預設 10 秒）之間取整數秒，等待後重試讀取；一般重整間隔熱更新不縮短該次等待。HTTP 401／429 仍停止輪詢。暫停／斷開與關閉自動重整優先，送出鎖不因 403 解除。
+根 frame 網址監聽與網路／對話框事件回呼統一使用非同步函式，避免 zendriver 同步回呼的背景執行緒讀取到已變動的非同步 callback，導致事件遺失與 coroutine 未 await。
+日期補零會正規化，熱賣中不推算精確張數。關閉自動重整時以 frame loader 識別手動 F5，直接讀取目前 DOM，不額外 GET 同一票區。
+HTTP 讀取不複製 Cookie 到 Python；網址監控使用根 frame 導航事件及 frame tree，避免頁面 JavaScript 等候。
+兩種模式都只到結帳頁，付款保持手動。Ticketmaster／Indievox 保留既有流程。
+
 ---
 
 ## 平台概述

@@ -734,6 +734,8 @@ async def reload_config(config_dict, last_mtime, config_filepath):
                     "play_sound", "disable_adjacent_seat", "hide_some_image",
                     "auto_guess_options", "user_guess_string", "auto_reload_page_interval", "verbose",
                     "tixcraft_soft_block_delay",
+                    "tixcraft_http_forbidden_retry_interval",
+                    "tixcraft_http_forbidden_retry_interval_max",
                     "idle_keyword", "resume_keyword", "idle_keyword_second", "resume_keyword_second",
                     "discord_webhook_url", "telegram_bot_token", "telegram_chat_id",
                     "discount_code", "ticketplus_stock_api", "ticketplus_stock_api_timeout", "ticketplus_direct_flow",
@@ -771,8 +773,39 @@ async def _disconnect_platform_run(session):
             pass
 
 
-async def main(args):
-    session = {"heartbeat": "heartbeat.txt"}
+async def _run_current_url(tab, config, session):
+    """TixCraft is document based: browser navigation events avoid suspended page JS."""
+    cached = str(getattr(getattr(tab, 'target', None), 'url', '') or '')
+    state = session.get('tixcraft_url')
+    eligible = urllib.parse.urlsplit(cached).hostname in ('tixcraft.com', 'www.tixcraft.com')
+    if cached in ('', 'about:blank'):
+        eligible = urllib.parse.urlsplit(config.get('homepage', '')).hostname in ('tixcraft.com', 'www.tixcraft.com')
+    if (not config.get('advanced', {}).get('tixcraft_http_api', True) or
+            not eligible and
+            not (state and state['tab'] is tab and urllib.parse.urlsplit(state['url']).hostname in ('tixcraft.com', 'www.tixcraft.com'))):
+        return await nodriver_current_url(tab, config)
+    try:
+        if not state or state['tab'] is not tab:
+            state = {'tab': tab, 'url': cached, 'frame': None, 'checked': 0}
+            session['tixcraft_url'] = state
+            async def navigated(event, *_):
+                if isinstance(event, cdp.page.FrameNavigated) and event.frame.parent_id is None:
+                    state.update(url=event.frame.url+(event.frame.url_fragment or ''), frame=event.frame.id_, checked=time.monotonic())
+                elif isinstance(event, cdp.page.NavigatedWithinDocument) and event.frame_id == state['frame']:
+                    state.update(url=event.url, checked=time.monotonic())
+            tab.add_handler(cdp.page.FrameNavigated, navigated)
+            tab.add_handler(cdp.page.NavigatedWithinDocument, navigated)
+            await tab.send(cdp.page.enable())
+        if not state['frame'] or time.monotonic() - state['checked'] >= 1:
+            frame = (await tab.send(cdp.page.get_frame_tree())).frame
+            state.update(url=frame.url+(frame.url_fragment or ''), frame=frame.id_, checked=time.monotonic())
+        return state['url'], False
+    except Exception:
+        return await nodriver_current_url(tab, config)
+
+
+async def main(args, ocr_loader=None):
+    session = {"heartbeat": "heartbeat.txt", "ocr_loader": ocr_loader}
     try:
         await _run_bot(args, session)
     except Exception:
@@ -930,7 +963,8 @@ async def _run_bot(args, session):
     Captcha_Browser = None
     try:
         if should_initialize_ocr(config_dict):
-            ocr = create_ocr_for_platform(config_dict)
+            loader = session.get('ocr_loader')
+            ocr = await loader(config_dict) if loader else create_ocr_for_platform(config_dict)
             if ocr is None:
                 ocr = create_builtin_ocr(beta=config_dict["ocr_captcha"]["beta"], ranges=1)
             Captcha_Browser = NonBrowser()
@@ -1035,7 +1069,7 @@ async def _run_bot(args, session):
                     return
 
         if not is_quit_bot:
-            url, is_quit_bot = await nodriver_current_url(tab, config_dict)
+            url, is_quit_bot = await _run_current_url(tab, config_dict, session)
             #print("url:", url)
 
         if is_quit_bot:

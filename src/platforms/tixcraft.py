@@ -13,6 +13,9 @@ import random
 import re
 import time
 import traceback
+from urllib.parse import urlsplit, urljoin
+
+import tixcraft_api as ticket_http
 
 
 from zendriver import cdp
@@ -75,6 +78,17 @@ __all__ = [
 
 # Module-level state (replaces global tixcraft_dict)
 _state = {}
+
+
+def _tixcraft_runtime_guards():
+    return {key: _state[key] for key in ('tixcraft_submit_pending', 'tixcraft_submit_generation') if key in _state}
+
+
+def _tixcraft_reset_runtime_state(pending=None):
+    """Reset run-local UI state while retaining uncertain command guards."""
+    _state.clear()
+    if pending:
+        _state.update({key: pending[key] for key in ('tixcraft_submit_pending', 'tixcraft_submit_generation') if key in pending})
 
 # Seconds the Ticketmaster check-captcha handler waits for the captcha input:
 # the URL flips before the form renders, and nodriver_tixcraft_auto_ocr reads a
@@ -1240,6 +1254,8 @@ async def nodriver_ticketmaster_captcha(tab, config_dict, ocr, captcha_browser):
     alert_state = {"detected": False, "message": ""}
 
     async def on_captcha_alert(event: cdp.page.JavascriptDialogOpening):
+        if not isinstance(event, cdp.page.JavascriptDialogOpening):
+            return
         alert_state["detected"] = True
         alert_state["message"] = event.message
         debug.log(f"[TICKETMASTER CAPTCHA] Alert event: '{event.message[:60]}'")
@@ -1851,11 +1867,11 @@ async def nodriver_tixcraft_date_auto_select(tab, url, config_dict, domain_name)
                         if isinstance(keyword_item_set, str):
                             # OR logic: single keyword
                             normalized_keyword = re.sub(r'\s+', ' ', keyword_item_set)
-                            is_match = normalized_keyword in normalized_row_text
+                            is_match = ticket_http.date_matches(normalized_keyword, normalized_row_text)
                         elif isinstance(keyword_item_set, list):
                             # AND logic: all keywords must match
                             normalized_keywords = [re.sub(r'\s+', ' ', kw) for kw in keyword_item_set]
-                            match_results = [kw in normalized_row_text for kw in normalized_keywords]
+                            match_results = [ticket_http.date_matches(kw, normalized_row_text) for kw in normalized_keywords]
                             is_match = all(match_results)
 
                         if is_match:
@@ -2568,6 +2584,452 @@ async def nodriver_tixcraft_ticket_main(tab, config_dict, ocr, Captcha_Browser, 
     if await _tixcraft_ticket_selection_valid(tab, config_dict):
         await nodriver_tixcraft_ticket_main_ocr(tab, config_dict, ocr, Captcha_Browser, domain_name)
 
+
+def _tixcraft_http_log(config, message):
+    util.create_debug_logger(config, enabled=True).log('[TIXCRAFT HTTP] ' + message)
+
+
+def _tixcraft_http_time(config, phase):
+    clock = _state.setdefault('http_timing', {'start': time.monotonic(), 'last': time.monotonic()})
+    now = time.monotonic()
+    _tixcraft_http_log(config, '%s：累計 %.3f 秒，本階段 %.3f 秒。' % (phase, now-clock['start'], now-clock['last']))
+    clock['last'] = now
+
+
+def _tixcraft_http_choose(rows, config, date=False):
+    if date:
+        eligible = [row for row in rows if not (row['sold'] and config.get('tixcraft', {}).get('pass_date_is_sold_out', True))]
+    else:
+        amount = int(config.get('ticket_number', 1))
+        less = config.get('tixcraft', {}).get('allow_less_tickets', False)
+        eligible = [row for row in rows if not row['sold'] and (row['count'] is None or row['count'] >= amount or less and row['count'] > 0)]
+    eligible = [row for row in eligible if not util.reset_row_text_if_match_keyword_exclude(config, row['name'])]
+    section = config['date_auto_select' if date else 'area_auto_select']
+    raw = section.get('date_keyword' if date else 'area_keyword', '').strip()
+    groups = util.parse_keyword_string_to_array(raw) if raw else ['']
+    for group in groups:
+        if date and isinstance(group, list) and all(isinstance(word, str) for word in group):
+            matched = [row for row in eligible if all(ticket_http.date_matches(word, row['name']) for word in group)]
+            if matched:
+                return util.get_target_item_from_matched_list(matched, section['mode'])
+            continue
+        if not isinstance(group, str):
+            continue
+        if date:
+            matched = [row for row in eligible if ticket_http.date_matches(group, row['name'])]
+        else:
+            words = [util.format_keyword_string(word) for word in group.split()]
+            matched = [row for row in eligible if all(word in util.format_keyword_string(row['name']) for word in words)]
+        if matched:
+            return util.get_target_item_from_matched_list(matched, section['mode'])
+    if config.get('date_auto_fallback' if date else 'area_auto_fallback', False):
+        return util.get_target_item_from_matched_list(eligible, section['mode'])
+    return None
+
+
+def _tixcraft_http_drain(task):
+    if not task.cancelled():
+        task.exception()
+
+
+def _tixcraft_http_area_diagnostics(rows, config):
+    amount = int(config.get('ticket_number', 1))
+    less = config.get('tixcraft', {}).get('allow_less_tickets', False)
+    raw = config.get('area_auto_select', {}).get('area_keyword', '').strip()
+    groups = util.parse_keyword_string_to_array(raw) if raw else ['']
+    if not rows:
+        return '可選票區 0 個：本次未解析出可點選票區，無法據此取得全場精確餘票數。'
+    details = []
+    for row in rows:
+        name, count = row['name'], row['count']
+        if row['sold']:
+            reason = '網站標示售完'
+        elif count is not None and count < amount and not (less and count > 0):
+            reason = '張數不足，需 %s 張' % amount
+        elif util.reset_row_text_if_match_keyword_exclude(config, name):
+            reason = '符合排除字'
+        elif not any(isinstance(group, str) and all(util.format_keyword_string(word) in util.format_keyword_string(name)
+                     for word in group.split()) for group in groups):
+            reason = '未匹配區域關鍵字'
+        else:
+            reason = '符合篩選條件'
+        stock = '網站未提供精確張數' if count is None else '餘額 %s 張' % count
+        details.append('%s〔%s；%s〕' % (name, stock, reason))
+    return '可選票區 %s 個；%s' % (len(rows), '；'.join(details))
+
+
+def _tixcraft_http_expiry(config):
+    try:
+        timeout = float(config.get('advanced', {}).get('tixcraft_http_dispatch_timeout', 1))
+    except (TypeError, ValueError):
+        timeout = 1
+    if not .05 <= timeout <= 5:
+        timeout = 1
+    return int((time.time() + timeout) * 1000)
+
+
+async def _tixcraft_watch_entry_response(tab, target, frame_id):
+    """Reuse the document GET caused by the real entry click; no second GET."""
+    capture = {'tab': tab, 'url': target, 'frame': frame_id, 'future': asyncio.get_running_loop().create_future()}
+    capture['future'].add_done_callback(_tixcraft_http_drain)
+    _state['http_entry_capture'] = capture
+    async def response(event, *_):
+        if (isinstance(event, cdp.network.ResponseReceived) and _state.get('http_entry_capture') is capture and
+                event.response.url == target and event.frame_id == frame_id and event.type_ == cdp.network.ResourceType.DOCUMENT):
+            capture.update(request=event.request_id, loader=str(event.loader_id), status=int(event.response.status))
+    async def finished(event, *_):
+        if (not isinstance(event, cdp.network.LoadingFinished) or _state.get('http_entry_capture') is not capture or
+                event.request_id != capture.get('request') or capture['future'].done()):
+            return
+        try:
+            body, encoded = await tab.send(cdp.network.get_response_body(event.request_id))
+            if encoded:
+                body = base64.b64decode(body).decode('utf8', errors='replace')
+            value = (capture['status'], body if len(body.encode('utf8')) <= ticket_http.CONST_HTML_LIMIT else None)
+        except Exception:
+            value = (0, None)
+        if not capture['future'].done():
+            capture['future'].set_result(value)
+    async def loading(event, *_):
+        if (isinstance(event, cdp.page.FrameStartedLoading) and _state.get('http_entry_capture') is capture and
+                event.frame_id == frame_id):
+            capture['started'] = True
+    tab.add_handler(cdp.network.ResponseReceived, response)
+    tab.add_handler(cdp.network.LoadingFinished, finished)
+    tab.add_handler(cdp.page.FrameStartedLoading, loading)
+    await tab.send(cdp.page.enable())
+    await tab.send(cdp.network.enable())
+    return capture
+
+
+async def _tixcraft_click_date_entry(tab, config, flow):
+    capture = _state.get('http_entry_capture')
+    if flow.get('entry_logged') and capture and capture.get('started'):
+        return True
+    if time.monotonic() < flow.get('entry_due', 0) or await _tixcraft_actions_paused(config):
+        return True
+    target = flow['entry']['url']
+    if not flow.get('entry_watch'):
+        await _tixcraft_watch_entry_response(tab, target, flow['frame'])
+        flow['entry_watch'] = True
+    result = await tab.evaluate(r'''(() => {
+        const p=PARAMETERS;
+        if(location.href!==p.source||Date.now()>p.expires)return false;
+        const nodes=document.querySelectorAll('#gameList button[data-href],#gameList a[href],a[href],button[data-href]');
+        for(const button of nodes){
+            const href=button.getAttribute('data-href')||button.getAttribute('href');
+            if(!href||new URL(href,location.href).href!==p.target)continue;
+            if(button.matches(':disabled,.disabled')||button.getAttribute('aria-disabled')==='true'||!button.getClientRects().length)continue;
+            button.click();return true;
+        }
+        return false;
+    })()'''.replace('PARAMETERS', json.dumps({'source': flow['source'], 'target': target, 'expires': _tixcraft_http_expiry(config)})))
+    flow['entry_due'] = time.monotonic() + 1
+    if result is True and not flow.get('entry_logged'):
+        flow['entry_logged'] = True
+        _tixcraft_http_log(config, '已點場次入口，等待正確場次載入並同步讀取該次回應。')
+    return True
+
+
+def _tixcraft_start_catalog_read(tab, url, flow):
+    capture = _state.get('http_entry_capture')
+    if (not flow['reads'] and capture and capture['tab'] is tab and capture['url'] == url and
+            capture.get('loader', flow['identity'][1]) == flow['identity'][1] and not capture.get('consumed')):
+        flow['task'] = capture['future']
+        capture['consumed'] = True
+    else:
+        read = ticket_http.current_html(tab) if not util.is_auto_refresh_enabled() and flow['endpoint'] == url else ticket_http.read_html(tab, flow['endpoint'], flow['frame'])
+        flow['task'] = asyncio.create_task(read)
+    flow['task'].add_done_callback(_tixcraft_http_drain)
+    flow['read_started'] = time.monotonic()
+
+
+async def _tixcraft_http_catalog(tab, url, config):
+    parts = urlsplit(url).path.strip('/').split('/')
+    if parts[:2] == ['activity', 'detail']:
+        return False  # Retain the existing activity-detail entry handling.
+    is_date = parts[:2] in (['activity', 'game'], ['activity', 'detail'])
+    if not is_date and parts[:2] != ['ticket', 'area']:
+        return False
+    if is_date and not config.get('date_auto_select', {}).get('enable', True):
+        return False
+    if not is_date and not config.get('area_auto_select', {}).get('enable', True):
+        return False
+    signature = json.dumps({key: config.get(key) for key in ('date_auto_select', 'area_auto_select', 'date_auto_fallback',
+                           'area_auto_fallback', 'ticket_number', 'keyword_exclude', 'tixcraft')}, sort_keys=True)
+    flow = _state.get('http_catalog')
+    if not flow or flow['source'] != url or flow['signature'] != signature or flow['tab'] is not tab:
+        # Old GETs are read-only. Let their replies drain: cancelling a pending
+        # CDP command on the same socket can break Zendriver's response listener.
+        identity = await ticket_http.page_identity(tab)
+        if identity[0] != url:
+            return True
+        endpoint = urljoin(url, '/activity/game/' + parts[2]) if is_date else url
+        flow = {'source': url, 'signature': signature, 'identity': identity[:2], 'frame': identity[2],
+                'tab': tab, 'endpoint': endpoint, 'date': is_date, 'task': None,
+                'due': _state.get('http_next_read', 0), 'reads': 0,
+                'interval': float(config.get('advanced', {}).get('auto_reload_page_interval', 1))}
+        _state['http_catalog'] = flow
+        _state.setdefault('http_timing', {'start': time.monotonic(), 'last': time.monotonic()})
+    elif time.monotonic() >= flow.get('identity_due', 0):
+        flow['identity_due'] = time.monotonic() + .25
+        if (await ticket_http.page_identity(tab))[:2] != flow['identity']:
+            _state.pop('http_catalog', None)
+            return True  # A manual F5 is a new document, even with the same URL.
+    interval = max(0, float(config.get('advanced', {}).get('auto_reload_page_interval', 1)))
+    if interval != flow['interval']:
+        _tixcraft_http_log(config, '重整間隔已即時套用：%s → %s 秒。' % (flow['interval'], interval))
+        flow['interval'] = interval
+        if not flow.get('forbidden_retry'):
+            flow['due'] = flow.get('completed', time.monotonic()) + interval
+    if flow.get('entry'):
+        return await _tixcraft_click_date_entry(tab, config, flow)
+    if flow.get('blocked') or time.monotonic() < flow['due']:
+        return True
+    if flow['task'] is None:
+        if flow['reads'] and (not util.is_auto_refresh_enabled() or not _is_page_reload_enabled(config, util.create_debug_logger(config), 'TIXCRAFT HTTP') or
+                              flow['date'] and not config.get('tixcraft', {}).get('auto_reload_coming_soon_page', True)):
+            return True
+        _tixcraft_start_catalog_read(tab, url, flow)
+        return True
+    if not flow['task'].done():
+        return True
+    try:
+        status, html = flow['task'].result()
+    except Exception:
+        status, html = 0, None
+    flow['task'] = None
+    flow['reads'] += 1
+    flow['completed'] = time.monotonic()
+    _tixcraft_http_log(config, '讀取%s HTTP %s，耗時 %.3f 秒。' % ('場次' if flow['date'] else '票況', status, time.monotonic()-flow['read_started']))
+    flow.pop('forbidden_retry', None)
+    if status == 403:
+        minimum = max(1, int(float(config.get('advanced', {}).get('tixcraft_http_forbidden_retry_interval', 5))))
+        maximum = max(minimum, int(float(config.get('advanced', {}).get('tixcraft_http_forbidden_retry_interval_max', 10))))
+        delay = random.randint(minimum, maximum)
+        flow.update(forbidden_retry=True, due=flow['completed'] + delay)
+        _tixcraft_http_log(config, '網站拒絕票況請求（HTTP 403），等待 %s 秒後重試；可暫停或在瀏覽器處理網站驗證。' % delay)
+        util.write_instance_status('running', '票況 HTTP 403，等待 %s 秒後重試。' % delay)
+        return True
+    if status in (401, 429):
+        flow['blocked'] = True
+        _tixcraft_http_log(config, '網站拒絕票況請求（HTTP %s），已停止輪詢；請在瀏覽器處理驗證或登入，完成後手動 F5 重新確認。' % status)
+        util.write_instance_status('waiting_manual', '票況請求未獲放行，請在瀏覽器確認登入或網站驗證；暫不重試。')
+        return True
+    endpoint_parts = urlsplit(flow['endpoint']).path.strip('/').split('/')
+    rows = (ticket_http.parse_sessions(html, url, parts[2]) if flow['date'] else
+            ticket_http.parse_areas(html, url, endpoint_parts[2], endpoint_parts[3])) if html else None
+    if rows is None:
+        _state.pop('http_catalog', None)
+        return False  # No POST attempted: the existing page flow remains available.
+    chosen = _tixcraft_http_choose(rows, config, date=flow['date'])
+    if chosen:
+        _tixcraft_http_log(config, ('選定場次：' if flow['date'] else '偵測到票區：') + chosen['name'])
+        if flow['date']:
+            flow['entry'] = chosen
+            return await _tixcraft_click_date_entry(tab, config, flow)
+        if await _tixcraft_actions_paused(config):
+            return True
+        if (await ticket_http.page_identity(tab))[:2] != flow['identity']:
+            _state.pop('http_catalog', None)
+            return True
+        _tixcraft_http_time(config, '偵測到有票，直接進入選票頁')
+        await tab.get(chosen['url'])
+        _state.pop('http_catalog', None)
+        return True
+    flow['due'] = time.monotonic() + max(0, float(config.get('advanced', {}).get('auto_reload_page_interval', 1)))
+    if not flow['date']:
+        _tixcraft_http_log(config, _tixcraft_http_area_diagnostics(rows, config))
+    _tixcraft_http_log(config, '目前沒有符合日期／區域關鍵字及張數的選項，依自動重整間隔讀取票況。')
+    return True
+
+
+async def _tixcraft_http_snapshot(tab, config, ocr):
+    script = ticket_http.CONST_SNAPSHOT_JS.replace('RESET_LOGIC', CONST_TIXCRAFT_DISCONNECT_RESET_JS).replace(
+        'RESET_DATA', json.dumps(_tixcraft_disconnect_parameters())).replace('CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace(
+        'NEED_IMAGE', json.dumps(bool(ocr and config.get('ocr_captcha', {}).get('enable'))))
+    value = await tab.evaluate(script)
+    if not isinstance(value, dict) or not value.get('document_id'):
+        return None
+    if value.get('released'):
+        await _tixcraft_finish_disconnect(config)
+    return value
+
+
+async def _tixcraft_experimental_queue(tab, config, snapshot, api):
+    route = snapshot['document_id'].split('|', 1)[0]
+    queue = _state.setdefault('http_queue', {})
+    if queue.get('nonce') != api['nonce'] or queue.get('document') != snapshot['document_id']:
+        queue.clear()
+        queue.update(nonce=api['nonce'], document=snapshot['document_id'], handled=0)
+        util.write_instance_status('running', 'API 實驗：網站排隊中，依網站指定間隔查詢。')
+        _tixcraft_http_time(config, 'API 實驗：選票已確認進入排隊')
+    if api.get('check') is not None and api.get('check_seq', 0) > queue['handled']:
+        queue['handled'] = api['check_seq']
+        result = ticket_http.check_result(api['check'], route)
+        if result is None:
+            queue['blocked'] = True
+            util.write_instance_status('waiting_manual', '排隊回應無法確認，保留防重送；請查看瀏覽器。')
+        elif result['state'] == 'ready':
+            if not await _tixcraft_actions_paused(config) and (await ticket_http.page_identity(tab))[0] == route:
+                await tab.get(result['url'])
+            return True
+        else:
+            _tixcraft_http_log(config, 'API 實驗：網站要求等待 %s 秒，依回覆間隔查詢。' % result['delay'])
+    remaining = (api.get('check_due_ms', 0)-api.get('browser_now_ms', 0))/1000
+    if queue.get('blocked') or api.get('check_inflight') or remaining > 0 or await _tixcraft_actions_paused(config):
+        return True
+    await tab.evaluate(ticket_http.CONST_CHECK_JS.replace('PARAMETERS', json.dumps(
+        {'nonce': api['nonce'], 'expires': _tixcraft_http_expiry(config)})))
+    return True
+
+
+async def _tixcraft_http_pending(tab, config, snapshot):
+    """Keep native submission protection; website alone owns queue requests."""
+    api = snapshot.get('api')
+    if not api and snapshot.get('pending_state') == 'rejected':
+        nonce = snapshot.get('pending_nonce')
+        if nonce != _state.get('http_rejected_nonce'):
+            _state['http_rejected_nonce'] = nonce
+            _state['http_captcha_failures'] = _state.get('http_captcha_failures', 0) + 1
+        if _state.get('http_captcha_failures', 0) >= max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15))):
+            await _tixcraft_submission_pending(tab, config)
+            util.write_instance_status('waiting_manual', '驗證碼已達重試上限，請手動處理。')
+            return True
+    if api and _state.get('http_submit_experiment', False):
+        route = snapshot['document_id'].split('|', 1)[0]
+        if api.get('instance_id') == util.get_instance_id() and api.get('route') == route and isinstance(api.get('nonce'), str):
+            if api['state'] == 'queued':
+                return await _tixcraft_experimental_queue(tab, config, snapshot, api)
+            if api['state'] == 'checkout' and not await _tixcraft_actions_paused(config):
+                await tab.get(urljoin(route, '/ticket/checkout'))
+                return True
+            if api['state'] == 'posting' and api.get('active'):
+                return True
+            if api['state'] == 'rejected':
+                if not await _tixcraft_submission_pending(tab, config):
+                    return True
+                if _state.get('http_rejected_nonce') != api['nonce']:
+                    _state['http_rejected_nonce'] = api['nonce']
+                    failures = _state.get('http_captcha_failures', 0) + 1
+                    _state['http_captcha_failures'] = failures
+                    limit = max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15)))
+                    if failures >= limit:
+                        util.write_instance_status('waiting_manual', '驗證碼已達重試上限，請手動處理。')
+                    elif util.is_auto_refresh_enabled() and not await _tixcraft_actions_paused(config):
+                        await tab.get(route)
+                return True
+    if not await _tixcraft_submission_pending(tab, config):
+        return True
+    _tixcraft_pending_notice(config, ('button_pending', snapshot['document_id']))
+    return True
+
+
+def _tixcraft_http_wait(config, snapshot, reason, state='running'):
+    identity = ((snapshot or {}).get('document_id'), reason, state)
+    if _state.get('http_wait_notice') != identity:
+        _state['http_wait_notice'] = identity
+        _tixcraft_http_log(config, reason)
+        util.write_instance_status(state, reason)
+
+
+async def _tixcraft_http_ticket(tab, config, ocr):
+    experiment = _state.setdefault('http_submit_experiment', config.get('advanced', {}).get('tixcraft_api_submit_experiment') is True)
+    snapshot = await _tixcraft_http_snapshot(tab, config, ocr)
+    if not snapshot:
+        _tixcraft_http_wait(config, snapshot, '等待選票頁可讀取，尚未送出。')
+        return True
+    if snapshot.get('blocked'):
+        util.write_instance_status('waiting_manual', '網站正在阻擋或驗證連線，停止送出，請先在瀏覽器處理網站驗證。')
+        return True
+    if snapshot.get('pending'):
+        return await _tixcraft_http_pending(tab, config, snapshot)
+    if _state.get('tixcraft_submit_pending'):
+        _tixcraft_pending_notice(config, ('python', _state['tixcraft_submit_pending']), 'python')
+        return True
+    if _state.get('http_soldout_document') == snapshot['document_id']:
+        return True
+    if not snapshot.get('supported') or not snapshot.get('rows'):
+        _tixcraft_http_wait(config, snapshot, '等待選票表單載入，尚未送出。')
+        return True
+    if not snapshot.get('captcha_ready'):
+        _tixcraft_http_wait(config, snapshot, '等待驗證碼圖片載入完成，尚未辨識或送出。')
+        return True  # Partial document/unfinished captcha is not sold out; never F5 here.
+    eligible, candidates = _tixcraft_ticket_candidates(snapshot, config)
+    chosen = _tixcraft_pick_ticket_candidate(eligible, candidates, config)
+    if chosen is None:
+        if snapshot.get('ready') == 'loading':
+            return True
+        if util.is_auto_refresh_enabled() and await _tixcraft_action_allowed(tab, config, snapshot['document_id']):
+            # Return to the known area catalog; subsequent updates only read HTML.
+            parts = urlsplit(snapshot['document_id'].split('|', 1)[0]).path.split('/')
+            _state['http_next_read'] = time.monotonic() + max(0, float(config.get('advanced', {}).get('auto_reload_page_interval', 1)))
+            await tab.get(urljoin(snapshot['document_id'].split('|', 1)[0], '/ticket/area/'+parts[3]+'/'+parts[4]))
+        return True
+    answer = None
+    manual_only = _state.get('http_captcha_failures', 0) >= max(1, int(config.get('advanced', {}).get('tixcraft_http_captcha_retries', 15)))
+    if snapshot['has_captcha'] and not manual_only and not snapshot.get('captcha_filled') and config.get('ocr_captcha', {}).get('enable') and ocr is not None:
+        if not snapshot.get('image'):
+            _tixcraft_http_wait(config, snapshot, '驗證碼圖片已載入但無法取得辨識影像，持續重新確認；尚未送出。')
+            return True
+        # Cache inference for the unchanged image in this document, not across challenges.
+        cached = _state.get('http_ocr')
+        identity = (snapshot['document_id'], snapshot['captcha'])
+        if not cached or cached[0] != identity:
+            started = time.monotonic()
+            _tixcraft_http_log(config, '驗證碼圖片已就緒，開始 OCR 辨識。')
+            value = await asyncio.to_thread(ocr.classification, base64.b64decode(snapshot['image']))
+            cached = (identity, value.strip() if isinstance(value, str) else '')
+            _state['http_ocr'] = cached
+            _tixcraft_http_log(config, 'OCR 辨識已返回，耗時 %.3f 秒；取得 %s 碼，需要 4 碼。' % (time.monotonic() - started, len(cached[1])))
+        answer = cached[1]
+        if len(answer) != 4:
+            _tixcraft_http_wait(config, snapshot, 'OCR 已完成，但辨識結果為 %s 碼（需要 4 碼）；尚未送出，請手動輸入或換圖。' % len(answer), 'waiting_manual')
+            return True
+    elif snapshot['has_captcha'] and not snapshot.get('captcha_filled'):
+        _tixcraft_http_wait(config, snapshot, '等待手動輸入驗證碼：自動辨識未啟用、不可用或已達重試上限；尚未送出。')
+    if await _tixcraft_actions_paused(config):
+        return True
+    parameters = {'document': snapshot['document_id'], 'captcha': snapshot['captcha'], 'id': chosen['id'],
+                  'count': chosen['count'], 'target': int(config.get('ticket_number', 1)),
+                  'allow_less': bool(config.get('tixcraft', {}).get('allow_less_tickets', False)),
+                  'answer': answer, 'require_captcha': snapshot['has_captcha'],
+                  'submit': bool(config.get('ocr_captcha', {}).get('force_submit', False)) and not manual_only,
+                  'generation': util.get_browser_session_generation(), 'instance': util.get_instance_id()}
+    parameters['expires'] = _tixcraft_http_expiry(config)
+    if parameters['submit']:
+        _state['tixcraft_submit_pending'] = snapshot['document_id']
+        _state['tixcraft_submit_generation'] = parameters['generation']
+    template = ticket_http.CONST_EXPERIMENTAL_SEND_JS if experiment else ticket_http.CONST_SEND_JS
+    script = template.replace('CAPTCHA_LOGIC', CONST_TIXCRAFT_CAPTCHA_ID_JS).replace('PARAMETERS', json.dumps(parameters))
+    result = await tab.evaluate(script)
+    stage = result.get('state') if isinstance(result, dict) else 'unknown'
+    if stage in ('changed', 'not_ready', 'prepared', 'unsupported', 'expired'):
+        _state.pop('tixcraft_submit_pending', None)
+        _state.pop('tixcraft_submit_generation', None)
+    if stage == 'expired' and _state.get('http_expired_notice') != snapshot['document_id']:
+        _state['http_expired_notice'] = snapshot['document_id']
+        _tixcraft_http_log(config, '瀏覽器執行延遲，本次尚未發出的請求已作廢；重新確認暫停與表單後才會嘗試。')
+    if stage == 'unsupported' and _state.get('http_unsupported_notice') != snapshot['document_id']:
+        _state['http_unsupported_notice'] = snapshot['document_id']
+        util.write_instance_status('waiting_manual', '目前選票表單不符合已確認的 HTTP 格式，尚未送出；請查看瀏覽器或切回原本頁面流程。')
+    if stage == 'invoked':
+        phase = 'API 實驗已送出選票' if experiment else '已點原本送出按鈕'
+        _tixcraft_http_time(config, phase + '（%s 張）' % chosen['count'])
+        util.write_instance_status('running', '已點選票送出按鈕，等待網站導向與排隊；尚未確認購票完成。')
+    return True
+
+
+async def _tixcraft_http_main(tab, url, config, ocr):
+    parsed = urlsplit(url)
+    if parsed.hostname not in ('tixcraft.com', 'www.tixcraft.com') or not config.get('advanced', {}).get('tixcraft_http_api', True):
+        return False
+    _state.setdefault('http_submit_experiment', config.get('advanced', {}).get('tixcraft_api_submit_experiment') is True)
+    _state.setdefault('http_timing', {'start': time.monotonic(), 'last': time.monotonic()})
+    if parsed.path.startswith('/ticket/ticket/'):
+        return await _tixcraft_http_ticket(tab, config, ocr)
+    return await _tixcraft_http_catalog(tab, url, config)
+
 async def _tixcraft_actions_paused(config_dict=None):
     """每個可變更瀏覽器狀態的步驟都重新查暫停及結束。"""
     return await check_and_handle_pause(config_dict) or await check_and_handle_quit(config_dict)
@@ -2616,6 +3078,9 @@ const resetSubmission=({generation,force,pythonStale,instance})=>{
     if(!force&&(!stale&&!pythonStale||corrupt))return {cleared:false};
     if(!force&&!stale&&(saved||active))return {cleared:false};
     if(!saved&&!active&&!corrupt&&!pythonStale)return {cleared:false};
+    if(active?.transport==='http'&&Array.isArray(active.buttons)){
+        for(const item of active.buttons)if(item.button?.isConnected)item.button.disabled=item.disabled;
+    }
     sessionStorage.removeItem(key);delete window[Symbol.for(key)];return {cleared:true};
 };
 '''
@@ -3272,6 +3737,8 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
     # Handles alerts that appear after page navigation (e.g., area selection redirects)
     # Reference: KHAM platform implementation (Line 10681-10697)
     async def handle_global_alert(event):
+        if not isinstance(event, cdp.page.JavascriptDialogOpening):
+            return
         # Skip alert handling when bot is paused (let user handle manually)
         if _state.get('alert_handler_tab') is not tab or await _tixcraft_actions_paused(config_dict):
             return
@@ -3377,6 +3844,14 @@ async def nodriver_tixcraft_main(tab, url, config_dict, ocr, Captcha_Browser):
             debug.log(f"[GLOBAL ALERT] Global alert handler registered")
         except Exception as handler_exc:
             debug.log(f"[GLOBAL ALERT] Failed to register alert handler: {handler_exc}")
+
+    try:
+        if await _tixcraft_http_main(tab, url, config_dict, ocr):
+            return False  # True is reserved for an actual checkout handoff.
+    except Exception as exc:
+        _tixcraft_http_log(config_dict, '本輪讀取尚未完成（%s），保留送出保護；不因錯誤重送。' % type(exc).__name__)
+        if urlsplit(url).path.startswith('/ticket/ticket/'):
+            return False
 
     # Queue-it virtual waiting room detection (TixCraft + Ticketmaster SG)
     # Pattern: ported from platforms/ibon.py — URL-based, customerId-agnostic.
